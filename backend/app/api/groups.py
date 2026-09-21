@@ -1,4 +1,6 @@
 import uuid
+from datetime import date
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,15 +20,28 @@ from app.schemas.group import (
     GroupRead,
     GroupUpdate,
 )
+from app.schemas.group_position import GroupPeriod
 from app.schemas.group_settlement import (
     GroupSettlementCreate,
     GroupSettlementRead,
     GroupSettlementUpdate,
 )
 from app.schemas.transaction import TransactionRead
-from app.services import balance_service, group_service, settlement_service
+from app.services import (
+    balance_service,
+    group_service,
+    position_service,
+    settlement_service,
+)
 
 router = APIRouter(prefix="/api/groups", tags=["groups"])
+
+
+def _check_range(start: Optional[date], end: Optional[date]) -> None:
+    if start is not None and end is not None and end < start:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="end must not be before start"
+        )
 
 
 @router.get("", response_model=list[GroupRead])
@@ -191,15 +206,50 @@ async def list_group_transactions(
 @router.get("/{group_id}/balances", response_model=GroupBalances)
 async def get_balances(
     group_id: uuid.UUID,
+    start: Optional[date] = Query(None, description="Inclusive, YYYY-MM-DD"),
+    end: Optional[date] = Query(None, description="Exclusive, YYYY-MM-DD"),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
+    _check_range(start, end)
     balances = await balance_service.compute_balances(
-        session, group_id, ctx.workspace.id, ctx.user_id
+        session, group_id, ctx.workspace.id, ctx.user_id, start=start, end=end
     )
     if balances is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
     return balances
+
+
+@router.get("/{group_id}/period", response_model=GroupPeriod)
+async def get_period(
+    group_id: uuid.UUID,
+    start: Optional[date] = Query(None, description="Inclusive, YYYY-MM-DD"),
+    end: Optional[date] = Query(None, description="Exclusive, YYYY-MM-DD"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(
+        position_service.DEFAULT_PAGE_SIZE, ge=1, le=position_service.MAX_PAGE_SIZE
+    ),
+    ctx: WorkspaceContext = Depends(current_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """The group's common pot over the half-open range [start, end):
+    positions with the backlog, costs by category with shared income
+    apart, suggested transfers, contributions, payer-assumed transactions
+    and a page of the period's shared transactions."""
+    _check_range(start, end)
+    period = await position_service.compute_period(
+        session,
+        group_id,
+        ctx.workspace.id,
+        ctx.user_id,
+        start=start,
+        end=end,
+        page=page,
+        page_size=page_size,
+    )
+    if period is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    return period
 
 
 @router.get("/{group_id}/settlements", response_model=list[GroupSettlementRead])

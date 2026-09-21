@@ -5,7 +5,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
-GroupKind = Literal["social", "cost_center", "project", "client", "other"]
+GroupKind = Literal["social", "household", "cost_center", "project", "client", "other"]
 
 
 class GroupBase(BaseModel):

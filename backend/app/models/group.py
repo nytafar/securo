@@ -18,7 +18,9 @@ if TYPE_CHECKING:
 # kinds; this is metadata that drives UI labels and (later) settlement
 # workflows. Keeps the same table B2C-friendly (social) and B2B-ready
 # (cost_center / project / client) without a schema change.
-GROUP_KINDS = ("social", "cost_center", "project", "client", "other")
+# `household` is a common pot run over periods: the page opens on the
+# period and calls transfers contributions. Same calculation as the rest.
+GROUP_KINDS = ("social", "household", "cost_center", "project", "client", "other")
 
 # Allowed values for TransactionSplit.share_type — kept here so models
 # importing Group don't pull from the splits module.
