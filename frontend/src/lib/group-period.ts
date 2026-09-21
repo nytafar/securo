@@ -57,6 +57,23 @@ export function exclusiveEnd(lastDay: string): string | null {
 }
 
 /**
+ * Keeps a custom range in order.
+ *
+ * The two pickers are independent, so a user can move the start past the
+ * end. Rather than refusing the pick, the other end follows: the range
+ * stays valid, and `start > end` — which the API answers with a 400 —
+ * is never sent. `lastDay` is the inclusive end the pickers show.
+ */
+export function keepInOrder(
+  start: string,
+  lastDay: string,
+  moved: 'start' | 'end',
+): { start: string; lastDay: string } {
+  if (!start || !lastDay || start <= lastDay) return { start, lastDay }
+  return moved === 'start' ? { start, lastDay: start } : { start: lastDay, lastDay }
+}
+
+/**
  * Months of a given monthly catch-up needed to clear a backlog.
  *
  * `null` whenever there is nothing to compute: no backlog, a backlog in

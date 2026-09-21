@@ -2000,6 +2000,7 @@
       "custom": "Własny",
       "rangeStart": "Od",
       "rangeEnd": "Do",
+      "loadFailed": "Nie udało się wczytać tego okresu.",
       "costs": "Wspólne koszty",
       "category": "Kategoria",
       "groupTotal": "Suma grupy",
@@ -2024,7 +2025,8 @@
       "catchUp": "Nadrabianie",
       "catchUpHint": "Sprawdź miesięczną kwotę ponad przelew za okres. Nic nie jest zapisywane.",
       "catchUpMonthly": "Miesięczna kwota nadrabiania",
-      "catchUpResult": "{{months}} miesięcy, aby spłacić zaległość {{name}} w wysokości {{amount}}",
+      "catchUpResult_one": "{{count}} miesiąc, aby spłacić zaległość {{name}} w wysokości {{amount}}",
+      "catchUpResult_other": "{{count}} miesięcy, aby spłacić zaległość {{name}} w wysokości {{amount}}",
       "catchUpNoBacklog": "Brak zaległości do spłacenia.",
       "catchUpEnterAmount": "Podaj miesięczną kwotę większą od zera.",
       "contributions": "Wpłaty",
@@ -2034,7 +2036,7 @@
       "transactions": "Wspólne transakcje",
       "noTransactions": "Brak wspólnych transakcji w tym okresie.",
       "payerAssumed": "Płatnik założony",
-      "payerAssumedHint": "{{total}} z nich jest na koncie, które nie należy do żadnego członka, więc przyjmuje się, że zapłacił właściciel grupy.",
+      "payerAssumedHint": "W {{total}} z nich nie dało się ustalić płatnika na podstawie właściciela konta.",
       "paidBy": "Zapłacone przez {{name}}",
       "pageOf": "Strona {{page}} z {{pages}}"
     }

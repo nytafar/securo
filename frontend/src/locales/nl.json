@@ -1902,6 +1902,7 @@
       "custom": "Aangepast",
       "rangeStart": "Van",
       "rangeEnd": "Tot",
+      "loadFailed": "Deze periode kon niet worden geladen.",
       "costs": "Gedeelde kosten",
       "category": "Categorie",
       "groupTotal": "Groepstotaal",
@@ -1926,7 +1927,8 @@
       "catchUp": "Inhalen",
       "catchUpHint": "Probeer een maandbedrag bovenop de overboeking van deze periode. Er wordt niets opgeslagen.",
       "catchUpMonthly": "Maandelijks inhaalbedrag",
-      "catchUpResult": "{{months}} maanden om de achterstand van {{name}} van {{amount}} weg te werken",
+      "catchUpResult_one": "{{count}} maand om de achterstand van {{name}} van {{amount}} weg te werken",
+      "catchUpResult_other": "{{count}} maanden om de achterstand van {{name}} van {{amount}} weg te werken",
       "catchUpNoBacklog": "Geen achterstand weg te werken.",
       "catchUpEnterAmount": "Voer een maandbedrag boven nul in.",
       "contributions": "Bijdragen",
@@ -1936,7 +1938,7 @@
       "transactions": "Gedeelde transacties",
       "noTransactions": "Geen gedeelde transacties in deze periode.",
       "payerAssumed": "Betaler aangenomen",
-      "payerAssumedHint": "{{total}} hiervan staan op een rekening die van geen enkel lid is, dus geldt de eigenaar van de groep als betaler.",
+      "payerAssumedHint": "Van {{total}} hiervan kon de betaler niet uit de rekeninghouder worden afgeleid.",
       "paidBy": "Betaald door {{name}}",
       "pageOf": "Pagina {{page}} van {{pages}}"
     }

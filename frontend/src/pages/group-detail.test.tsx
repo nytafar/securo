@@ -281,6 +281,28 @@ function card(title: string): HTMLElement {
   return screen.getByText(title).closest('div.bg-card') as HTMLElement
 }
 
+/** The member names of a transfer card's rows, in the order they read:
+ *  [payer, receiver] per row. */
+function transferDirections(cardEl: HTMLElement): string[][] {
+  return within(cardEl)
+    .getAllByRole('listitem')
+    .map((row) =>
+      within(row)
+        .getAllByText(/^(Me|Anna)$/)
+        .map((node) => node.textContent ?? ''),
+    )
+}
+
+/** One row of the positions table, cell by cell. */
+function positionRow(name: string): string[] {
+  const row = within(card(t('splitGroups.pot.positions')))
+    .getAllByRole('row')
+    .find((candidate) => within(candidate).queryByText(name) !== null)!
+  return within(row)
+    .getAllByRole('cell')
+    .map((cell) => cell.textContent ?? '')
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   api.groups.get.mockResolvedValue(group)
@@ -306,12 +328,72 @@ describe('the group page as a common pot', () => {
 
     const periodCard = card(t('splitGroups.pot.transfersPeriod'))
     expect(within(periodCard).getByText('$300.00')).toBeInTheDocument()
+    // Anna pays Me, not the other way round.
+    expect(transferDirections(periodCard)).toEqual([['Anna', 'Me']])
 
     const runningCard = card(t('splitGroups.pot.transfersRunning'))
     expect(within(runningCard).getByText('$2,300.00')).toBeInTheDocument()
-    // The direction names who pays whom, so a backlog in a member's
-    // favour reads as the others paying them.
-    expect(within(runningCard).getAllByText('Anna')[0]).toBeInTheDocument()
+    expect(transferDirections(runningCard)).toEqual([['Anna', 'Me']])
+  })
+
+  it('shows the backlog per member, and in whose favour it runs', async () => {
+    await renderLoaded()
+
+    // Member, paid, share, sent, received, this period, backlog, running.
+    expect(positionRow('Anna')).toEqual([
+      'Anna',
+      '$0.00',
+      '$1,300.00',
+      '$1,000.00',
+      '$0.00',
+      '$300.00',
+      '$2,000.00',
+      '$2,300.00',
+    ])
+    // The same backlog from the other side: the pot owes Me, so both the
+    // backlog and the running position read negative.
+    expect(positionRow('Me')).toEqual([
+      'Me',
+      '$2,600.00',
+      '$1,300.00',
+      '$0.00',
+      '$1,000.00',
+      '-$300.00',
+      '-$2,000.00',
+      '-$2,300.00',
+    ])
+    expect(
+      screen.getByText(t('splitGroups.pot.positionsHint')),
+    ).toBeInTheDocument()
+  })
+
+  it('turns the transfers round when the backlog runs the other way', async () => {
+    // The mirror image: Me owes the pot, Anna is owed.
+    api.groups.period.mockResolvedValue({
+      ...thisMonth,
+      positions: thisMonth.positions.map((position) => ({
+        ...position,
+        period_position: -position.period_position,
+        backlog: -position.backlog,
+        running_position: -position.running_position,
+      })),
+      transfers_period: [
+        { from_member_id: ME, to_member_id: ANNA, currency: 'USD', amount: 300 },
+      ],
+      transfers_running: [
+        { from_member_id: ME, to_member_id: ANNA, currency: 'USD', amount: 2300 },
+      ],
+    })
+    await renderLoaded()
+
+    expect(transferDirections(card(t('splitGroups.pot.transfersPeriod')))).toEqual([
+      ['Me', 'Anna'],
+    ])
+    expect(transferDirections(card(t('splitGroups.pot.transfersRunning')))).toEqual([
+      ['Me', 'Anna'],
+    ])
+    expect(positionRow('Anna')[6]).toBe('-$2,000.00')
+    expect(positionRow('Me')[6]).toBe('$2,000.00')
   })
 
   it('shows shared income on its own line, apart from the category cost', async () => {
@@ -339,12 +421,33 @@ describe('the group page as a common pot', () => {
     expect(
       await screen.findByText(
         t('splitGroups.pot.catchUpResult', {
-          months: 4,
+          count: 4,
           name: 'Anna',
           amount: '$2,000.00',
         }),
       ),
     ).toBeInTheDocument()
+    expect(screen.getByText(/4 months/)).toBeInTheDocument()
+
+    // One month reads as one month, not "1 months".
+    await user.clear(input)
+    await user.type(input, '2000')
+
+    expect(await screen.findByText(/1 month to clear/)).toBeInTheDocument()
+    expect(screen.queryByText(/1 months/)).not.toBeInTheDocument()
+  })
+
+  it('leaves the calculator out when the range has no start', async () => {
+    const { user } = await renderLoaded()
+    expect(screen.getByText(t('splitGroups.pot.catchUp'))).toBeInTheDocument()
+
+    // All time carries no backlog by definition, so there is nothing for
+    // the calculator to answer.
+    await user.click(screen.getByRole('button', { name: t('splitGroups.pot.allTime') }))
+
+    await waitFor(() =>
+      expect(screen.queryByText(t('splitGroups.pot.catchUp'))).not.toBeInTheDocument(),
+    )
   })
 
   it('marks a transaction whose payer was assumed', async () => {
@@ -430,5 +533,92 @@ describe('the group page as a common pot', () => {
         api.groups.period.mock.calls.some(([, params]) => params?.page === 2),
       ).toBe(true),
     )
+  })
+
+  it('keeps the figures on screen while the next page loads', async () => {
+    let releasePageTwo: (value: unknown) => void = () => {}
+    const pageTwo = new Promise((resolve) => {
+      releasePageTwo = resolve
+    })
+    api.groups.period.mockImplementation(async (_id: string, params: { page?: number }) => {
+      if (params?.page === 2) {
+        await pageTwo
+        return { ...thisMonth, transactions: { ...thisMonth.transactions, page: 2 } }
+      }
+      return thisMonth
+    })
+
+    const { user } = await renderLoaded()
+    await user.click(screen.getByRole('button', { name: t('common.next') }))
+
+    await waitFor(() =>
+      expect(
+        api.groups.period.mock.calls.some(([, params]) => params?.page === 2),
+      ).toBe(true),
+    )
+    // Still in flight: the transfers and the positions must not blank.
+    expect(
+      within(card(t('splitGroups.pot.transfersPeriod'))).getByText('$300.00'),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(t('splitGroups.pot.nothingToMove'))).not.toBeInTheDocument()
+    expect(positionRow('Anna')[6]).toBe('$2,000.00')
+
+    releasePageTwo(null)
+    expect(
+      await screen.findByText(t('splitGroups.pot.pageOf', { page: 2, pages: 2 })),
+    ).toBeInTheDocument()
+  })
+
+  it('says so when the period cannot be loaded', async () => {
+    api.groups.period.mockRejectedValue(new Error('boom'))
+    renderPage()
+
+    expect(await screen.findByText(t('splitGroups.pot.loadFailed'))).toBeInTheDocument()
+    // Never an empty pot: a failure and a quiet period must not read alike.
+    expect(screen.queryByText(t('splitGroups.pot.noCosts'))).not.toBeInTheDocument()
+    expect(screen.queryByText(t('splitGroups.pot.nothingToMove'))).not.toBeInTheDocument()
+    expect(screen.queryByText(t('splitGroups.pot.noTransactions'))).not.toBeInTheDocument()
+
+    api.groups.period.mockResolvedValue(thisMonth)
+    const { default: userEvent } = await import('@testing-library/user-event')
+    await userEvent.setup().click(screen.getByRole('button', { name: t('common.retry') }))
+
+    expect(await screen.findByText(/May transfer/)).toBeInTheDocument()
+    expect(
+      within(card(t('splitGroups.pot.transfersPeriod'))).getByText('$300.00'),
+    ).toBeInTheDocument()
+  })
+
+  it('never asks for a range that ends before it starts', async () => {
+    // `keepInOrder` is covered in lib/group-period.test.ts; this is the
+    // wiring: the custom range seeds itself in order and every request
+    // the page makes stays that way.
+    const { user } = await renderLoaded()
+
+    await user.click(screen.getByRole('button', { name: t('splitGroups.pot.custom') }))
+    expect(screen.getByText(t('splitGroups.pot.rangeStart'))).toBeInTheDocument()
+
+    await waitFor(() => expect(api.groups.period.mock.calls.length).toBeGreaterThan(0))
+    for (const [, params] of api.groups.period.mock.calls) {
+      if (params?.start && params?.end) expect(params.start <= params.end).toBe(true)
+    }
+  })
+
+  it('marks the owner as "you" when their own member is unlinked', async () => {
+    api.groups.get.mockResolvedValue({
+      ...group,
+      members: [
+        { ...group.members[0], linked_user_id: null, is_self: true },
+        group.members[1],
+      ],
+    })
+    await renderLoaded()
+
+    const members = card(t('splitGroups.members'))
+    const mine = within(members)
+      .getAllByRole('listitem')
+      .find((row) => within(row).queryByText('Me') !== null)!
+    expect(within(mine).getByText(t('splitGroups.you'))).toBeInTheDocument()
+    expect(within(members).queryByText(t('splitGroups.ownerBadge'))).not.toBeInTheDocument()
   })
 })

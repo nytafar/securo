@@ -4,7 +4,13 @@
  */
 import { describe, expect, it } from 'vitest'
 
-import { catchUpMonths, exclusiveEnd, inclusiveEnd, presetRange } from '@/lib/group-period'
+import {
+  catchUpMonths,
+  exclusiveEnd,
+  inclusiveEnd,
+  keepInOrder,
+  presetRange,
+} from '@/lib/group-period'
 
 const may15 = new Date('2026-05-15T12:00:00')
 
@@ -35,6 +41,34 @@ describe('the inclusive end a date picker shows', () => {
   it('round-trips back to the exclusive end', () => {
     expect(exclusiveEnd(inclusiveEnd('2026-06-01'))).toBe('2026-06-01')
     expect(exclusiveEnd('')).toBeNull()
+  })
+})
+
+describe('keepInOrder', () => {
+  it('leaves a range that is already in order alone', () => {
+    expect(keepInOrder('2026-05-01', '2026-05-31', 'start')).toEqual({
+      start: '2026-05-01',
+      lastDay: '2026-05-31',
+    })
+  })
+
+  it('takes the end along when the start moves past it', () => {
+    expect(keepInOrder('2026-06-10', '2026-05-31', 'start')).toEqual({
+      start: '2026-06-10',
+      lastDay: '2026-06-10',
+    })
+  })
+
+  it('takes the start along when the end moves before it', () => {
+    expect(keepInOrder('2026-05-01', '2026-04-10', 'end')).toEqual({
+      start: '2026-04-10',
+      lastDay: '2026-04-10',
+    })
+  })
+
+  it('leaves a half-set range as it is', () => {
+    expect(keepInOrder('', '2026-05-31', 'end')).toEqual({ start: '', lastDay: '2026-05-31' })
+    expect(keepInOrder('2026-05-01', '', 'start')).toEqual({ start: '2026-05-01', lastDay: '' })
   })
 })
 

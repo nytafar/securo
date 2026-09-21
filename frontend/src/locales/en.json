@@ -1900,6 +1900,7 @@
       "custom": "Custom",
       "rangeStart": "From",
       "rangeEnd": "To",
+      "loadFailed": "This period could not be loaded.",
       "costs": "Shared costs",
       "category": "Category",
       "groupTotal": "Group total",
@@ -1924,7 +1925,8 @@
       "catchUp": "Catch-up",
       "catchUpHint": "Try a monthly amount on top of this period's transfer. Nothing is stored.",
       "catchUpMonthly": "Monthly catch-up",
-      "catchUpResult": "{{months}} months to clear {{name}}'s backlog of {{amount}}",
+      "catchUpResult_one": "{{count}} month to clear {{name}}'s backlog of {{amount}}",
+      "catchUpResult_other": "{{count}} months to clear {{name}}'s backlog of {{amount}}",
       "catchUpNoBacklog": "No backlog to clear.",
       "catchUpEnterAmount": "Enter a monthly amount above zero.",
       "contributions": "Contributions",
@@ -1934,7 +1936,7 @@
       "transactions": "Shared transactions",
       "noTransactions": "No shared transactions in this period.",
       "payerAssumed": "Payer assumed",
-      "payerAssumedHint": "{{total}} of these sit on an account no member owns, so the group's owner is taken to have paid.",
+      "payerAssumedHint": "The payer of {{total}} of these could not be read from the account's owner.",
       "paidBy": "Paid by {{name}}",
       "pageOf": "Page {{page}} of {{pages}}"
     }

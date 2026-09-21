@@ -1901,6 +1901,7 @@
       "custom": "Personalizado",
       "rangeStart": "Desde",
       "rangeEnd": "Hasta",
+      "loadFailed": "No se ha podido cargar este período.",
       "costs": "Gastos compartidos",
       "category": "Categoría",
       "groupTotal": "Total del grupo",
@@ -1925,7 +1926,8 @@
       "catchUp": "Recuperación",
       "catchUpHint": "Prueba un importe mensual además de la transferencia del período. No se guarda nada.",
       "catchUpMonthly": "Recuperación mensual",
-      "catchUpResult": "{{months}} meses para saldar el atraso de {{name}} de {{amount}}",
+      "catchUpResult_one": "{{count}} mes para saldar el atraso de {{name}} de {{amount}}",
+      "catchUpResult_other": "{{count}} meses para saldar el atraso de {{name}} de {{amount}}",
       "catchUpNoBacklog": "No hay atraso que saldar.",
       "catchUpEnterAmount": "Introduce un importe mensual mayor que cero.",
       "contributions": "Aportes",
@@ -1935,7 +1937,7 @@
       "transactions": "Transacciones compartidas",
       "noTransactions": "No hay transacciones compartidas en este período.",
       "payerAssumed": "Pagador supuesto",
-      "payerAssumedHint": "{{total}} de ellas están en una cuenta que no pertenece a ningún miembro, así que se supone que pagó el propietario del grupo.",
+      "payerAssumedHint": "El pagador de {{total}} de ellas no se ha podido deducir del propietario de la cuenta.",
       "paidBy": "Pagado por {{name}}",
       "pageOf": "Página {{page}} de {{pages}}"
     }

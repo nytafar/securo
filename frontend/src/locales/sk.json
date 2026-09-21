@@ -2032,6 +2032,7 @@
       "custom": "Vlastné",
       "rangeStart": "Od",
       "rangeEnd": "Do",
+      "loadFailed": "Toto obdobie sa nepodarilo načítať.",
       "costs": "Spoločné náklady",
       "category": "Kategória",
       "groupTotal": "Spolu za skupinu",
@@ -2056,7 +2057,8 @@
       "catchUp": "Dobiehanie",
       "catchUpHint": "Vyskúšajte mesačnú sumu nad rámec prevodu za obdobie. Nič sa neukladá.",
       "catchUpMonthly": "Mesačné dobiehanie",
-      "catchUpResult": "{{months}} mesiacov na splatenie nedoplatku {{name}} vo výške {{amount}}",
+      "catchUpResult_one": "{{count}} mesiac na splatenie nedoplatku {{name}} vo výške {{amount}}",
+      "catchUpResult_other": "{{count}} mesiacov na splatenie nedoplatku {{name}} vo výške {{amount}}",
       "catchUpNoBacklog": "Žiadny nedoplatok na splatenie.",
       "catchUpEnterAmount": "Zadajte mesačnú sumu väčšiu ako nula.",
       "contributions": "Príspevky",
@@ -2066,7 +2068,7 @@
       "transactions": "Spoločné transakcie",
       "noTransactions": "V tomto období nie sú žiadne spoločné transakcie.",
       "payerAssumed": "Predpokladaný platiteľ",
-      "payerAssumedHint": "{{total}} z nich je na účte, ktorý nepatrí žiadnemu členovi, takže sa predpokladá, že platil vlastník skupiny.",
+      "payerAssumedHint": "Pri {{total}} z nich sa platiteľ nedal určiť podľa vlastníka účtu.",
       "paidBy": "Zaplatil {{name}}",
       "pageOf": "Strana {{page}} z {{pages}}"
     }

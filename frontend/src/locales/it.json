@@ -1901,6 +1901,7 @@
       "custom": "Personalizzato",
       "rangeStart": "Da",
       "rangeEnd": "A",
+      "loadFailed": "Non è stato possibile caricare questo periodo.",
       "costs": "Spese condivise",
       "category": "Categoria",
       "groupTotal": "Totale del gruppo",
@@ -1925,7 +1926,8 @@
       "catchUp": "Recupero",
       "catchUpHint": "Prova un importo mensile oltre al trasferimento del periodo. Non viene salvato nulla.",
       "catchUpMonthly": "Recupero mensile",
-      "catchUpResult": "{{months}} mesi per azzerare l'arretrato di {{name}} di {{amount}}",
+      "catchUpResult_one": "{{count}} mese per azzerare l'arretrato di {{name}} di {{amount}}",
+      "catchUpResult_other": "{{count}} mesi per azzerare l'arretrato di {{name}} di {{amount}}",
       "catchUpNoBacklog": "Nessun arretrato da azzerare.",
       "catchUpEnterAmount": "Inserisci un importo mensile maggiore di zero.",
       "contributions": "Contributi",
@@ -1935,7 +1937,7 @@
       "transactions": "Transazioni condivise",
       "noTransactions": "Nessuna transazione condivisa in questo periodo.",
       "payerAssumed": "Pagante presunto",
-      "payerAssumedHint": "{{total}} di queste sono su un conto che non appartiene a nessun membro, quindi si presume abbia pagato il proprietario del gruppo.",
+      "payerAssumedHint": "Per {{total}} di queste non è stato possibile dedurre il pagante dal proprietario del conto.",
       "paidBy": "Pagato da {{name}}",
       "pageOf": "Pagina {{page}} di {{pages}}"
     }

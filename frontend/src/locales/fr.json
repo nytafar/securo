@@ -1901,6 +1901,7 @@
       "custom": "Personnalisée",
       "rangeStart": "Du",
       "rangeEnd": "Au",
+      "loadFailed": "Cette période n'a pas pu être chargée.",
       "costs": "Dépenses partagées",
       "category": "Catégorie",
       "groupTotal": "Total du groupe",
@@ -1925,7 +1926,8 @@
       "catchUp": "Rattrapage",
       "catchUpHint": "Essayez un montant mensuel en plus du transfert de la période. Rien n'est enregistré.",
       "catchUpMonthly": "Rattrapage mensuel",
-      "catchUpResult": "{{months}} mois pour solder l'arriéré de {{name}}, soit {{amount}}",
+      "catchUpResult_one": "{{count}} mois pour solder l'arriéré de {{name}}, soit {{amount}}",
+      "catchUpResult_other": "{{count}} mois pour solder l'arriéré de {{name}}, soit {{amount}}",
       "catchUpNoBacklog": "Aucun arriéré à solder.",
       "catchUpEnterAmount": "Saisissez un montant mensuel supérieur à zéro.",
       "contributions": "Contributions",
@@ -1935,7 +1937,7 @@
       "transactions": "Transactions partagées",
       "noTransactions": "Aucune transaction partagée sur cette période.",
       "payerAssumed": "Payeur supposé",
-      "payerAssumedHint": "{{total}} d'entre elles se trouvent sur un compte qui n'appartient à aucun membre ; le propriétaire du groupe est donc supposé avoir payé.",
+      "payerAssumedHint": "Le payeur de {{total}} d'entre elles n'a pas pu être déduit du propriétaire du compte.",
       "paidBy": "Payé par {{name}}",
       "pageOf": "Page {{page}} sur {{pages}}"
     }

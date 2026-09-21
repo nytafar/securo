@@ -1901,6 +1901,7 @@
       "custom": "Personalizado",
       "rangeStart": "De",
       "rangeEnd": "Até",
+      "loadFailed": "Não foi possível carregar este período.",
       "costs": "Custos partilhados",
       "category": "Categoria",
       "groupTotal": "Total do grupo",
@@ -1925,7 +1926,8 @@
       "catchUp": "Recuperação",
       "catchUpHint": "Experimente um valor mensal além da transferência do período. Nada é guardado.",
       "catchUpMonthly": "Recuperação mensal",
-      "catchUpResult": "{{months}} meses para liquidar o acumulado de {{name}}, de {{amount}}",
+      "catchUpResult_one": "{{count}} mês para liquidar o acumulado de {{name}}, de {{amount}}",
+      "catchUpResult_other": "{{count}} meses para liquidar o acumulado de {{name}}, de {{amount}}",
       "catchUpNoBacklog": "Sem acumulado a liquidar.",
       "catchUpEnterAmount": "Indique um valor mensal acima de zero.",
       "contributions": "Contribuições",
@@ -1935,7 +1937,7 @@
       "transactions": "Transações partilhadas",
       "noTransactions": "Sem transações partilhadas neste período.",
       "payerAssumed": "Pagador presumido",
-      "payerAssumedHint": "{{total}} destas estão numa conta que não pertence a nenhum membro, pelo que se presume que o dono do grupo pagou.",
+      "payerAssumedHint": "Não foi possível deduzir o pagador de {{total}} destas pelo dono da conta.",
       "paidBy": "Pago por {{name}}",
       "pageOf": "Página {{page}} de {{pages}}"
     }

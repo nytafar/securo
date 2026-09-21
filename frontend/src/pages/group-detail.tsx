@@ -12,7 +12,7 @@ import { useTranslation } from 'react-i18next'
 import { useDisplayLocale, useDateLocale } from '@/hooks/use-display-locale'
 import { getAccountName, sortAccountsByDisplayName } from '@/lib/account-utils'
 import { useNavigate, useParams } from 'react-router-dom'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
   AlertTriangle,
@@ -36,6 +36,7 @@ import {
   catchUpMonths,
   exclusiveEnd,
   inclusiveEnd,
+  keepInOrder,
   presetRange,
   PERIOD_PRESETS,
   type PeriodPreset,
@@ -106,6 +107,7 @@ function shareOf(shares: GroupMemberShare[], memberId: string): number {
  *  in a member's favour shows as the others paying them. */
 function TransferList({
   transfers,
+  loaded,
   nameOf,
   locale,
   emptyLabel,
@@ -113,12 +115,22 @@ function TransferList({
   onPick,
 }: {
   transfers: GroupSuggestedTransfer[]
+  /** False until a period has actually been read: an empty list is only
+   *  "nothing to move" once we know the period is empty. */
+  loaded: boolean
   nameOf: (memberId: string | null) => string
   locale: string
   emptyLabel: string
   actionLabel?: string
   onPick?: (transfer: GroupSuggestedTransfer) => void
 }) {
+  if (!loaded) {
+    return (
+      <div className="p-4 space-y-2">
+        <Skeleton className="h-8 w-full" />
+      </div>
+    )
+  }
   if (transfers.length === 0) {
     return (
       <div className="text-center py-6 text-muted-foreground text-sm">{emptyLabel}</div>
@@ -200,7 +212,11 @@ export default function GroupDetailPage() {
     setPage(1)
   }
 
-  const { data: period, isLoading: loadingPeriod } = useQuery({
+  const {
+    data: period,
+    isError: periodFailed,
+    refetch: refetchPeriod,
+  } = useQuery({
     queryKey: ['groups', groupId, 'period', range.start, range.end, page],
     queryFn: () =>
       groupsApi.period(groupId, {
@@ -212,7 +228,15 @@ export default function GroupDetailPage() {
     // Waits for the group, so the first request already uses the range
     // the group's kind opens on.
     enabled: !!groupId && !!group,
+    // Keep the figures on screen while the next period or page loads.
+    // Without this, paging the transaction list blanks the transfers and
+    // the positions, which reads as "nothing to move".
+    placeholderData: keepPreviousData,
   })
+
+  // A failed request must never look like a quiet period, so the
+  // sections are replaced rather than left showing their empty states.
+  const showFigures = !!period && !periodFailed
 
   const openCustomRange = () => {
     // Seed the custom pickers from whatever is on screen, so switching
@@ -221,6 +245,19 @@ export default function GroupDetailPage() {
     if (!customEnd && range.end) setCustomEnd(inclusiveEnd(range.end))
     setPreset('custom')
   }
+
+  // The range stays in order whatever the user picks, so `start > end`
+  // and the 400 it earns never happen.
+  const pickRange = (value: string, moved: 'start' | 'end') =>
+    changeRange(() => {
+      const ordered = keepInOrder(
+        moved === 'start' ? value : customStart,
+        moved === 'end' ? value : customEnd,
+        moved,
+      )
+      setCustomStart(ordered.start)
+      setCustomEnd(ordered.lastDay)
+    })
 
   const periodMembers = useMemo(() => period?.members ?? [], [period])
 
@@ -234,11 +271,16 @@ export default function GroupDetailPage() {
     return (memberId: string | null) => (memberId && names.get(memberId)) || '—'
   }, [group?.members, periodMembers])
 
-  const viewerMember = useMemo(
-    () => group?.members.find((m) => user && m.linked_user_id === user.id),
-    [group?.members, user],
-  )
   const ownerMemberId = period?.owner_member_id ?? null
+  // The member that stands for whoever is looking: their linked member,
+  // or — for the group's owner, whose own member is often unlinked — the
+  // owner's member the period response resolved. Never the rewritten
+  // `is_self`, which depends on the viewer.
+  const viewerMemberId = useMemo(() => {
+    const linked = group?.members.find((m) => user && m.linked_user_id === user.id)
+    if (linked) return linked.id
+    return isOwner ? ownerMemberId : null
+  }, [group?.members, user, isOwner, ownerMemberId])
 
   // One block per currency: positions are never added across currencies.
   const currencies = useMemo(() => {
@@ -495,6 +537,7 @@ export default function GroupDetailPage() {
       />
       <TransferList
         transfers={period?.transfers_period ?? []}
+        loaded={showFigures}
         nameOf={nameOf}
         locale={locale}
         emptyLabel={t('splitGroups.pot.nothingToMove')}
@@ -522,6 +565,7 @@ export default function GroupDetailPage() {
       />
       <TransferList
         transfers={period?.transfers_running ?? []}
+        loaded={showFigures}
         nameOf={nameOf}
         locale={locale}
         emptyLabel={t('splitGroups.pot.nothingToMove')}
@@ -594,14 +638,14 @@ export default function GroupDetailPage() {
                 <Label className="text-xs">{t('splitGroups.pot.rangeStart')}</Label>
                 <DatePickerInput
                   value={customStart}
-                  onChange={(value) => changeRange(() => setCustomStart(value))}
+                  onChange={(value) => pickRange(value, 'start')}
                 />
               </div>
               <div className="space-y-1">
                 <Label className="text-xs">{t('splitGroups.pot.rangeEnd')}</Label>
                 <DatePickerInput
                   value={customEnd}
-                  onChange={(value) => changeRange(() => setCustomEnd(value))}
+                  onChange={(value) => pickRange(value, 'end')}
                 />
               </div>
             </div>
@@ -609,6 +653,20 @@ export default function GroupDetailPage() {
         </div>
       </SectionCard>
 
+      {periodFailed && (
+        <SectionCard>
+          <div className="px-4 py-6 flex flex-col items-center gap-3 text-center">
+            <AlertTriangle size={20} className="text-rose-500" />
+            <p className="text-sm text-foreground">{t('splitGroups.pot.loadFailed')}</p>
+            <Button variant="outline" size="sm" onClick={() => refetchPeriod()}>
+              {t('common.retry')}
+            </Button>
+          </div>
+        </SectionCard>
+      )}
+
+      {!periodFailed && (
+        <>
       {/* Who moves what: the period alone, and with the backlog. A
           household reads the period first; other kinds the running one. */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4">
@@ -620,7 +678,7 @@ export default function GroupDetailPage() {
           net total straight from the server. */}
       <SectionCard>
         <SectionHeader title={t('splitGroups.pot.costs')} />
-        {loadingPeriod && !period ? (
+        {!showFigures ? (
           <div className="p-4 space-y-2">
             <Skeleton className="h-8 w-full" />
             <Skeleton className="h-8 w-full" />
@@ -738,7 +796,12 @@ export default function GroupDetailPage() {
           title={t('splitGroups.pot.positions')}
           description={t('splitGroups.pot.positionsHint')}
         />
-        {currencies.length === 0 ? (
+        {!showFigures ? (
+          <div className="p-4 space-y-2">
+            <Skeleton className="h-8 w-full" />
+            <Skeleton className="h-8 w-full" />
+          </div>
+        ) : currencies.length === 0 ? (
           <div className="text-center py-6 text-muted-foreground text-sm">
             {t('splitGroups.pot.noCosts')}
           </div>
@@ -833,7 +896,10 @@ export default function GroupDetailPage() {
       </SectionCard>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4">
-        {/* The catch-up calculator. Nothing here is stored. */}
+        {/* The catch-up calculator. Nothing here is stored. A range with
+            no start carries no backlog by definition, so there is
+            nothing for it to answer and it stays away. */}
+        {range.start && (
         <SectionCard>
           <SectionHeader
             title={t('splitGroups.pot.catchUp')}
@@ -857,7 +923,7 @@ export default function GroupDetailPage() {
                 : months === null
                   ? t('splitGroups.pot.catchUpEnterAmount')
                   : t('splitGroups.pot.catchUpResult', {
-                      months,
+                      count: months,
                       name: nameOf(backlogLine.memberId),
                       amount: formatCurrency(
                         backlogLine.amount,
@@ -868,6 +934,7 @@ export default function GroupDetailPage() {
             </p>
           </div>
         </SectionCard>
+        )}
 
         {/* The period's contributions, straight from the response. */}
         <SectionCard>
@@ -890,7 +957,11 @@ export default function GroupDetailPage() {
               ) : undefined
             }
           />
-          {period && period.contributions.length > 0 ? (
+          {!showFigures ? (
+            <div className="p-4 space-y-2">
+              <Skeleton className="h-10 w-full" />
+            </div>
+          ) : period && period.contributions.length > 0 ? (
             <ul className="divide-y divide-border">
               {period.contributions.map((contribution) => (
                 <li
@@ -964,12 +1035,12 @@ export default function GroupDetailPage() {
             </Button>
           }
         />
-        {loadingPeriod && !period ? (
+        {!showFigures || !period ? (
           <div className="p-4 space-y-2">
             <Skeleton className="h-10 w-full" />
             <Skeleton className="h-10 w-full" />
           </div>
-        ) : !period || period.transactions.items.length === 0 ? (
+        ) : period.transactions.items.length === 0 ? (
           <div className="text-center py-8 text-muted-foreground text-sm flex flex-col items-center gap-2">
             <Receipt size={20} className="opacity-50" />
             {t('splitGroups.pot.noTransactions')}
@@ -1040,6 +1111,8 @@ export default function GroupDetailPage() {
           </>
         )}
       </SectionCard>
+        </>
+      )}
 
       {/* Members */}
       <SectionCard>
@@ -1068,7 +1141,7 @@ export default function GroupDetailPage() {
                     {/* "(you)" marks the viewer; the owner's member comes
                         from the period response, which resolves it the
                         same way for everyone who looks. */}
-                    {viewerMember?.id === member.id ? (
+                    {viewerMemberId === member.id ? (
                       <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full">
                         {t('splitGroups.you')}
                       </span>
@@ -1147,7 +1220,7 @@ export default function GroupDetailPage() {
             <DialogTitle>{recordLabel}</DialogTitle>
           </DialogHeader>
           {(() => {
-            const myMemberId = viewerMember?.id ?? (isOwner ? ownerMemberId : null)
+            const myMemberId = viewerMemberId
             const viewerIsPayer = !!myMemberId && settleFrom === myMemberId
             return (
           <div className="space-y-4 min-w-0">

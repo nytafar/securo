@@ -1900,6 +1900,7 @@
       "custom": "कस्टम",
       "rangeStart": "से",
       "rangeEnd": "तक",
+      "loadFailed": "यह अवधि लोड नहीं हो सकी।",
       "costs": "साझा खर्च",
       "category": "श्रेणी",
       "groupTotal": "समूह कुल",
@@ -1924,7 +1925,8 @@
       "catchUp": "बकाया चुकाना",
       "catchUpHint": "अवधि के हस्तांतरण के ऊपर एक मासिक राशि आज़माएँ। कुछ भी सहेजा नहीं जाता।",
       "catchUpMonthly": "मासिक अतिरिक्त राशि",
-      "catchUpResult": "{{name}} का {{amount}} का बकाया चुकाने में {{months}} महीने",
+      "catchUpResult_one": "{{name}} का {{amount}} का बकाया चुकाने में {{count}} महीना",
+      "catchUpResult_other": "{{name}} का {{amount}} का बकाया चुकाने में {{count}} महीने",
       "catchUpNoBacklog": "चुकाने के लिए कोई बकाया नहीं।",
       "catchUpEnterAmount": "शून्य से अधिक मासिक राशि दर्ज करें।",
       "contributions": "योगदान",
@@ -1934,7 +1936,7 @@
       "transactions": "साझा लेन-देन",
       "noTransactions": "इस अवधि में कोई साझा लेन-देन नहीं।",
       "payerAssumed": "भुगतानकर्ता अनुमानित",
-      "payerAssumedHint": "इनमें से {{total}} ऐसे खाते में हैं जो किसी सदस्य का नहीं है, इसलिए माना जाता है कि समूह के स्वामी ने भुगतान किया।",
+      "payerAssumedHint": "इनमें से {{total}} का भुगतानकर्ता खाते के स्वामी से तय नहीं किया जा सका।",
       "paidBy": "{{name}} द्वारा भुगतान",
       "pageOf": "पृष्ठ {{page}} / {{pages}}"
     }
