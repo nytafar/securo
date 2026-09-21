@@ -16,7 +16,9 @@ side existed links the receiver's credit in the payer-side column, and is
 """
 
 import uuid
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import date as _date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Iterable, Optional, Sequence
 
 from sqlalchemy import or_, select
@@ -68,20 +70,26 @@ async def _user_member_id(
     return result.scalar_one_or_none()
 
 
-async def _can_settle_from(
+async def _can_record_between(
     session: AsyncSession,
     group: Group,
     user_id: uuid.UUID,
     from_member_id: uuid.UUID,
+    to_member_id: uuid.UUID,
 ) -> bool:
-    """Permission check for creating/editing a settlement:
-    - Group owner can do anything.
-    - Linked member can only act when they are the `from_member`
-      (i.e., they're recording a payment they themselves made)."""
+    """Who may create, edit or delete a contribution:
+    - the group's owner, for anything;
+    - a linked member, when the contribution is one they are part of,
+      on either side.
+
+    Receiving is as much a fact a member knows first-hand as paying is,
+    and in a two-person household the partner's own record of what she
+    was sent is the one worth having. A linked member still cannot
+    record a contribution between two other people."""
     if group.user_id == user_id:
         return True
     linked = await _user_member_id(session, group.id, user_id)
-    return linked is not None and linked == from_member_id
+    return linked is not None and linked in (from_member_id, to_member_id)
 
 
 async def _create_payment_transaction(
@@ -266,6 +274,53 @@ async def _assert_transaction_unlinked(
         raise ValueError("That transaction is already linked to a contribution")
 
 
+async def _assert_link_side_matches_member(
+    session: AsyncSession,
+    group_id: uuid.UUID,
+    transaction_id: Optional[uuid.UUID],
+    member_id: uuid.UUID,
+    side: str,
+) -> None:
+    """The linked transaction has to sit on that member's own account.
+
+    Both members of a household keep their accounts in one workspace, so
+    every transaction either of them owns is reachable from the same
+    call. Filing her credit as his receiver side would take the wrong
+    bank row out of profit and loss and leave the right one in.
+
+    When the account's owner is no member of the group the link is
+    allowed, as it always has been: an outside or cash account has no
+    member to disagree with.
+    """
+    from app.services.position_service import _load_identity_for_group
+
+    if transaction_id is None:
+        return
+    account_owner_id = (
+        await session.execute(
+            select(Account.user_id)
+            .join(Transaction, Transaction.account_id == Account.id)
+            .where(Transaction.id == transaction_id)
+        )
+    ).scalar_one_or_none()
+    if account_owner_id is None:
+        return
+    identity = await _load_identity_for_group(session, group_id)
+    if identity is None:
+        return
+    owners = [m for m in identity.members if m.linked_user_id == account_owner_id]
+    if identity.owner_member_id is not None and account_owner_id == identity.owner_user_id:
+        owners = [m for m in identity.members if m.id == identity.owner_member_id]
+    if len(owners) != 1:
+        # No member owns that account, or two do. Nothing to contradict.
+        return
+    if owners[0].id != member_id:
+        raise ValueError(
+            f"That transaction is on {owners[0].name}'s account, so it cannot be "
+            f"the {side} side of this contribution"
+        )
+
+
 async def _assert_transaction_unshared(
     session: AsyncSession, transaction_id: uuid.UUID
 ) -> None:
@@ -311,24 +366,9 @@ async def linked_transaction_ids(
 ) -> set[uuid.UUID]:
     """The subset of `transaction_ids` that a contribution already links,
     on either side. For callers that hold many rows at once."""
-    ids = list(transaction_ids)
-    if not ids:
-        return set()
-    result = await session.execute(
-        select(GroupSettlement.transaction_id, GroupSettlement.receiver_transaction_id).where(
-            or_(
-                GroupSettlement.transaction_id.in_(ids),
-                GroupSettlement.receiver_transaction_id.in_(ids),
-            )
-        )
-    )
-    wanted = set(ids)
-    found: set[uuid.UUID] = set()
-    for payer_id, receiver_id in result.all():
-        for candidate in (payer_id, receiver_id):
-            if candidate in wanted:
-                found.add(candidate)
-    return found
+    from app.services._query_filters import contribution_linked_ids
+
+    return await contribution_linked_ids(session, transaction_ids)
 
 
 def _resolve_links(
@@ -420,10 +460,12 @@ async def create_settlement(
     if not group:
         return None
 
-    if not await _can_settle_from(session, group, user_id, data.from_member_id):
-        # Linked members may only record payments they themselves made.
+    if not await _can_record_between(
+        session, group, user_id, data.from_member_id, data.to_member_id
+    ):
+        # Linked members may only record what they are part of.
         raise PermissionError(
-            "You can only record settlements where you are the payer"
+            "You can only record settlements you are part of"
         )
 
     await _validate_members_in_group(
@@ -436,6 +478,12 @@ async def create_settlement(
         raise ValueError("The two sides of a contribution must be two transactions")
     await _validate_transaction(session, data.transaction_id, workspace_id)
     await _validate_transaction(session, data.receiver_transaction_id, workspace_id)
+    await _assert_link_side_matches_member(
+        session, group_id, data.transaction_id, data.from_member_id, "payer"
+    )
+    await _assert_link_side_matches_member(
+        session, group_id, data.receiver_transaction_id, data.to_member_id, "receiver"
+    )
 
     payload = data.model_dump()
     account_id = payload.pop("account_id", None)
@@ -541,10 +589,11 @@ async def update_settlement(
     if not settlement:
         return None
 
-    # Caller must currently own the settlement (linked member of the
-    # original from_member, or the group owner).
-    if not await _can_settle_from(session, group, user_id, settlement.from_member_id):
-        raise PermissionError("You can only edit settlements you created")
+    # Caller must be part of the settlement as it stands (or the owner).
+    if not await _can_record_between(
+        session, group, user_id, settlement.from_member_id, settlement.to_member_id
+    ):
+        raise PermissionError("You can only edit settlements you are part of")
 
     update_data = data.model_dump(exclude_unset=True)
 
@@ -573,6 +622,15 @@ async def update_settlement(
             await _validate_transaction(
                 session, update_data[column], workspace_id, settlement_id=settlement.id
             )
+    # Both sides are re-checked, not only the changed one: moving a
+    # member is as capable of putting a link on the wrong side as moving
+    # a link is.
+    await _assert_link_side_matches_member(
+        session, group_id, new_payer_link, new_from, "payer"
+    )
+    await _assert_link_side_matches_member(
+        session, group_id, new_receiver_link, new_to, "receiver"
+    )
 
     for key, value in update_data.items():
         setattr(settlement, key, value)
@@ -602,8 +660,10 @@ async def delete_settlement(
     settlement = result.scalar_one_or_none()
     if not settlement:
         return False
-    if not await _can_settle_from(session, group, user_id, settlement.from_member_id):
-        raise PermissionError("You can only delete settlements you created")
+    if not await _can_record_between(
+        session, group, user_id, settlement.from_member_id, settlement.to_member_id
+    ):
+        raise PermissionError("You can only delete settlements you are part of")
 
     # Only rows this service invented go with it. A linked bank row is
     # the user's record of money that really moved and survives the
@@ -636,25 +696,44 @@ async def _synthetic_linked_transactions(
     return list(result.scalars().all())
 
 
-async def mark_transaction_as_contribution(
+@dataclass(frozen=True)
+class ContributionPlan:
+    """What marking a transaction would do, decided but not yet written.
+
+    `existing_settlement_id` is set when this transaction is the missing
+    leg of a contribution already on the books, in which case marking
+    attaches to that one instead of creating a second.
+    """
+
+    transaction_id: uuid.UUID
+    from_member_id: uuid.UUID
+    to_member_id: uuid.UUID
+    member_id: uuid.UUID
+    amount: Decimal
+    currency: str
+    date: _date
+    # "payer" or "receiver" — which side the transaction is.
+    side: str
+    existing_settlement_id: Optional[uuid.UUID]
+
+
+async def plan_contribution_from_transaction(
     session: AsyncSession,
     group_id: uuid.UUID,
     workspace_id: uuid.UUID,
     user_id: uuid.UUID,
     data: MarkContributionFromTransaction,
-) -> Optional[GroupSettlement]:
-    """Turn a real bank transaction into a contribution in one step.
+) -> Optional[ContributionPlan]:
+    """Everything marking decides, and every reason it would refuse,
+    without writing anything.
 
-    Everything but the counterparty is read off the transaction: the
-    amount, the currency, the date it is bucketed by, and which side of
-    the contribution it is. A debit is the payer's side — the account's
-    owner moved money out — and a credit is the receiver's. The member on
-    the other side is the one the caller names, and it has to be a member
-    of this group.
-
-    No transaction is created: the one that is already there is the
-    contribution.
+    Split out so a preview cannot promise what the write would turn
+    down, and cannot name a date the write would not store. Raises the
+    same `ValueError` and `PermissionError` marking raises; returns None
+    when the group is not visible.
     """
+    from app.services._query_filters import reporting_date_of
+    from app.services.admin_service import get_credit_card_accounting_mode
     from app.services.position_service import _load_identity, _resolve_payer
 
     group = await _ensure_group_visible(session, group_id, workspace_id, user_id)
@@ -694,39 +773,164 @@ async def mark_transaction_as_contribution(
     if account_member_id == data.member_id:
         raise ValueError("The other member must not be the one whose account this is")
 
+    # A debit is the payer's side — the money left that account's owner —
+    # and a credit is the receiver's.
     if tx.type == "debit":
-        from_member_id, to_member_id = account_member_id, data.member_id
-        links = {"transaction_id": tx.id}
+        from_member_id, to_member_id, side = account_member_id, data.member_id, "payer"
     else:
-        from_member_id, to_member_id = data.member_id, account_member_id
-        links = {"receiver_transaction_id": tx.id}
+        from_member_id, to_member_id, side = data.member_id, account_member_id, "receiver"
 
-    if not await _can_settle_from(session, group, user_id, from_member_id):
-        raise PermissionError(
-            "You can only record settlements where you are the payer"
-        )
+    if not await _can_record_between(
+        session, group, user_id, from_member_id, to_member_id
+    ):
+        raise PermissionError("You can only record settlements you are part of")
 
     await _validate_transaction(session, tx.id, workspace_id)
 
-    from app.services._query_filters import reporting_date_of
-    from app.services.admin_service import get_credit_card_accounting_mode
+    when = reporting_date_of(tx, await get_credit_card_accounting_mode(session))
+    amount = abs(tx.amount)
 
-    settlement = GroupSettlement(
+    # The other leg of the same transfer may already be a contribution.
+    # Both accounts are imported in this household, so marking the credit
+    # and then the debit is the ordinary path, not an edge: creating a
+    # second contribution there would credit one transfer twice and
+    # `attach_paired_leg` could never put it right.
+    existing = await _contribution_awaiting_this_leg(
+        session,
         group_id=group_id,
-        workspace_id=workspace_id,
         from_member_id=from_member_id,
         to_member_id=to_member_id,
-        amount=abs(tx.amount),
+        amount=amount,
         currency=tx.currency,
-        date=reporting_date_of(tx, await get_credit_card_accounting_mode(session)),
-        notes=data.notes,
-        **links,
+        when=when,
+        side=_LINK_COLUMN[side],
     )
-    session.add(settlement)
+
+    return ContributionPlan(
+        transaction_id=tx.id,
+        from_member_id=from_member_id,
+        to_member_id=to_member_id,
+        member_id=data.member_id,
+        amount=amount,
+        currency=tx.currency,
+        date=when,
+        side=side,
+        existing_settlement_id=existing.id if existing is not None else None,
+    )
+
+
+_LINK_COLUMN = {"payer": "transaction_id", "receiver": "receiver_transaction_id"}
+
+
+async def mark_transaction_as_contribution(
+    session: AsyncSession,
+    group_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    data: MarkContributionFromTransaction,
+) -> Optional[GroupSettlement]:
+    """Turn a real bank transaction into a contribution in one step.
+
+    Everything but the counterparty is read off the transaction: the
+    amount, the currency, the date it is bucketed by, and which side of
+    the contribution it is. When the other leg of the same transfer is
+    already a contribution, this one joins it rather than becoming a
+    second.
+
+    No transaction is created: the one that is already there is the
+    contribution.
+    """
+    plan = await plan_contribution_from_transaction(
+        session, group_id, workspace_id, user_id, data
+    )
+    if plan is None:
+        return None
+
+    column = _LINK_COLUMN[plan.side]
+
+    if plan.existing_settlement_id is not None:
+        settlement = await session.get(GroupSettlement, plan.existing_settlement_id)
+        if settlement is None:
+            raise ValueError("The other leg's contribution is no longer there")
+        setattr(settlement, column, plan.transaction_id)
+        if data.notes and not settlement.notes:
+            settlement.notes = data.notes
+    else:
+        settlement = GroupSettlement(
+            group_id=group_id,
+            workspace_id=workspace_id,
+            from_member_id=plan.from_member_id,
+            to_member_id=plan.to_member_id,
+            amount=plan.amount,
+            currency=plan.currency,
+            date=plan.date,
+            notes=data.notes,
+            **{column: plan.transaction_id},
+        )
+        session.add(settlement)
+
     await session.commit()
     await session.refresh(settlement)
     await attach_links(session, [settlement])
     return settlement
+
+
+# The window transfer detection pairs two legs over, in days. A
+# contribution is dated from the transaction it is made of, so two legs
+# of one transfer are dated at most this far apart here too.
+LEG_TOLERANCE_DAYS = 2
+
+
+async def _contribution_awaiting_this_leg(
+    session: AsyncSession,
+    *,
+    group_id: uuid.UUID,
+    from_member_id: uuid.UUID,
+    to_member_id: uuid.UUID,
+    amount,
+    currency: str,
+    when,
+    side: str,
+) -> Optional[GroupSettlement]:
+    """The contribution this transaction is the missing leg of, if there
+    is exactly one.
+
+    A candidate is in the same group, runs between the same two members
+    in the same direction, carries the same amount in the same currency,
+    is dated within the window transfer detection pairs legs over, and
+    has *this* side of it still empty. The other side may be filled — the
+    usual case, where the first leg was marked — or empty, where the
+    contribution was recorded by hand and is only now being backed by a
+    bank row; either way there is one event and one contribution.
+
+    Returns None when nothing matches. Raises when more than one does:
+    which of two contributions this leg belongs to is a fact about money
+    that only the user has, and guessing it would double-count either
+    way.
+    """
+    column = getattr(GroupSettlement, side)
+    result = await session.execute(
+        select(GroupSettlement).where(
+            GroupSettlement.group_id == group_id,
+            GroupSettlement.from_member_id == from_member_id,
+            GroupSettlement.to_member_id == to_member_id,
+            GroupSettlement.amount == amount,
+            GroupSettlement.currency == currency,
+            column.is_(None),
+            GroupSettlement.date >= when - timedelta(days=LEG_TOLERANCE_DAYS),
+            GroupSettlement.date <= when + timedelta(days=LEG_TOLERANCE_DAYS),
+        )
+    )
+    candidates = list(result.scalars().all())
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        ids = ", ".join(str(c.id) for c in candidates)
+        raise ValueError(
+            "More than one contribution could be the other leg of this "
+            f"transaction ({ids}). Link it to the right one by hand."
+        )
+    return candidates[0]
 
 
 async def attach_paired_leg(

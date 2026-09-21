@@ -25,6 +25,7 @@ from app.models.group_settlement import GroupSettlement
 from app.models.transaction import Transaction
 from app.models.user import User
 from app.models.workspace import WorkspaceMember
+from app.schemas.transaction_calendar import TransactionCalendarDay
 from app.schemas.group import GroupCreate, GroupMemberCreate
 from app.services import (
     account_service,
@@ -478,3 +479,75 @@ async def test_a_contribution_still_moves_the_balance_and_shows_in_the_list(
         )
         assert summary is not None
         assert summary["current_balance"] == pytest.approx(expected, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_the_calendar_shows_no_income_on_the_day_of_a_contribution(
+    session: AsyncSession, test_user, test_workspace
+):
+    """Booked rows. Dashboard and reports agree the transfer is neither
+    income nor spending; the day grid has to say the same thing."""
+    from app.services.transaction_calendar_service import get_transaction_calendar
+
+    home = await _household(session, test_user, test_workspace)
+    today = date.today().replace(day=5)
+    credit, debit = await _transfer_legs(session, home, test_user, test_workspace, today)
+    await session.commit()
+
+    async def day() -> TransactionCalendarDay:
+        calendar = await get_transaction_calendar(
+            session, test_workspace.id, test_user.id, today.replace(day=1)
+        )
+        return next(d for d in calendar.days if d.date == today)
+
+    before = await day()
+    assert before.income == pytest.approx(2000.0, abs=0.01)
+    assert before.expense == pytest.approx(2000.0, abs=0.01)
+
+    await _mark(session, home, test_workspace, credit, debit)
+
+    after = await day()
+    assert after.income == 0.0
+    assert after.expense == 0.0
+    assert after.actual_income == 0.0
+    assert after.actual_expense == 0.0
+    # Still listed, and still moving the balance: the money did move.
+    assert after.actual_count == 2
+    assert {item.description for item in after.items} == {"Monthly transfer"}
+    assert after.ending_balance == before.ending_balance
+
+
+@pytest.mark.asyncio
+async def test_the_calendar_leaves_a_pending_contribution_out_of_projected_income(
+    session: AsyncSession, test_user, test_workspace
+):
+    """Forecast rows, which the calendar buckets from its own loader."""
+    from app.services.transaction_calendar_service import get_transaction_calendar
+
+    home = await _household(session, test_user, test_workspace)
+    today = date.today().replace(day=5)
+    credit, debit = await _transfer_legs(
+        session, home, test_user, test_workspace, today, status="pending"
+    )
+    await session.commit()
+
+    async def day() -> TransactionCalendarDay:
+        calendar = await get_transaction_calendar(
+            session, test_workspace.id, test_user.id, today.replace(day=1)
+        )
+        return next(d for d in calendar.days if d.date == today)
+
+    before = await day()
+    assert before.projected_income == pytest.approx(2000.0, abs=0.01)
+    assert before.projected_expense == pytest.approx(2000.0, abs=0.01)
+
+    await _mark(session, home, test_workspace, credit, debit)
+
+    after = await day()
+    assert after.projected_income == 0.0
+    assert after.projected_expense == 0.0
+    assert after.income == 0.0
+    assert after.expense == 0.0
+    # The projected walk still carries them: they will land.
+    assert after.projected_count == 2
+    assert after.ending_balance == before.ending_balance

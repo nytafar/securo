@@ -658,6 +658,12 @@ describe('the group page as a common pot', () => {
     // in the receiver column — the payer column is where history put it,
     // not where a new record belongs.
     api.groups.settlements.create.mockResolvedValue({ id: 'contribution-2' })
+    // His account and hers, both in the one workspace the household
+    // shares — which is why the picker has to be filtered at all.
+    api.accounts.list.mockResolvedValue([
+      { id: 'account-mine', user_id: 'user-1', name: 'Mine', display_name: null },
+      { id: 'account-hers', user_id: 'user-2', name: 'Hers', display_name: null },
+    ])
     api.transactions.list.mockResolvedValue({
       items: [
         {
@@ -690,10 +696,12 @@ describe('the group page as a common pot', () => {
     expect(
       within(dialog).queryByRole('option', { name: t('splitGroups.txActionCreate') }),
     ).not.toBeInTheDocument()
-    // It is the credits that are searched, not the debits.
+    // It is the credits that are searched, not the debits, and only the
+    // viewer's own accounts: a link the API accepts has to sit on the
+    // account of the member on that side.
     await waitFor(() =>
       expect(api.transactions.list).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'credit' }),
+        expect.objectContaining({ type: 'credit', account_ids: ['account-mine'] }),
       ),
     )
 
@@ -704,6 +712,53 @@ describe('the group page as a common pot', () => {
     const [, payload] = api.groups.settlements.create.mock.calls.at(-1)!
     expect(payload.receiver_transaction_id).toBe('tx-credit')
     expect(payload.transaction_id).toBeUndefined()
+  })
+
+  it('never offers a linked member a pair the API would refuse', async () => {
+    // A linked member may record a contribution she is part of, on
+    // either side, and nothing between two other people. Moving one side
+    // away from her takes the other side to her, so the dialog cannot be
+    // walked into a 403.
+    const THIRD = 'member-third'
+    api.groups.get.mockResolvedValue({
+      ...group,
+      is_owner: false,
+      user_id: 'user-9',
+      members: [
+        ...group.members,
+        {
+          id: THIRD,
+          group_id: 'group-1',
+          name: 'Third',
+          linked_user_id: null,
+          email: null,
+          is_self: false,
+          created_at: '2026-01-03T00:00:00Z',
+        },
+      ],
+    })
+    api.groups.settlements.create.mockResolvedValue({ id: 'contribution-2' })
+    const { user } = await renderLoaded()
+
+    const periodCard = card(t('splitGroups.pot.transfersPeriod'))
+    await user.click(
+      within(periodCard).getByRole('button', {
+        name: t('splitGroups.pot.recordContribution'),
+      }),
+    )
+
+    // The viewer is user-1, linked to Me. The suggested transfer fills
+    // Anna → Me; moving the receiver to Third must put the viewer back
+    // on the paying side rather than leave her out of the pair.
+    const dialog = await screen.findByRole('dialog')
+    const selects = within(dialog).getAllByRole('combobox')
+    await user.selectOptions(selects[1], THIRD)
+    await user.click(within(dialog).getByRole('button', { name: t('common.save') }))
+
+    await waitFor(() => expect(api.groups.settlements.create).toHaveBeenCalled())
+    const [, payload] = api.groups.settlements.create.mock.calls.at(-1)!
+    expect(payload.to_member_id).toBe(THIRD)
+    expect(payload.from_member_id).toBe(ME)
   })
 
   it('pages the transaction list on the server', async () => {

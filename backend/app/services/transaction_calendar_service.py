@@ -18,6 +18,7 @@ from app.schemas.transaction_calendar import (
     TransactionCalendarItem,
     TransactionCalendarResponse,
 )
+from app.services._query_filters import contribution_linked_ids
 from app.services.dashboard_service import (
     _balance_at,
     _daily_balance_deltas_by_date,
@@ -103,6 +104,17 @@ async def get_transaction_calendar(
     actual_rows = await _load_actual_transactions(
         session, workspace_id, grid_start, grid_end, requested_account_ids
     )
+    forecast_rows = await _get_forecast_transactions(
+        session, workspace_id, grid_start, grid_end, requested_account_ids
+    )
+    # The bank rows group contributions are made of. They stay in the
+    # day's item list and in both balance walks — the money moved — but
+    # they are no more income or spending here than anywhere else, so
+    # they are kept out of the day's income and expense buckets. Read
+    # once for every row on the grid.
+    contribution_links = await contribution_linked_ids(
+        session, [tx.id for tx in actual_rows] + [tx.id for tx in forecast_rows]
+    )
     balance_deltas = await _daily_balance_deltas_by_date(
         session,
         workspace_id,
@@ -123,7 +135,7 @@ async def get_transaction_calendar(
             tx.category and tx.category.treat_as_transfer
         )
         ignored = bool(tx.is_ignored or (tx.category and tx.category.is_ignored))
-        if not ignored and not tx.exclude_from_pnl:
+        if not ignored and not tx.exclude_from_pnl and tx.id not in contribution_links:
             if is_transfer or tx.source == "transfer":
                 transfer_delta = await _signed_balance_delta_primary(session, tx, primary_currency)
                 day.transfer_net += transfer_delta
@@ -142,9 +154,6 @@ async def get_transaction_calendar(
         day.actual_count += 1
         day.items.append(_actual_item(tx, amount_primary, is_transfer, ignored))
 
-    forecast_rows = await _get_forecast_transactions(
-        session, workspace_id, grid_start, grid_end, requested_account_ids
-    )
     forecast_deltas: dict[date, float] = {}
     for tx in forecast_rows:
         if tx.date not in days:
@@ -157,7 +166,7 @@ async def get_transaction_calendar(
             tx.category and tx.category.treat_as_transfer
         )
         ignored = bool(tx.is_ignored or (tx.category and tx.category.is_ignored))
-        if not ignored and not tx.exclude_from_pnl:
+        if not ignored and not tx.exclude_from_pnl and tx.id not in contribution_links:
             if is_transfer or tx.source == "transfer":
                 delta = await _signed_balance_delta_primary(session, tx, primary_currency)
                 day.transfer_net += delta

@@ -391,4 +391,178 @@ async def test_propose_mark_contribution_refuses_a_counterparty_outside_the_grou
         member_id=str(uuid.uuid4()),
         apply=True,
     )
-    assert "does not belong" in result["error"]
+    assert "must belong to the group" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_refuses_in_the_preview_what_apply_would_refuse(
+    session, test_user, test_workspace
+):
+    """The tool's description promises it turns down a transaction that
+    is already a contribution or carries shares. A preview that promised
+    otherwise would send the user to an Apply that fails."""
+    from app.schemas.transaction_split import (
+        TransactionSplitInput,
+        TransactionSplitsInput,
+    )
+    from app.services import settlement_service, split_service
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    already = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    shared = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "300.00", type_="credit"
+    )
+    await split_service.replace_splits(
+        session,
+        shared,
+        TransactionSplitsInput(
+            share_type="equal",
+            splits=[
+                TransactionSplitInput(group_member_id=home["me"].id),
+                TransactionSplitInput(group_member_id=home["partner"].id),
+            ],
+        ),
+        test_user.id,
+    )
+    await session.commit()
+
+    from app.schemas.group_settlement import MarkContributionFromTransaction
+
+    await settlement_service.mark_transaction_as_contribution(
+        session,
+        home["group"].id,
+        test_workspace.id,
+        test_user.id,
+        MarkContributionFromTransaction(
+            transaction_id=already.id, member_id=home["partner"].id
+        ),
+    )
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    ctx = _Ctx(user_id=test_user.id, external=False)
+
+    linked = await handler(
+        session=session,
+        ctx=ctx,
+        group_id=str(home["group"].id),
+        transaction_id=str(already.id),
+        member_id=str(home["partner"].id),
+    )
+    assert "already linked" in linked["error"]
+    assert "proposed" not in linked
+
+    carries_shares = await handler(
+        session=session,
+        ctx=ctx,
+        group_id=str(home["group"].id),
+        transaction_id=str(shared.id),
+        member_id=str(home["partner"].id),
+    )
+    assert "shared in a group" in carries_shares["error"]
+    assert "proposed" not in carries_shares
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_shows_the_date_that_will_be_stored(
+    session, test_user, test_workspace
+):
+    """A card row is bucketed by its bill date, and that is the date the
+    contribution carries — not the transaction's own."""
+    from datetime import date as _date
+
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        "2000.00",
+        type_="credit",
+        when=_date(2026, 5, 20),
+    )
+    credit.effective_bill_date = _date(2026, 6, 10)
+    await session.commit()
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        member_id=str(home["partner"].id),
+    )
+    assert preview["proposed"]["date"] == "2026-06-10"
+    assert preview["outcome"] == "create"
+
+    applied = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        member_id=str(home["partner"].id),
+        apply=True,
+    )
+    assert applied.get("applied") is True
+
+    from app.models.group_settlement import GroupSettlement as _Settlement
+    from sqlalchemy import select as _select
+
+    row = (await session.execute(_select(_Settlement))).scalars().one()
+    assert row.date == _date(2026, 6, 10)
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_says_when_it_will_attach_to_the_other_leg(
+    session, test_user, test_workspace
+):
+    from datetime import date as _date
+
+    from app.schemas.group_settlement import MarkContributionFromTransaction
+    from app.services import settlement_service
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    when = _date(2026, 5, 20)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=when,
+    )
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    await session.commit()
+
+    first = await settlement_service.mark_transaction_as_contribution(
+        session,
+        home["group"].id,
+        test_workspace.id,
+        test_user.id,
+        MarkContributionFromTransaction(
+            transaction_id=credit.id, member_id=home["partner"].id
+        ),
+    )
+    assert first is not None
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(debit.id),
+        member_id=str(home["me"].id),
+    )
+    assert preview["outcome"] == "attach"
+    assert preview["existing_settlement_id"] == str(first.id)
+    assert preview["proposed"]["side"] == "payer"

@@ -45,6 +45,24 @@ def is_contribution_link():
     )
 
 
+async def contribution_linked_ids(
+    session: AsyncSession, transaction_ids
+) -> set[uuid.UUID]:
+    """Which of these transactions `is_contribution_link()` matches.
+
+    For readers that have already loaded their rows and decide what to
+    count in Python. Built from the same fragment the SQL readers use, so
+    the two cannot answer differently.
+    """
+    ids = list(transaction_ids)
+    if not ids:
+        return set()
+    result = await session.execute(
+        select(Transaction.id).where(Transaction.id.in_(ids), is_contribution_link())
+    )
+    return {row[0] for row in result.all()}
+
+
 def is_confirmed():
     """SQL filter: the charge is settled rather than merely authorized.
 

@@ -33,6 +33,9 @@ from app.services import group_service, settlement_service, split_service
 # ──────────────────────────── the household ─────────────────────────────
 
 
+PARTNER_PASSWORD = "testpass123"
+
+
 async def _partner(session: AsyncSession, workspace) -> User:
     """A second user in the same workspace, as both members of the
     household have had since their accounts landed in one place."""
@@ -41,7 +44,9 @@ async def _partner(session: AsyncSession, workspace) -> User:
     user = User(
         id=uuid.uuid4(),
         email=f"partner-{uuid.uuid4().hex[:8]}@example.com",
-        hashed_password=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
+        hashed_password=bcrypt.hashpw(
+            PARTNER_PASSWORD.encode(), bcrypt.gensalt()
+        ).decode(),
         is_active=True,
         is_verified=True,
     )
@@ -52,7 +57,9 @@ async def _partner(session: AsyncSession, workspace) -> User:
             id=uuid.uuid4(),
             workspace_id=workspace.id,
             user_id=user.id,
-            role="member",
+            # Both members keep their own books in the shared workspace,
+            # so she writes there too.
+            role="editor",
         )
     )
     await session.flush()
@@ -222,8 +229,8 @@ async def test_the_receiver_side_can_be_set_on_update(
 async def test_nothing_synthetic_is_created_unless_it_is_asked_for(
     client, auth_headers, session, test_user, test_workspace
 ):
-    """The partner is a linked user with a checking account, which used
-    to be enough for a mirror credit to appear on its own."""
+    """The receiver is a real user with a checking account, which used to
+    be enough for a mirror credit to appear on its own."""
     home = await _household(session, test_user, test_workspace)
     debit = await _tx(session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00")
     await session.commit()
@@ -232,12 +239,7 @@ async def test_nothing_synthetic_is_created_unless_it_is_asked_for(
     created = await client.post(
         f"/api/groups/{home['group'].id}/settlements",
         headers=auth_headers,
-        json=_contribution(
-            home,
-            from_member_id=str(home["me"].id),
-            to_member_id=str(home["partner"].id),
-            transaction_id=str(debit.id),
-        ),
+        json=_contribution(home, transaction_id=str(debit.id)),
     )
     assert created.status_code == 201, created.text
     assert created.json()["receiver_transaction_id"] is None
@@ -1055,3 +1057,359 @@ def test_the_migration_stops_before_touching_books_that_break_the_rule(monkeypat
         assert "Nothing has been changed" in message
         # And nothing was: the old indexes are still the ones in place.
         assert "ix_group_settlements_transaction_id" in _index_names(connection)
+
+
+# ─────────────────── one transfer, one contribution ──────────────────────
+
+
+def _mark_payload(home, transaction, member):
+    return {"transaction_id": str(transaction.id), "member_id": str(member.id)}
+
+
+@pytest.mark.asyncio
+async def test_marking_both_legs_of_one_transfer_gives_one_contribution(
+    client, auth_headers, session, test_user, test_workspace
+):
+    """Both accounts are imported, so the credit and the debit are both
+    markable. They are one transfer and must stay one contribution: two
+    would credit her 4 000 for 2 000 that moved once, and no later
+    pairing could put it right."""
+    home = await _household(session, test_user, test_workspace)
+    when = date(2026, 5, 20)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=when,
+    )
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    await session.commit()
+
+    url = f"/api/groups/{home['group'].id}/settlements/from-transaction"
+    first = await client.post(url, headers=auth_headers, json=_mark_payload(home, credit, home["partner"]))
+    assert first.status_code == 201, first.text
+    second = await client.post(url, headers=auth_headers, json=_mark_payload(home, debit, home["me"]))
+    assert second.status_code == 201, second.text
+
+    assert second.json()["id"] == first.json()["id"]
+    assert second.json()["links"] == {
+        "payer_transaction_id": str(debit.id),
+        "receiver_transaction_id": str(credit.id),
+    }
+
+    rows = (await session.execute(select(GroupSettlement))).scalars().all()
+    assert len(rows) == 1
+
+    # And the pot moved once: 2 000 in, not 4 000.
+    period = await client.get(
+        f"/api/groups/{home['group'].id}/period",
+        headers=auth_headers,
+        params={"start": "2026-05-01", "end": "2026-06-01"},
+    )
+    body = period.json()
+    assert len(body["contributions"]) == 1
+    made = {
+        p["member_id"]: p["contributions_made"]
+        for p in body["positions"]
+        if p["currency"] == "USD"
+    }
+    assert Decimal(made[str(home["partner"].id)]) == Decimal("2000.00")
+    assert Decimal(made[str(home["me"].id)]) == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_the_second_leg_joins_even_when_the_first_was_a_debit(
+    client, auth_headers, session, test_user, test_workspace
+):
+    home = await _household(session, test_user, test_workspace)
+    when = date(2026, 5, 20)
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    # One day apart, inside the window transfer detection pairs legs over.
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=date(2026, 5, 21),
+    )
+    await session.commit()
+
+    url = f"/api/groups/{home['group'].id}/settlements/from-transaction"
+    first = await client.post(url, headers=auth_headers, json=_mark_payload(home, debit, home["me"]))
+    assert first.status_code == 201, first.text
+    second = await client.post(url, headers=auth_headers, json=_mark_payload(home, credit, home["partner"]))
+    assert second.status_code == 201, second.text
+    assert second.json()["id"] == first.json()["id"]
+
+    rows = (await session.execute(select(GroupSettlement))).scalars().all()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_two_separate_transfers_of_the_same_amount_stay_two_contributions(
+    client, auth_headers, session, test_user, test_workspace
+):
+    """Same members, same amount, but a month apart — two transfers, and
+    nothing may fold them into one."""
+    home = await _household(session, test_user, test_workspace)
+    may = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=date(2026, 5, 20),
+    )
+    june = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=date(2026, 6, 20),
+    )
+    await session.commit()
+
+    url = f"/api/groups/{home['group'].id}/settlements/from-transaction"
+    first = await client.post(url, headers=auth_headers, json=_mark_payload(home, may, home["partner"]))
+    second = await client.post(url, headers=auth_headers, json=_mark_payload(home, june, home["partner"]))
+    assert first.status_code == 201 and second.status_code == 201, second.text
+    assert first.json()["id"] != second.json()["id"]
+
+    rows = (await session.execute(select(GroupSettlement))).scalars().all()
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_same_side_leg_never_joins_an_existing_contribution(
+    client, auth_headers, session, test_user, test_workspace
+):
+    """Two credits on the same day for the same amount are two
+    contributions: the side this one wants is already taken."""
+    home = await _household(session, test_user, test_workspace)
+    when = date(2026, 5, 20)
+    one = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=when, description="Transfer one",
+    )
+    two = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=when, description="Transfer two",
+    )
+    await session.commit()
+
+    url = f"/api/groups/{home['group'].id}/settlements/from-transaction"
+    first = await client.post(url, headers=auth_headers, json=_mark_payload(home, one, home["partner"]))
+    second = await client.post(url, headers=auth_headers, json=_mark_payload(home, two, home["partner"]))
+    assert first.status_code == 201 and second.status_code == 201, second.text
+    assert first.json()["id"] != second.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_two_possible_other_legs_are_refused_rather_than_guessed(
+    client, auth_headers, session, test_user, test_workspace
+):
+    home = await _household(session, test_user, test_workspace)
+    when = date(2026, 5, 20)
+    for description in ("Transfer one", "Transfer two"):
+        session.add(
+            GroupSettlement(
+                id=uuid.uuid4(),
+                group_id=home["group"].id,
+                workspace_id=test_workspace.id,
+                from_member_id=home["partner"].id,
+                to_member_id=home["me"].id,
+                amount=Decimal("2000.00"),
+                currency="USD",
+                date=when,
+                notes=description,
+            )
+        )
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    await session.commit()
+
+    refused = await client.post(
+        f"/api/groups/{home['group'].id}/settlements/from-transaction",
+        headers=auth_headers,
+        json=_mark_payload(home, debit, home["me"]),
+    )
+    assert refused.status_code == 400
+    assert "More than one contribution" in refused.json()["detail"]
+
+
+# ───────────────── a link has to sit on the right account ────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_credit_on_her_account_cannot_be_his_receiver_side(
+    client, auth_headers, session, test_user, test_workspace
+):
+    """Both accounts are in one workspace, so the owner can reach her
+    rows. Filing one as his side would take the wrong bank row out of
+    profit and loss and leave the right one in."""
+    home = await _household(session, test_user, test_workspace)
+    her_credit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        type_="credit",
+    )
+    await session.commit()
+
+    refused = await client.post(
+        f"/api/groups/{home['group'].id}/settlements",
+        headers=auth_headers,
+        json=_contribution(home, receiver_transaction_id=str(her_credit.id)),
+    )
+    assert refused.status_code == 400
+    assert "Partner's account" in refused.json()["detail"]
+    assert "receiver side" in refused.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_a_debit_on_his_account_cannot_be_her_payer_side(
+    client, auth_headers, session, test_user, test_workspace
+):
+    home = await _household(session, test_user, test_workspace)
+    his_debit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00"
+    )
+    await session.commit()
+
+    refused = await client.post(
+        f"/api/groups/{home['group'].id}/settlements",
+        headers=auth_headers,
+        json=_contribution(home, transaction_id=str(his_debit.id)),
+    )
+    assert refused.status_code == 400
+    assert "Me's account" in refused.json()["detail"]
+    assert "payer side" in refused.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_moving_the_members_of_a_linked_contribution_is_refused(
+    client, auth_headers, session, test_user, test_workspace
+):
+    home = await _household(session, test_user, test_workspace)
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00"
+    )
+    await session.commit()
+
+    created = await client.post(
+        f"/api/groups/{home['group'].id}/settlements",
+        headers=auth_headers,
+        json=_contribution(home, transaction_id=str(debit.id)),
+    )
+    assert created.status_code == 201, created.text
+
+    refused = await client.patch(
+        f"/api/groups/{home['group'].id}/settlements/{created.json()['id']}",
+        headers=auth_headers,
+        json={
+            "from_member_id": str(home["me"].id),
+            "to_member_id": str(home["partner"].id),
+        },
+    )
+    assert refused.status_code == 400
+    assert "Partner's account" in refused.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_a_transaction_on_an_account_no_member_owns_is_still_linkable(
+    client, auth_headers, session, test_user, test_workspace
+):
+    """An outside or cash account has no member to contradict, which is
+    the behaviour that was there before and stays."""
+    home = await _household(session, test_user, test_workspace)
+    outsider = await _partner(session, test_workspace)
+    theirs = await _account(session, outsider.id, test_workspace.id, "Theirs")
+    debit = await _tx(session, outsider.id, test_workspace.id, theirs.id, "2000.00")
+    await session.commit()
+
+    created = await client.post(
+        f"/api/groups/{home['group'].id}/settlements",
+        headers=auth_headers,
+        json=_contribution(home, transaction_id=str(debit.id)),
+    )
+    assert created.status_code == 201, created.text
+
+
+# ──────────── either side of a contribution is your own business ─────────
+
+
+async def _headers_for(client, user: User, workspace) -> dict:
+    token = (
+        await client.post(
+            "/api/auth/login",
+            data={"username": user.email, "password": PARTNER_PASSWORD},
+        )
+    ).json()["access_token"]
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-Workspace-Id": str(workspace.id),
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_linked_member_can_mark_a_credit_she_received(
+    client, auth_headers, session, test_user, test_workspace
+):
+    """Being paid is as much her own first-hand knowledge as paying is,
+    and in this household she is the one who sees her own books."""
+    home = await _household(session, test_user, test_workspace)
+    her_credit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "500.00",
+        type_="credit",
+    )
+    await session.commit()
+    hers = await _headers_for(client, home["partner_user"], test_workspace)
+
+    marked = await client.post(
+        f"/api/groups/{home['group'].id}/settlements/from-transaction",
+        headers=hers,
+        json={"transaction_id": str(her_credit.id), "member_id": str(home["me"].id)},
+    )
+    assert marked.status_code == 201, marked.text
+    body = marked.json()
+    assert body["from_member_id"] == str(home["me"].id)
+    assert body["to_member_id"] == str(home["partner"].id)
+    assert body["receiver_transaction_id"] == str(her_credit.id)
+
+
+@pytest.mark.asyncio
+async def test_a_linked_member_can_record_a_contribution_made_to_her(
+    client, auth_headers, session, test_user, test_workspace
+):
+    home = await _household(session, test_user, test_workspace)
+    hers = await _headers_for(client, home["partner_user"], test_workspace)
+
+    created = await client.post(
+        f"/api/groups/{home['group'].id}/settlements",
+        headers=hers,
+        json=_contribution(
+            home,
+            from_member_id=str(home["me"].id),
+            to_member_id=str(home["partner"].id),
+        ),
+    )
+    assert created.status_code == 201, created.text
+
+
+@pytest.mark.asyncio
+async def test_a_linked_member_cannot_record_between_two_other_people(
+    client, auth_headers, session, test_user, test_workspace
+):
+    home = await _household(session, test_user, test_workspace)
+    third = await group_service.create_member(
+        session, home["group"].id, test_workspace.id, GroupMemberCreate(name="Third")
+    )
+    assert third is not None
+    await session.commit()
+    hers = await _headers_for(client, home["partner_user"], test_workspace)
+
+    refused = await client.post(
+        f"/api/groups/{home['group'].id}/settlements",
+        headers=hers,
+        json=_contribution(
+            home,
+            from_member_id=str(home["me"].id),
+            to_member_id=str(third.id),
+        ),
+    )
+    assert refused.status_code == 403
+    assert "you are part of" in refused.json()["detail"]

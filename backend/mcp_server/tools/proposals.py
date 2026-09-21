@@ -1101,13 +1101,34 @@ async def propose_mark_contribution(
     if tx is None:
         return {"error": "transaction not found"}
 
-    member = (
-        await session.execute(
-            select(GroupMember).where(GroupMember.id == mid, GroupMember.group_id == gid)
+    payload = MarkContributionFromTransaction(
+        transaction_id=tx_id, member_id=mid, notes=notes
+    )
+
+    # The preview runs exactly the decisions and refusals the write runs,
+    # so a proposal cannot promise something the user's Apply would turn
+    # down, and cannot name a date or a side the write would not store.
+    try:
+        plan = await settlement_service.plan_contribution_from_transaction(
+            session, gid, ws_id, ctx.user_id, payload
         )
-    ).scalar_one_or_none()
-    if member is None:
-        return {"error": "the other member does not belong to the given group"}
+    except PermissionError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if plan is None:
+        return {"error": "group not found or not visible to this user"}
+
+    names = {
+        row.id: row.name
+        for row in (
+            await session.execute(
+                select(GroupMember.id, GroupMember.name).where(
+                    GroupMember.id.in_([plan.from_member_id, plan.to_member_id])
+                )
+            )
+        ).all()
+    }
 
     preview = {
         "kind": "mark_contribution",
@@ -1116,27 +1137,37 @@ async def propose_mark_contribution(
             "group_name": group.name,
             "transaction_id": str(tx.id),
             "description": tx.description,
-            "amount": num(tx.amount),
-            "currency": tx.currency,
-            "date": tx.date.isoformat() if tx.date else None,
-            "side": "payer" if tx.type == "debit" else "receiver",
-            "member_id": str(member.id),
-            "member_name": member.name,
+            "amount": num(plan.amount),
+            "currency": plan.currency,
+            # The date the contribution will carry, which is the date the
+            # rest of the app buckets this transaction by — not always
+            # the transaction's own `date`.
+            "date": plan.date.isoformat(),
+            "side": plan.side,
+            "from_member_id": str(plan.from_member_id),
+            "from_member_name": names.get(plan.from_member_id),
+            "to_member_id": str(plan.to_member_id),
+            "to_member_name": names.get(plan.to_member_id),
+            "member_id": str(plan.member_id),
+            "member_name": names.get(
+                plan.to_member_id if plan.side == "payer" else plan.from_member_id
+            ),
             "notes": notes,
         },
+        # "create" writes a new contribution; "attach" hangs this
+        # transaction off the one the other leg of the same transfer
+        # already made, so one transfer stays one contribution.
+        "outcome": "attach" if plan.existing_settlement_id else "create",
+        "existing_settlement_id": (
+            str(plan.existing_settlement_id) if plan.existing_settlement_id else None
+        ),
         "apply_endpoint": f"POST /api/groups/{gid}/settlements/from-transaction",
     }
 
     if _can_apply(ctx, apply):
         try:
             created = await settlement_service.mark_transaction_as_contribution(
-                session,
-                gid,
-                ws_id,
-                ctx.user_id,
-                MarkContributionFromTransaction(
-                    transaction_id=tx.id, member_id=member.id, notes=notes
-                ),
+                session, gid, ws_id, ctx.user_id, payload
             )
         except PermissionError as exc:
             return {**preview, "error": str(exc)}

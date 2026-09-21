@@ -131,13 +131,28 @@ async def _load_identity(
     """
     from app.services.group_service import _visible_predicate
 
-    group_row = (
-        await session.execute(
-            select(Group.id, Group.user_id, Group.kind, Group.default_currency).where(
-                Group.id == group_id, _visible_predicate(workspace_id, user_id)
-            )
-        )
-    ).first()
+    return await _identity_of(
+        session, group_id, _visible_predicate(workspace_id, user_id)
+    )
+
+
+async def _load_identity_for_group(
+    session: AsyncSession, group_id: uuid.UUID
+) -> Optional[_GroupIdentity]:
+    """The same identity, for callers that have already decided the group
+    is theirs to touch."""
+    return await _identity_of(session, group_id, None)
+
+
+async def _identity_of(
+    session: AsyncSession, group_id: uuid.UUID, visible
+) -> Optional[_GroupIdentity]:
+    query = select(Group.id, Group.user_id, Group.kind, Group.default_currency).where(
+        Group.id == group_id
+    )
+    if visible is not None:
+        query = query.where(visible)
+    group_row = (await session.execute(query)).first()
     if group_row is None:
         return None
 

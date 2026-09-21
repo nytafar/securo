@@ -459,13 +459,33 @@ export default function GroupDetailPage() {
         ? 'receiver'
         : null
 
-  // Accounts of the requesting user — needed only when the optional
-  // "create transaction" toggle is enabled.
+  // Accounts of the workspace — needed for the optional "create
+  // transaction" toggle, and to keep the transaction picker to the
+  // viewer's own rows.
   const { data: accountsList } = useQuery({
     queryKey: ['accounts'],
     queryFn: () => accountsApi.list(),
     enabled: settleOpen,
   })
+
+  // Both members of a household keep their accounts in one workspace, so
+  // an unfiltered picker offers the other member's rows too — and the
+  // API refuses those, because a link has to sit on the account of the
+  // member on that side. Offer only what it accepts.
+  const ownAccountIds = useMemo(
+    () => (accountsList ?? []).filter((a) => a.user_id === user?.id).map((a) => a.id),
+    [accountsList, user?.id],
+  )
+
+  // A linked member may record a contribution she is part of, on either
+  // side, and nothing between two other people. Moving one side away
+  // from her takes the other side to her, so the dialog cannot be walked
+  // into a pair the API turns down.
+  const keepViewerInThePair = (side: 'from' | 'to', value: string) => {
+    if (isOwner || !viewerMemberId || value === viewerMemberId) return
+    if (side === 'from') setSettleTo(viewerMemberId)
+    else setSettleFrom(viewerMemberId)
+  }
 
   // Debounce the transaction search so we don't hit the API on every
   // keystroke (mirrors the transactions page pattern).
@@ -478,10 +498,11 @@ export default function GroupDetailPage() {
   // capped — offered when linking an existing transaction instead of
   // creating one. Debits when they paid, credits when they were paid.
   const { data: settleTxOptions } = useQuery({
-    queryKey: ['settle-tx-options', settleTxQuery, settleSide],
+    queryKey: ['settle-tx-options', settleTxQuery, settleSide, ownAccountIds],
     queryFn: () =>
       transactionsApi.list({
         type: settleSide === 'receiver' ? 'credit' : 'debit',
+        account_ids: ownAccountIds.length > 0 ? ownAccountIds : undefined,
         q: settleTxQuery || undefined,
         limit: 20,
         sort_by: 'date',
@@ -1341,6 +1362,7 @@ export default function GroupDetailPage() {
                 value={settleFrom}
                 onChange={(e) => {
                   setSettleFrom(e.target.value)
+                  keepViewerInThePair('from', e.target.value)
                   // Reset the ledger-side options: which side the viewer
                   // is on decides what can be linked.
                   setSettleTxMode('none')
@@ -1364,6 +1386,7 @@ export default function GroupDetailPage() {
                 value={settleTo}
                 onChange={(e) => {
                   setSettleTo(e.target.value)
+                  keepViewerInThePair('to', e.target.value)
                   setSettleTxMode('none')
                   setSettleAccountId('')
                   setSettlePickedTx(null)
