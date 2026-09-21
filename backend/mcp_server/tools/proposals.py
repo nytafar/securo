@@ -1276,6 +1276,16 @@ async def propose_share_transaction(
         return {"error": "group has no members"}
     names = {m.id: m.name for m in members}
 
+    # Every refusal the write would make, made here as well: a preview
+    # that promised shares the Apply button then turned down would be
+    # worse than no preview.
+    if await settlement_service.is_contribution_link(session, tx.id):
+        return {
+            "error": (
+                "A transaction linked to a contribution cannot be shared in a group"
+            )
+        }
+
     entries = splits or [{"group_member_id": str(m.id)} for m in members]
     try:
         payload = TransactionSplitsInput.model_validate(
@@ -1287,6 +1297,15 @@ async def propose_share_transaction(
         materialized = split_service._materialize(tx.amount, payload)
     except (ValueError, TypeError) as exc:
         return {"error": str(exc)}
+
+    member_ids = {m.id for m in members}
+    strangers = [
+        entry.group_member_id
+        for entry in payload.splits
+        if entry.group_member_id not in member_ids
+    ]
+    if strangers:
+        return {"error": "One or more split members not found"}
 
     preview = {
         "kind": "share_transaction",

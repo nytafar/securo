@@ -70,8 +70,11 @@ class RuleShareSplit(BaseModel):
     """One member's place in a sharing rule's distribution."""
 
     group_member_id: uuid.UUID
-    # Only read for share_type="percent"; equal needs nothing but the member.
-    share_pct: Optional[Decimal] = None
+    # Only read for share_type="percent"; equal needs nothing but the
+    # member. Bounded, so a negative share — which would hand a member
+    # money for a cost the group carried — cannot be stored, and neither
+    # can one over the whole amount.
+    share_pct: Optional[Decimal] = Field(default=None, ge=0, le=100)
 
 
 class RuleShareAction(BaseModel):

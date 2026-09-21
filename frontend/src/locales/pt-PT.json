@@ -1236,7 +1236,7 @@
       "history": "Histórico"
     },
     "shareInGroup": "Dividir no grupo",
-    "shareInGroupHint": "(cada correspondência entra no fundo comum do grupo)",
+    "shareInGroupHint": "(cada correspondência entra no fundo comum do grupo — uma transferência entre as suas próprias contas também entra, por isso exclua-as nas condições)",
     "markAsContribution": "Marcar como contribuição",
     "markAsContributionHint": "(a própria transação é a contribuição)",
     "selectGroup": "Selecionar grupo...",

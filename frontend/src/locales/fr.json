@@ -1236,7 +1236,7 @@
       "history": "Historique"
     },
     "shareInGroup": "Partager dans le groupe",
-    "shareInGroupHint": "(chaque correspondance rejoint la cagnotte du groupe)",
+    "shareInGroupHint": "(chaque correspondance rejoint la cagnotte du groupe — un virement entre vos propres comptes aussi, excluez-les donc dans les conditions)",
     "markAsContribution": "Marquer comme contribution",
     "markAsContributionHint": "(la transaction elle-même est la contribution)",
     "selectGroup": "Sélectionner un groupe...",

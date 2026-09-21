@@ -1236,7 +1236,7 @@
       "history": "Verlauf"
     },
     "shareInGroup": "In Gruppe teilen",
-    "shareInGroupHint": "(jeder Treffer geht in die gemeinsame Kasse)",
+    "shareInGroupHint": "(jeder Treffer geht in die gemeinsame Kasse — eine Umbuchung zwischen eigenen Konten ebenfalls, schließen Sie diese in den Bedingungen aus)",
     "markAsContribution": "Als Beitrag markieren",
     "markAsContributionHint": "(die Transaktion selbst ist der Beitrag)",
     "selectGroup": "Gruppe auswählen...",

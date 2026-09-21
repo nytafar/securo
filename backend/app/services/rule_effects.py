@@ -31,11 +31,13 @@ rolled back rather than half-applied.
 import logging
 import uuid
 from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Literal, Optional, Sequence
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.transaction import Transaction
@@ -52,8 +54,23 @@ SHARE_ACTION = "share_in_group"
 CONTRIBUTION_ACTION = "mark_as_contribution"
 
 
-@dataclass(frozen=True)
-class PlannedShare:
+@dataclass(frozen=True, kw_only=True)
+class PlannedEffect:
+    """What every planned effect carries besides its own payload.
+
+    `rule_id` names the rule in the log — a skip at 02:00 is only useful
+    if it says which rule went quiet — and `author_id` is the user whose
+    rule it is. The author, not whoever happens to be running a bank
+    sync, is who the effect is written as: their access to the group is
+    what was checked when the rule was saved.
+    """
+
+    rule_id: Optional[uuid.UUID] = None
+    author_id: Optional[uuid.UUID] = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class PlannedShare(PlannedEffect):
     """Shares a rule would write on the transaction it matched."""
 
     group_id: uuid.UUID
@@ -72,8 +89,8 @@ class PlannedShare:
         )
 
 
-@dataclass(frozen=True)
-class PlannedContribution:
+@dataclass(frozen=True, kw_only=True)
+class PlannedContribution(PlannedEffect):
     """A contribution a rule would make of the transaction it matched.
 
     `member_id` is the member on the other side, exactly as marking by
@@ -113,7 +130,12 @@ def parse_contribution_action(value: Any) -> RuleContributionAction:
         raise ValueError("Invalid contribution action") from exc
 
 
-def plan_from_action(action_op: str, value: Any):
+def plan_from_action(
+    action_op: str,
+    value: Any,
+    rule_id: Optional[uuid.UUID] = None,
+    author_id: Optional[uuid.UUID] = None,
+):
     """The effect one action plans, or None when it plans none.
 
     Called from the engine while rules run, so a malformed value — a rule
@@ -125,6 +147,8 @@ def plan_from_action(action_op: str, value: Any):
         if action_op == SHARE_ACTION:
             parsed = parse_share_action(value)
             return PlannedShare(
+                rule_id=rule_id,
+                author_id=author_id,
                 group_id=parsed.group_id,
                 share_type=parsed.share_type,
                 splits=tuple(
@@ -134,32 +158,55 @@ def plan_from_action(action_op: str, value: Any):
         if action_op == CONTRIBUTION_ACTION:
             parsed_contribution = parse_contribution_action(value)
             return PlannedContribution(
+                rule_id=rule_id,
+                author_id=author_id,
                 group_id=parsed_contribution.group_id,
                 member_id=parsed_contribution.member_id,
             )
     except ValueError:
-        logger.warning("Rule action %s carries a value it cannot act on", action_op)
+        logger.warning(
+            "Rule %s: action %s carries a value it cannot act on", rule_id, action_op
+        )
     return None
 
 
 async def validate_action(
-    session: AsyncSession, workspace_id: uuid.UUID, action_op: str, value: Any
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    action_op: str,
+    value: Any,
+    author_id: Optional[uuid.UUID] = None,
 ) -> None:
     """Refuse a group action a rule could never carry out.
 
     Runs where every other rule action is validated, so a rule naming a
-    group that is not this workspace's, a member of another group, or a
-    distribution that does not add up, is turned down when it is written
-    rather than every time it fires.
+    group that is not this workspace's, a group its author has no part
+    in, a member of another group, or a distribution that does not add
+    up, is turned down when it is written rather than every time it
+    fires.
+
+    `author_id` is the rule's own author, because the author is who the
+    effect is written as. Without them the group is only checked against
+    the workspace, which is what a preview with no viewer gets.
     """
     from app.models.group import Group, GroupMember
 
     async def _group(group_id: uuid.UUID) -> None:
-        found = await session.execute(
-            select(Group.id).where(
-                Group.id == group_id, Group.workspace_id == workspace_id
-            )
+        query = select(Group.id).where(
+            Group.id == group_id, Group.workspace_id == workspace_id
         )
+        if author_id is not None:
+            # The same reach the sharing and settlement services give a
+            # user: the group's owner, or a member linked to them.
+            linked_group_ids = (
+                select(GroupMember.group_id)
+                .where(GroupMember.linked_user_id == author_id)
+                .distinct()
+            )
+            query = query.where(
+                or_(Group.user_id == author_id, Group.id.in_(linked_group_ids))
+            )
+        found = await session.execute(query)
         if found.scalar_one_or_none() is None:
             raise ValueError("Group not found")
 
@@ -206,6 +253,35 @@ async def transaction_has_shares(
     return result.first() is not None
 
 
+def _skip(
+    report: EffectReport,
+    transaction: Transaction,
+    plan: "PlannedEffect",
+    reason: str,
+    *,
+    loud: bool = False,
+) -> None:
+    """Record a skipped effect and say so in the log.
+
+    A rule that goes quiet at 02:00 in an unattended sync is only
+    findable afterwards if it left a line behind. Amounts stay out of it:
+    the transaction id is enough to look the row up.
+    """
+    report.skipped.append(reason)
+    (logger.warning if loud else logger.info)(
+        "Rule %s skipped a group effect on transaction %s: %s",
+        plan.rule_id,
+        transaction.id,
+        reason,
+    )
+
+
+# What "more than one candidate" reads like when the settlement service
+# refuses to guess. It is the one skip that means a transfer may go
+# uncounted, so it is logged louder than the rest.
+AMBIGUOUS_REFUSAL = "More than one contribution"
+
+
 async def _write_share(
     session: AsyncSession,
     transaction: Transaction,
@@ -222,11 +298,14 @@ async def _write_share(
     # and a transaction taken out of the pot — shared 100 % on its payer —
     # stays out.
     if await transaction_has_shares(session, transaction.id):
-        report.skipped.append("This transaction already carries shares")
+        _skip(report, transaction, plan, "This transaction already carries shares")
         return
     if await is_contribution_link(session, transaction.id):
-        report.skipped.append(
-            "This transaction is a contribution, so it cannot also be shared"
+        _skip(
+            report,
+            transaction,
+            plan,
+            "This transaction is a contribution, so it cannot also be shared",
         )
         return
 
@@ -265,16 +344,100 @@ async def _write_contribution(
         # other member's account, two contributions could be its other
         # leg — and never about the rule. Skipping keeps a rule
         # idempotent and keeps a sync going.
-        report.skipped.append(str(exc))
+        _skip(
+            report,
+            transaction,
+            plan,
+            str(exc),
+            loud=AMBIGUOUS_REFUSAL in str(exc),
+        )
         return
     if contribution_plan is None:
-        report.skipped.append("Group not found or not visible to this user")
+        _skip(
+            report, transaction, plan, "Group not found or not visible to this user"
+        )
+        return
+
+    if contribution_plan.existing_settlement_id is None and await _twin_already_marked(
+        session, transaction, plan.group_id, contribution_plan
+    ):
+        _skip(
+            report,
+            transaction,
+            plan,
+            "The same transfer was already marked from another bank row the "
+            "provider reported twice",
+        )
         return
 
     await settlement_service.write_contribution_plan(
         session, plan.group_id, transaction.workspace_id, contribution_plan
     )
     report.contributions_written += 1
+
+
+# The window bank sync's phantom-duplicate cleanup works over: a provider
+# that reports one payment twice dates the twin within a day of the real
+# one, with the same amount and a near-identical description.
+PHANTOM_WINDOW_DAYS = 1
+PHANTOM_DESCRIPTION_OVERLAP = 0.9
+
+
+async def _twin_already_marked(
+    session: AsyncSession,
+    transaction: Transaction,
+    group_id: uuid.UUID,
+    plan,
+) -> bool:
+    """True when this row is the provider's second report of a payment
+    that is already a contribution.
+
+    Some providers send the same payment twice under two external ids a
+    day apart. Sync pairs the real one and deletes the twin afterwards —
+    but a rule has already marked both by then, and deleting the twin
+    leaves its contribution standing with a null link, doubling what the
+    member is credited with, unattended.
+
+    So a rule does not make a second contribution out of a row that looks
+    exactly like the one already marked: same account, same amount, same
+    type, within a day, near-identical description, and the contribution
+    it is linked to runs between the same members for the same amount.
+    Marking it by hand still works — the person doing it can see both
+    rows — and the twin's own deletion then takes nothing with it.
+    """
+    from app.models.group_settlement import GroupSettlement
+    from app.services.text_similarity import token_overlap
+
+    side_column = (
+        GroupSettlement.transaction_id
+        if plan.side == "payer"
+        else GroupSettlement.receiver_transaction_id
+    )
+    rows = await session.execute(
+        select(Transaction, GroupSettlement)
+        .join(GroupSettlement, side_column == Transaction.id)
+        .where(
+            Transaction.account_id == transaction.account_id,
+            Transaction.id != transaction.id,
+            Transaction.amount == transaction.amount,
+            Transaction.type == transaction.type,
+            Transaction.date >= transaction.date - timedelta(days=PHANTOM_WINDOW_DAYS),
+            Transaction.date <= transaction.date + timedelta(days=PHANTOM_WINDOW_DAYS),
+            GroupSettlement.group_id == group_id,
+            GroupSettlement.from_member_id == plan.from_member_id,
+            GroupSettlement.to_member_id == plan.to_member_id,
+            GroupSettlement.amount == plan.amount,
+            GroupSettlement.currency == plan.currency,
+        )
+    )
+    for twin, _settlement in rows.all():
+        overlap = token_overlap(
+            twin.original_description or twin.description,
+            transaction.original_description or transaction.description,
+        )
+        if overlap >= PHANTOM_DESCRIPTION_OVERLAP:
+            return True
+    return False
 
 
 # Everything a rule can write on the transaction itself. A failing
@@ -316,6 +479,14 @@ async def apply_planned_effects(
     effect rolls back that transaction's other rule changes": SQLAlchemy
     flushes pending state when a SAVEPOINT opens, so the field changes
     are not inside it and have to be undone by hand.
+
+    Each effect is written as its own rule's author; `user_id` is the
+    fallback for an effect that carries none. A database error — the
+    unique indexes behind "one transaction, one contribution" firing when
+    the savepoint is released, because someone else marked the same
+    transfer in the same moment — is a failure like any other: the
+    savepoint goes back, this transaction keeps nothing, and the sync
+    carries on with the next row.
     """
     report = EffectReport()
     if not effects:
@@ -324,13 +495,16 @@ async def apply_planned_effects(
     try:
         async with session.begin_nested():
             for effect in effects:
+                acting_user_id = getattr(effect, "author_id", None) or user_id
                 if isinstance(effect, PlannedShare):
-                    await _write_share(session, transaction, effect, user_id, report)
+                    await _write_share(
+                        session, transaction, effect, acting_user_id, report
+                    )
                 elif isinstance(effect, PlannedContribution):
                     await _write_contribution(
-                        session, transaction, effect, user_id, report
+                        session, transaction, effect, acting_user_id, report
                     )
-    except (ValueError, PermissionError) as exc:
+    except (ValueError, PermissionError, SQLAlchemyError) as exc:
         report.failure = str(exc)
         report.shares_written = 0
         report.contributions_written = 0

@@ -1302,7 +1302,7 @@
       "history": "Historia"
     },
     "shareInGroup": "Podziel w grupie",
-    "shareInGroupHint": "(każde dopasowanie trafia do wspólnej puli)",
+    "shareInGroupHint": "(każde dopasowanie trafia do wspólnej puli — przelew między własnymi kontami także, więc wyklucz je w warunkach)",
     "markAsContribution": "Oznacz jako wpłatę",
     "markAsContributionHint": "(sama transakcja jest wpłatą)",
     "selectGroup": "Wybierz grupę...",

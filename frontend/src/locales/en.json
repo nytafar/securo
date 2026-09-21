@@ -1235,7 +1235,7 @@
       "history": "History"
     },
     "shareInGroup": "Share in group",
-    "shareInGroupHint": "(every match joins the group's pot)",
+    "shareInGroupHint": "(every match joins the group's pot — a transfer between your own accounts joins it too, so keep those out with the conditions)",
     "markAsContribution": "Mark as contribution",
     "markAsContributionHint": "(the transaction itself is the contribution)",
     "selectGroup": "Select group...",

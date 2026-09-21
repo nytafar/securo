@@ -1384,6 +1384,433 @@ async def test_the_preview_says_what_it_would_pass_over(
     assert item.skipped_effects == ["This transaction already carries shares"]
 
 
+# ────────────── what the unattended sync must not get wrong ─────────────
+
+
+@pytest.mark.asyncio
+async def test_a_rule_joins_the_contribution_that_was_typed_in_first(
+    session, test_user, test_workspace
+):
+    """He records the month's 2 000 by hand before the bank has anything,
+    the bank then delivers both legs and pairs them, and the rule runs
+    over history. One contribution, 2 000 — not two rows and 4 000."""
+    home = await _household(session, test_user, test_workspace)
+    when = date(2026, 5, 5)
+    by_hand = GroupSettlement(
+        id=uuid.uuid4(),
+        group_id=home["group"].id,
+        workspace_id=test_workspace.id,
+        from_member_id=home["her"].id,
+        to_member_id=home["me"].id,
+        amount=D("2000.00"),
+        currency="USD",
+        date=when,
+        notes="May",
+    )
+    session.add(by_hand)
+    pair_id = uuid.uuid4()
+    credit = await _bank_row(
+        session,
+        home["mine"],
+        "2000.00",
+        type_="credit",
+        description="MONTHLY TRANSFER",
+        when=when,
+    )
+    debit = await _bank_row(
+        session, home["hers"], "2000.00", description="MONTHLY TRANSFER", when=when
+    )
+    credit.transfer_pair_id = pair_id
+    debit.transfer_pair_id = pair_id
+    await session.commit()
+
+    into = await _rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        "Transfer in",
+        "MONTHLY TRANSFER",
+        [_contribution_action(home, member=home["her"])],
+    )
+    out = await _rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        "Transfer out",
+        "MONTHLY TRANSFER",
+        [_contribution_action(home, member=home["me"])],
+    )
+    await rule_service.apply_single_rule(session, test_workspace.id, into)
+    await rule_service.apply_single_rule(session, test_workspace.id, out)
+
+    rows = await _contributions(session, home["group"].id)
+    assert len(rows) == 1
+    assert rows[0].id == by_hand.id
+    assert rows[0].transaction_id == debit.id
+    assert rows[0].receiver_transaction_id == credit.id
+
+    positions = await position_service.compute_positions(
+        session, home["group"].id, test_workspace.id, test_user.id
+    )
+    assert positions is not None
+    made = {p.member_id: p.contributions_made for p in positions.positions}
+    assert made[home["her"].id] == D("2000.00")
+
+
+@pytest.mark.asyncio
+async def test_a_transfer_the_bank_reported_twice_stays_one_contribution(
+    session, test_user, test_workspace
+):
+    """The provider sends her 2 000 twice under two external ids a day
+    apart. The rule marks the real one; the twin is passed over, so when
+    sync's phantom cleanup deletes it nothing is left behind pointing at
+    a row that no longer exists."""
+    home = await _household(session, test_user, test_workspace)
+    her_conn = await _connected_account(
+        session, home["partner_user"].id, test_workspace.id, home["hers"], "acc-hers"
+    )
+    his_conn = await _connected_account(
+        session, test_user.id, test_workspace.id, home["mine"], "acc-mine"
+    )
+    await _rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        "Transfer in",
+        "MONTHLY TRANSFER",
+        [_contribution_action(home, member=home["her"])],
+    )
+    await _rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        "Transfer out",
+        "MONTHLY TRANSFER",
+        [_contribution_action(home, member=home["me"])],
+    )
+    group_id = home["group"].id
+
+    await _sync(
+        session,
+        her_conn.id,
+        test_workspace.id,
+        home["partner_user"].id,
+        _provider(
+            [
+                _incoming(
+                    external_id="d1",
+                    description="MONTHLY TRANSFER",
+                    amount=D("2000.00"),
+                    date=date(2026, 5, 5),
+                )
+            ],
+            account_ext="acc-hers",
+        ),
+    )
+    await _sync(
+        session,
+        his_conn.id,
+        test_workspace.id,
+        test_user.id,
+        _provider(
+            [
+                _incoming(
+                    external_id="c1",
+                    description="MONTHLY TRANSFER",
+                    amount=D("2000.00"),
+                    date=date(2026, 5, 5),
+                    type="credit",
+                ),
+                _incoming(
+                    external_id="c1-again",
+                    description="MONTHLY TRANSFER",
+                    amount=D("2000.00"),
+                    date=date(2026, 5, 6),
+                    type="credit",
+                ),
+            ],
+            account_ext="acc-mine",
+        ),
+    )
+
+    rows = await _contributions(session, group_id)
+    assert len(rows) == 1, "one transfer, one contribution"
+    linked = {rows[0].transaction_id, rows[0].receiver_transaction_id}
+    surviving = {
+        row.id
+        for row in (
+            await session.execute(
+                select(Transaction).where(Transaction.source == "sync")
+            )
+        ).scalars().all()
+    }
+    assert None not in linked, "both sides of it are real rows"
+    assert linked <= surviving, "and neither was deleted as a phantom"
+
+    positions = await position_service.compute_positions(
+        session, group_id, test_workspace.id, test_user.id
+    )
+    assert positions is not None
+    made = {p.member_id: p.contributions_made for p in positions.positions}
+    assert made[home["her"].id] == D("2000.00")
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_effect_says_so_in_the_log(
+    session, test_user, test_workspace, caplog
+):
+    """A rule that goes quiet in an unattended sync has to leave a line
+    naming the rule and the transaction."""
+    import logging
+
+    home = await _household(session, test_user, test_workspace)
+    personal = await _bank_row(session, home["mine"], "300.00")
+    await split_service.replace_splits(
+        session,
+        personal,
+        TransactionSplitsInput(
+            share_type="percent",
+            splits=[
+                TransactionSplitInput(group_member_id=home["me"].id, share_pct=D("100"))
+            ],
+        ),
+        test_user.id,
+    )
+    await session.commit()
+    rule = await _rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        "Groceries",
+        "SUPERMARKET",
+        [_share_action(home)],
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.services.rule_effects"):
+        await rule_service.apply_single_rule(session, test_workspace.id, rule)
+
+    (line,) = [r for r in caplog.records if "skipped a group effect" in r.message]
+    assert line.levelno == logging.INFO
+    assert str(rule.id) in line.getMessage()
+    assert str(personal.id) in line.getMessage()
+    assert "already carries shares" in line.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_contribution_refusal_is_logged_louder(
+    session, test_user, test_workspace, caplog
+):
+    """Two contributions could be this leg's other half, so the rule
+    refuses to guess — which means a transfer goes uncounted until
+    someone links it by hand. That is a warning, not a note."""
+    import logging
+
+    home = await _household(session, test_user, test_workspace)
+    when = date(2026, 5, 5)
+    for note in ("one", "two"):
+        session.add(
+            GroupSettlement(
+                id=uuid.uuid4(),
+                group_id=home["group"].id,
+                workspace_id=test_workspace.id,
+                from_member_id=home["her"].id,
+                to_member_id=home["me"].id,
+                amount=D("2000.00"),
+                currency="USD",
+                date=when,
+                notes=note,
+            )
+        )
+    credit = await _bank_row(
+        session,
+        home["mine"],
+        "2000.00",
+        type_="credit",
+        description="MONTHLY TRANSFER",
+        when=when,
+    )
+    await session.commit()
+    rule = await _rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        "Her transfer",
+        "MONTHLY TRANSFER",
+        [_contribution_action(home)],
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.services.rule_effects"):
+        await rule_service.apply_single_rule(session, test_workspace.id, rule)
+
+    (line,) = [r for r in caplog.records if "skipped a group effect" in r.message]
+    assert line.levelno == logging.WARNING
+    assert "More than one contribution" in line.getMessage()
+    assert str(credit.id) in line.getMessage()
+    assert len(await _contributions(session, home["group"].id)) == 2, "neither was touched"
+
+
+@pytest.mark.asyncio
+async def test_a_database_error_in_an_effect_does_not_abort_the_run(
+    session, test_user, test_workspace, test_categories
+):
+    """Two writers can mark the same transfer in the same moment, and
+    then the unique indexes behind "one transaction, one contribution"
+    fire when the savepoint is released. That is this transaction's
+    failure, not the sync's."""
+    home = await _household(session, test_user, test_workspace)
+    credit = await _bank_row(
+        session,
+        home["mine"],
+        "2000.00",
+        type_="credit",
+        description="MONTHLY TRANSFER",
+    )
+    await session.commit()
+    rule = await _rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        "Her transfer",
+        "MONTHLY TRANSFER",
+        [
+            {"op": "set_category", "value": str(test_categories[0].id)},
+            _contribution_action(home),
+        ],
+    )
+    # The row is already a contribution's receiver side, and the service
+    # check that would have seen it is blinded — what a second writer's
+    # row looks like from in here.
+    session.add(
+        GroupSettlement(
+            id=uuid.uuid4(),
+            group_id=home["group"].id,
+            workspace_id=test_workspace.id,
+            from_member_id=home["her"].id,
+            to_member_id=home["me"].id,
+            amount=D("2000.00"),
+            currency="USD",
+            date=credit.date,
+            receiver_transaction_id=credit.id,
+        )
+    )
+    await session.commit()
+
+    with patch(
+        "app.services.settlement_service._assert_transaction_unlinked",
+        new_callable=AsyncMock,
+    ):
+        count = await rule_service.apply_single_rule(session, test_workspace.id, rule)
+
+    assert count == 0
+    await session.refresh(credit)
+    assert credit.category_id is None, "the rule's other changes went back"
+    assert len(await _contributions(session, home["group"].id)) == 1
+    # The session is still usable, which is what "the sync carries on"
+    # means for the rows after this one.
+    assert (await session.execute(select(Transaction.id))).first() is not None
+
+
+# ─────────────────────── whose rule it is, and where ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_rule_cannot_share_in_a_group_its_author_has_no_part_in(
+    session, test_user, test_workspace
+):
+    home = await _household(session, test_user, test_workspace)
+    outsider = await _partner(session, test_workspace)
+    await session.commit()
+
+    with pytest.raises(ValueError, match="Group not found"):
+        await rule_service.create_rule(
+            session,
+            test_workspace.id,
+            outsider.id,
+            RuleCreate(
+                name="Groceries",
+                conditions_op="and",
+                conditions=[
+                    {"field": "description", "op": "contains", "value": "SUPERMARKET"}
+                ],
+                actions=[_share_action(home)],
+                apply_to_existing=False,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_her_rule_fires_on_his_sync(session, test_user, test_workspace):
+    """She wrote the rule and is a linked member; he owns the group and
+    the account the charge lands on. The effect is written as her, and
+    the pot gets its shares."""
+    home = await _household(session, test_user, test_workspace)
+    conn = await _connected_account(
+        session, test_user.id, test_workspace.id, home["mine"], "acc-mine"
+    )
+    await _rule(
+        session,
+        test_workspace.id,
+        home["partner_user"].id,
+        "Groceries",
+        "SUPERMARKET",
+        [_share_action(home)],
+    )
+
+    await _sync(
+        session,
+        conn.id,
+        test_workspace.id,
+        test_user.id,
+        _provider(
+            [
+                _incoming(
+                    external_id="s1",
+                    description="SUPERMARKET",
+                    amount=D("300.00"),
+                    date=date(2026, 5, 15),
+                )
+            ],
+            account_ext="acc-mine",
+        ),
+    )
+
+    tx = (
+        await session.execute(
+            select(Transaction).where(Transaction.external_id == "s1")
+        )
+    ).scalar_one()
+    assert sorted(s.share_amount for s in await _shares_of(session, tx.id)) == [
+        D("150.00"),
+        D("150.00"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_negative_share_cannot_be_stored(session, test_user, test_workspace):
+    home = await _household(session, test_user, test_workspace)
+    with pytest.raises(ValueError, match="Invalid group sharing action"):
+        await _rule(
+            session,
+            test_workspace.id,
+            test_user.id,
+            "Groceries",
+            "SUPERMARKET",
+            [
+                {
+                    "op": "share_in_group",
+                    "value": {
+                        "group_id": str(home["group"].id),
+                        "share_type": "percent",
+                        "splits": [
+                            {"group_member_id": str(home["me"].id), "share_pct": 130},
+                            {"group_member_id": str(home["her"].id), "share_pct": -30},
+                        ],
+                    },
+                }
+            ],
+        )
+
+
 # ──────────────────────────── over the API ──────────────────────────────
 
 

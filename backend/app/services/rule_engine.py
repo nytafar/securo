@@ -198,6 +198,8 @@ def apply_rule_actions(
     skip_description: bool = False,
     hidden_category_ids: Collection[uuid.UUID] | None = None,
     effects: list | None = None,
+    rule_id: uuid.UUID | None = None,
+    rule_author_id: uuid.UUID | None = None,
 ) -> bool:
     """Apply actions in-place and return the updated category-set flag.
 
@@ -209,9 +211,10 @@ def apply_rule_actions(
 
     Two actions change nothing on the transaction itself: sharing it in a
     group and marking it as a contribution are rows in other tables. They
-    are *planned* here — appended to `effects` as plain data — and written
-    by whoever owns the database transaction. This function stays what it
-    has always been: pure, and safe to run against a detached preview.
+    are *planned* here — appended to `effects` as plain data, carrying
+    the rule they came from and its author — and written by whoever owns
+    the database transaction. This function stays what it has always
+    been: pure, and safe to run against a detached preview.
     """
     for action in actions:
         op = action.get("op")
@@ -260,7 +263,7 @@ def apply_rule_actions(
                 continue
             from app.services.rule_effects import plan_from_action
 
-            planned = plan_from_action(op, value)
+            planned = plan_from_action(op, value, rule_id, rule_author_id)
             if planned is not None:
                 effects.append(planned)
 

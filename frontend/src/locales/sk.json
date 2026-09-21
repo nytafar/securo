@@ -1323,7 +1323,7 @@
       "history": "História"
     },
     "shareInGroup": "Rozdeliť v skupine",
-    "shareInGroupHint": "(každá zhoda ide do spoločnej pokladnice)",
+    "shareInGroupHint": "(každá zhoda ide do spoločnej pokladnice — aj prevod medzi vlastnými účtami, preto ich vylúčte v podmienkach)",
     "markAsContribution": "Označiť ako príspevok",
     "markAsContributionHint": "(samotná transakcia je príspevok)",
     "selectGroup": "Vyberte skupinu...",

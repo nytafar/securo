@@ -803,6 +803,17 @@ async def test_propose_share_transaction_refuses_a_contribution(
     )
 
     handler = REGISTRY["propose_share_transaction"].handler
+    # The preview refuses it too: a proposal that promised shares the
+    # Apply button then turned down would be worse than none.
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+    )
+    assert "cannot be shared" in preview["error"]
+    assert "proposed" not in preview
+
     result = await handler(
         session=session,
         ctx=_Ctx(user_id=test_user.id, external=True),
@@ -811,6 +822,48 @@ async def test_propose_share_transaction_refuses_a_contribution(
         apply=True,
     )
     assert "cannot be shared" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_propose_share_transaction_refuses_a_member_of_another_group(
+    session, test_user, test_workspace
+):
+    from app.schemas.group import GroupCreate, GroupMemberCreate
+    from app.services import group_service
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    other = await group_service.create_group(
+        session, test_workspace.id, test_user.id, GroupCreate(name="Trip")
+    )
+    stranger = await group_service.create_member(
+        session, other.id, test_workspace.id, GroupMemberCreate(name="Someone")
+    )
+    assert stranger is not None
+    groceries = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        "300.00",
+        description="SUPERMARKET",
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_share_transaction"].handler
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(groceries.id),
+        splits=[
+            {"group_member_id": str(home["me"].id)},
+            {"group_member_id": str(stranger.id)},
+        ],
+    )
+    assert preview["error"] == "One or more split members not found"
 
 
 @pytest.mark.asyncio

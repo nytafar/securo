@@ -1236,7 +1236,7 @@
       "history": "Cronologia"
     },
     "shareInGroup": "Dividi nel gruppo",
-    "shareInGroupHint": "(ogni corrispondenza entra nella cassa comune del gruppo)",
+    "shareInGroupHint": "(ogni corrispondenza entra nella cassa comune del gruppo — anche un giroconto tra i tuoi conti, quindi escludili nelle condizioni)",
     "markAsContribution": "Segna come contributo",
     "markAsContributionHint": "(la transazione stessa è il contributo)",
     "selectGroup": "Seleziona gruppo...",

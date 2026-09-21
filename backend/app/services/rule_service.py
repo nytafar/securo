@@ -81,7 +81,10 @@ async def _validate_rule_definition(
     workspace_id: uuid.UUID,
     conditions: list,
     actions: list,
+    author_id: Optional[uuid.UUID] = None,
 ) -> None:
+    """`author_id` is the rule's own author: a group action is written as
+    them, so the group has to be one they own or are a member of."""
     for condition in _flatten_conditions(conditions):
         field = _rule_item_value(condition, "field")
         op = _rule_item_value(condition, "op")
@@ -127,7 +130,9 @@ async def _validate_rule_definition(
             if len(value.strip()) > 500:
                 raise ValueError("Description cannot exceed 500 characters")
         elif op in rule_engine.GROUP_ACTION_OPS:
-            await rule_effects.validate_action(session, workspace_id, op, value)
+            await rule_effects.validate_action(
+                session, workspace_id, op, value, author_id
+            )
 
 
 # ─── Universal rules (work for any language/country) ───
@@ -997,6 +1002,7 @@ async def import_rules(
                 workspace_id,
                 [condition.model_dump() for condition in incoming.conditions],
                 resolved_actions,
+                author_id=user_id,
             )
         except ValueError:
             skipped += 1
@@ -1042,7 +1048,9 @@ async def create_rule(
     if data.name in existing_names:
         raise DuplicateRuleError(f"A rule named '{data.name}' already exists")
 
-    await _validate_rule_definition(session, workspace_id, data.conditions, data.actions)
+    await _validate_rule_definition(
+        session, workspace_id, data.conditions, data.actions, author_id=user_id
+    )
 
     rule = Rule(
         user_id=user_id,
@@ -1087,6 +1095,9 @@ async def update_rule(
         workspace_id,
         update_data.get("conditions", rule.conditions or []),
         update_data.get("actions", rule.actions or []),
+        # The rule's own author, not whoever is editing it: the author is
+        # who its effects are written as.
+        author_id=rule.user_id,
     )
 
     for key, value in update_data.items():
@@ -1250,6 +1261,8 @@ async def apply_rules_to_transaction(
                 category_set,
                 hidden_category_ids=hidden_categories,
                 effects=planned,
+                rule_id=rule.id,
+                rule_author_id=rule.user_id,
             )
 
     if effects is None and planned:
@@ -1312,7 +1325,9 @@ async def preview_rule(
     still stand.
     """
     will_apply = is_active and apply_to_existing
-    await _validate_rule_definition(session, workspace_id, conditions, actions or [])
+    await _validate_rule_definition(
+        session, workspace_id, conditions, actions or [], author_id=user_id
+    )
 
     # Every transaction is evaluated in Python, so only the columns the engine
     # reads and `_rule_preview` copies are worth fetching — notably not
@@ -1659,6 +1674,8 @@ async def apply_single_rule(
             skip_description=_has_manual_description(tx),
             hidden_category_ids=hidden_categories,
             effects=planned,
+            rule_id=rule.id,
+            rule_author_id=rule.user_id,
         )
         report = await rule_effects.apply_planned_effects(
             session,
@@ -1721,6 +1738,8 @@ async def apply_all_rules(session: AsyncSession, workspace_id: uuid.UUID) -> int
                     skip_description=preserve_manual_description,
                     hidden_category_ids=hidden_categories,
                     effects=planned,
+                    rule_id=rule.id,
+                    rule_author_id=rule.user_id,
                 )
 
         # Shares and contributions are not reset the way a category is:
@@ -1729,6 +1748,10 @@ async def apply_all_rules(session: AsyncSession, workspace_id: uuid.UUID) -> int
         # made of a real bank row — is not reapplying a rule, it is
         # losing a fact. Sharing by rule therefore skips a transaction
         # that already carries shares here too.
+        #
+        # Each effect is written as the author of the rule that planned
+        # it, so a run that matches two people's rules attributes each to
+        # its own; `acting_user_id` is only the fallback.
         if planned and acting_user_id is not None:
             await rule_effects.apply_planned_effects(
                 session,

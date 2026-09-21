@@ -1235,7 +1235,7 @@
       "history": "履歴"
     },
     "shareInGroup": "グループで分担",
-    "shareInGroupHint": "(一致した取引はグループの共同財布に入ります)",
+    "shareInGroupHint": "(一致した取引はグループの共同財布に入ります。自分の口座間の振替も入るので、条件で除外してください)",
     "markAsContribution": "拠出として記録",
     "markAsContributionHint": "(取引そのものが拠出になります)",
     "selectGroup": "グループを選択...",
