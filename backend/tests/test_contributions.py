@@ -1617,6 +1617,163 @@ async def test_a_pair_partner_that_is_a_contribution_is_the_only_candidate(
     assert second.json()["id"] == first.json()["id"]
 
 
+@pytest.mark.asyncio
+async def test_a_paired_leg_joins_a_contribution_that_links_nothing_yet(
+    client, auth_headers, session, test_user, test_workspace
+):
+    """He records the month's contribution by hand before the bank has
+    delivered anything, then the bank sends both legs and pairs them.
+    Marking either leg has to join that row, not write a second one:
+    2 000 moved, so 2 000 is what the pot may count."""
+    home = await _household(session, test_user, test_workspace)
+    when = date(2026, 5, 20)
+    by_hand = GroupSettlement(
+        id=uuid.uuid4(),
+        group_id=home["group"].id,
+        workspace_id=test_workspace.id,
+        from_member_id=home["partner"].id,
+        to_member_id=home["me"].id,
+        amount=Decimal("2000.00"),
+        currency="USD",
+        date=when,
+        notes="May",
+    )
+    session.add(by_hand)
+    pair_id = uuid.uuid4()
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=when,
+    )
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    credit.transfer_pair_id = pair_id
+    debit.transfer_pair_id = pair_id
+    await session.commit()
+
+    url = f"/api/groups/{home['group'].id}/settlements/from-transaction"
+    first = await client.post(
+        url, headers=auth_headers,
+        json={"transaction_id": str(credit.id), "member_id": str(home["partner"].id)},
+    )
+    second = await client.post(
+        url, headers=auth_headers,
+        json={"transaction_id": str(debit.id), "member_id": str(home["me"].id)},
+    )
+    assert first.status_code == 201 and second.status_code == 201, second.text
+    assert first.json()["id"] == str(by_hand.id)
+    assert second.json()["id"] == str(by_hand.id)
+
+    rows = (await session.execute(select(GroupSettlement))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].transaction_id == debit.id
+    assert rows[0].receiver_transaction_id == credit.id
+
+    period = await client.get(
+        f"/api/groups/{home['group'].id}/period", headers=auth_headers
+    )
+    made = {
+        row["member_id"]: row["contributions_made"]
+        for row in period.json()["positions"]
+    }
+    assert made[str(home["partner"].id)] == "2000.00"
+
+
+@pytest.mark.asyncio
+async def test_a_paired_leg_still_prefers_the_contribution_holding_its_partner(
+    client, auth_headers, session, test_user, test_workspace
+):
+    """A contribution that links nothing is only the fallback: when the
+    transaction's own partner is already on a contribution, that one
+    wins and the empty row is left for whatever it was recorded for."""
+    home = await _household(session, test_user, test_workspace)
+    when = date(2026, 5, 20)
+    empty = GroupSettlement(
+        id=uuid.uuid4(),
+        group_id=home["group"].id,
+        workspace_id=test_workspace.id,
+        from_member_id=home["partner"].id,
+        to_member_id=home["me"].id,
+        amount=Decimal("2000.00"),
+        currency="USD",
+        date=when,
+        notes="recorded by hand",
+    )
+    session.add(empty)
+    pair_id = uuid.uuid4()
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=when,
+    )
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    credit.transfer_pair_id = pair_id
+    debit.transfer_pair_id = pair_id
+    await session.commit()
+
+    url = f"/api/groups/{home['group'].id}/settlements/from-transaction"
+    first = await client.post(
+        url, headers=auth_headers,
+        json={"transaction_id": str(credit.id), "member_id": str(home["partner"].id)},
+    )
+    assert first.json()["id"] == str(empty.id), "the empty row takes the first leg"
+
+    second = await client.post(
+        url, headers=auth_headers,
+        json={"transaction_id": str(debit.id), "member_id": str(home["me"].id)},
+    )
+    assert second.status_code == 201, second.text
+    assert second.json()["id"] == str(empty.id), "and its partner joins it"
+    rows = (await session.execute(select(GroupSettlement))).scalars().all()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_paired_leg_never_joins_a_contribution_holding_another_transfer(
+    client, auth_headers, session, test_user, test_workspace
+):
+    """The fallback is only for a contribution with no bank row at all.
+    One already holding some other transfer's leg is a different event
+    and stays out of it."""
+    home = await _household(session, test_user, test_workspace)
+    when = date(2026, 5, 20)
+    first_pair, second_pair = uuid.uuid4(), uuid.uuid4()
+    credit_one = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=when,
+    )
+    debit_one = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    credit_two = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=when,
+    )
+    debit_two = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    credit_one.transfer_pair_id = debit_one.transfer_pair_id = first_pair
+    credit_two.transfer_pair_id = debit_two.transfer_pair_id = second_pair
+    await session.commit()
+
+    url = f"/api/groups/{home['group'].id}/settlements/from-transaction"
+    one = await client.post(
+        url, headers=auth_headers,
+        json={"transaction_id": str(credit_one.id), "member_id": str(home["partner"].id)},
+    )
+    two = await client.post(
+        url, headers=auth_headers,
+        json={"transaction_id": str(debit_two.id), "member_id": str(home["me"].id)},
+    )
+    assert one.status_code == 201 and two.status_code == 201
+    assert one.json()["id"] != two.json()["id"], "two transfers, two contributions"
+
+
 # ───────────── transfer detection obeys the same rules as a person ───────
 
 

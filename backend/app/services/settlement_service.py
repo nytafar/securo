@@ -1000,10 +1000,13 @@ async def _contribution_awaiting_this_leg(
     payer side is free and the matching debit belongs there.
 
     Transfer pairing decides the rest. A transaction the bank's two legs
-    were matched on belongs to the contribution holding its own partner
-    and to no other; one that is unpaired cannot join a contribution
-    whose other leg is paired with something else. Without that, two
-    transfers of the same amount on the same day cross over.
+    were matched on belongs to the contribution holding its own partner;
+    failing that, to a contribution that links no bank row at all — the
+    month's transfer typed in by hand before the bank delivered it — and
+    never to one holding some other transfer's leg. A transaction that is
+    unpaired cannot join a contribution whose other leg is paired with
+    something else. Without that, two transfers of the same amount on the
+    same day cross over.
 
     Returns None when nothing matches. Raises when more than one does:
     which of two contributions this leg belongs to is a fact about money
@@ -1034,13 +1037,25 @@ async def _contribution_awaiting_this_leg(
     ]
     pair_of = await _transfer_pairs_of(session, [leg for leg in other_legs if leg])
 
-    candidates: list[tuple[GroupSettlement, ContributionLinks]] = []
+    # Two tiers, in this order: the contribution already holding this
+    # transaction's own partner, and — only when there is no such row —
+    # a contribution that holds no bank leg at all, which is what a
+    # contribution recorded by hand before the bank delivered anything
+    # looks like.
+    partner_candidates: list[tuple[GroupSettlement, ContributionLinks]] = []
+    empty_candidates: list[tuple[GroupSettlement, ContributionLinks]] = []
     for row, links, other_leg in zip(rows, resolved, other_legs):
         if getattr(links, f"{side}_transaction_id") is not None:
             continue
-        if not _legs_of_one_transfer(transfer_pair_id, pair_of.get(other_leg)):
+        if other_leg is None:
+            # This side is free and the other side is empty, so the
+            # contribution has no bank row at all.
+            empty_candidates.append((row, links))
             continue
-        candidates.append((row, links))
+        if _legs_of_one_transfer(transfer_pair_id, pair_of.get(other_leg)):
+            partner_candidates.append((row, links))
+
+    candidates = partner_candidates or empty_candidates
 
     if not candidates:
         return None
@@ -1056,14 +1071,18 @@ async def _contribution_awaiting_this_leg(
 def _legs_of_one_transfer(
     pair_id: Optional[uuid.UUID], other_pair_id: Optional[uuid.UUID]
 ) -> bool:
-    """Whether a transaction and a contribution's other leg can be the
-    two halves of one transfer.
+    """Whether a transaction and a contribution's *linked* other leg can
+    be the two halves of one transfer.
 
     When the transaction is half of a matched pair, only the contribution
-    already holding the other half will do — anything else is a guess,
-    including a contribution with no leg linked at all. When it is
-    unpaired, the other leg has to be unpaired too, or it is half of some
-    other transfer.
+    already holding the other half will do: a contribution holding some
+    other transfer's leg is a different event. When it is unpaired, the
+    other leg has to be unpaired too, or it is half of some other
+    transfer.
+
+    A contribution that links nothing never reaches here — it is not the
+    other leg of anything, and the caller keeps it as the fallback for a
+    transfer whose partner is on no contribution at all.
     """
     if pair_id is not None:
         return other_pair_id == pair_id
