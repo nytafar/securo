@@ -389,6 +389,8 @@
     "allAccounts": "All accounts",
     "viewing": "Viewing",
     "clearFilter": "Clear",
+    "people": "People",
+    "consumptionHint": "Their own costs plus their shares of shared costs.",
     "manage": "Manage collections",
     "add": "New collection",
     "edit": "Edit collection",

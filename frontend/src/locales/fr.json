@@ -389,6 +389,8 @@
     "allAccounts": "Tous les comptes",
     "viewing": "Affichage",
     "clearFilter": "Effacer",
+    "people": "Personnes",
+    "consumptionHint": "Ses propres dépenses plus sa part des dépenses partagées.",
     "manage": "Gérer les collections",
     "add": "Nouvelle collection",
     "edit": "Modifier la collection",

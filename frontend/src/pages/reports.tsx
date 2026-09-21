@@ -146,11 +146,15 @@ export default function ReportsPage() {
   const [sparklinePage, setSparklinePage] = useState(0)
   const [cashFlowBaseline, setCashFlowBaseline] = useState(false)
   const [selectedDate, setSelectedDate] = useState<string | null>(null)
-  // Active Collection filter (issue #105): scope all report tabs to its
-  // accounts; net worth also includes the collection's wallets' assets.
-  const { activeAccountIds, activeWalletIds } = useCollectionFilter()
-  const acctIds = activeAccountIds ?? undefined
+  // Active viewing filter: a collection scopes every tab to its accounts
+  // (net worth also includes its wallets' assets); a user scopes them to
+  // that person — their accounts, and their consumption where the figure
+  // is one. Under a user filter the server resolves the accounts, so the
+  // person is sent instead of a list of ids.
+  const { activeAccountIds, activeWalletIds, activeUserId } = useCollectionFilter()
+  const acctIds = activeUserId ? undefined : (activeAccountIds ?? undefined)
   const walletIds = activeWalletIds ?? undefined
+  const filterUserId = activeUserId ?? undefined
   // Wallet-only collection (active, zero accounts): the account-based reports
   // (income/expenses, cash flow) have no data — only net worth (which includes
   // the wallets' assets) is meaningful.
@@ -194,13 +198,13 @@ export default function ReportsPage() {
   }
 
   const { data, isLoading } = useQuery<ReportResponse>({
-    queryKey: ['reports', activeTab, rangeKey, months, period ?? null, days ?? null, interval, isCashFlow ? cashFlowBaseline : false, activeAccountIds, activeWalletIds],
+    queryKey: ['reports', activeTab, rangeKey, months, period ?? null, days ?? null, interval, isCashFlow ? cashFlowBaseline : false, activeAccountIds, activeWalletIds, activeUserId],
     queryFn: () =>
       isCashFlow
-        ? reports.cashFlow(months, interval, cashFlowBaseline, acctIds)
+        ? reports.cashFlow(months, interval, cashFlowBaseline, acctIds, filterUserId)
         : activeTab === 'income_expenses' || isMoneyMap
-          ? reports.incomeExpenses(months, interval, acctIds, period, days)
-          : reports.netWorth(months, interval, acctIds, walletIds, period),
+          ? reports.incomeExpenses(months, interval, acctIds, period, days, filterUserId)
+          : reports.netWorth(months, interval, acctIds, walletIds, period, filterUserId),
     enabled: currentTab.enabled && !(noAccounts && activeTab !== 'net_worth'),
   })
 

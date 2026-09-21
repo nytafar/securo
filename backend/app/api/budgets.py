@@ -11,6 +11,7 @@ from app.core.workspace_context import (
     current_workspace,
     current_writable_workspace,
 )
+from app.api._user_filter import assert_filterable_user
 from app.schemas.budget import BudgetCreate, BudgetRead, BudgetUpdate, BudgetVsActual
 from app.services import budget_service
 
@@ -65,7 +66,11 @@ async def delete_budget(
 @router.get("/comparison", response_model=list[BudgetVsActual])
 async def budget_comparison(
     month: Optional[date] = Query(None),
+    user_id: Optional[uuid.UUID] = Query(None),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
-    return await budget_service.get_budget_vs_actual(session, ctx.workspace.id, ctx.user_id, month)
+    await assert_filterable_user(session, ctx.workspace.id, user_id)
+    return await budget_service.get_budget_vs_actual(
+        session, ctx.workspace.id, ctx.user_id, month, filter_user_id=user_id
+    )

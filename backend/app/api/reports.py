@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_async_session
 from app.core.workspace_context import WorkspaceContext, current_workspace
+from app.api._user_filter import assert_filterable_user
 from app.schemas.report import ReportResponse
 from app.services import report_service
 
@@ -34,15 +35,18 @@ async def get_net_worth(
     account_ids: Optional[list[uuid.UUID]] = Query(None),
     asset_group_ids: Optional[list[uuid.UUID]] = Query(None),
     period: str | None = Query(None, pattern="^ytd$"),
+    user_id: Optional[uuid.UUID] = Query(None),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
     financial_year_start_month = _financial_year_start_month(ctx.workspace.tax_jurisdiction)
     _reject_unsupported_fiscal_year_report(period, interval, financial_year_start_month)
+    await assert_filterable_user(session, ctx.workspace.id, user_id)
     return await report_service.get_net_worth_report(
         session, ctx.workspace.id, ctx.user_id, months, interval, ctx.user.primary_currency,
         account_ids=account_ids, asset_group_ids=asset_group_ids, period=period,
         financial_year_start_month=financial_year_start_month,
+        filter_user_id=user_id,
     )
 
 
@@ -53,16 +57,19 @@ async def get_income_expenses(
     account_ids: Optional[list[uuid.UUID]] = Query(None),
     period: str | None = Query(None, pattern="^ytd$"),
     days: Optional[int] = Query(None, ge=1, le=730),
+    user_id: Optional[uuid.UUID] = Query(None),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
     """`days` overrides `months` with an exact rolling window ending today."""
     financial_year_start_month = _financial_year_start_month(ctx.workspace.tax_jurisdiction)
     _reject_unsupported_fiscal_year_report(period, interval, financial_year_start_month)
+    await assert_filterable_user(session, ctx.workspace.id, user_id)
     return await report_service.get_income_expenses_report(
         session, ctx.workspace.id, ctx.user_id, months, interval, ctx.user.primary_currency,
         account_ids=account_ids, period=period, days=days,
         financial_year_start_month=financial_year_start_month,
+        filter_user_id=user_id,
     )
 
 
@@ -72,10 +79,12 @@ async def get_cash_flow(
     interval: str = Query("daily", pattern="^(daily|weekly|monthly)$"),
     baseline: bool = Query(False),
     account_ids: Optional[list[uuid.UUID]] = Query(None),
+    user_id: Optional[uuid.UUID] = Query(None),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
+    await assert_filterable_user(session, ctx.workspace.id, user_id)
     return await report_service.get_cash_flow_report(
         session, ctx.workspace.id, ctx.user_id, months, interval, ctx.user.primary_currency,
-        baseline=baseline, account_ids=account_ids,
+        baseline=baseline, account_ids=account_ids, filter_user_id=user_id,
     )

@@ -177,32 +177,40 @@ export default function DashboardPage() {
     setSelectedMonth(newMonth)
 }
 
-  // Active Collection filter (issue #105): scope dashboard cards to its
-  // accounts. undefined when "All accounts".
-  const { activeAccountIds, activeWalletIds } = useCollectionFilter()
-  const acctIds = activeAccountIds ?? undefined
+  // Active viewing filter: a collection scopes the cards to its accounts,
+  // a user scopes them to that person's consumption. undefined when
+  // "All accounts".
+  const { activeAccountIds, activeWalletIds, activeUserId } = useCollectionFilter()
+  // Under a user filter the server resolves the accounts itself, so the
+  // consumption cards send the person and not a list of account ids —
+  // a list of ids would read as a collection and drop the shares.
+  const acctIds = activeUserId ? undefined : (activeAccountIds ?? undefined)
   const walletIds = activeWalletIds ?? undefined
+  const filterUserId = activeUserId ?? undefined
+  // The cash views — the transaction list, the calendar, the drill-down —
+  // take the accounts either filter resolves to, and adjust no share.
+  const listAcctIds = activeAccountIds ?? undefined
   // A wallet-only collection (active, but with zero accounts) has no account
   // data — skip the account-only cards so they render empty instead of
   // silently falling back to "all accounts".
   const noAccounts = activeAccountIds !== null && activeAccountIds.length === 0
 
   const { data: summary, isLoading: summaryLoading } = useQuery({
-    queryKey: ['dashboard', 'summary', selectedMonth, activeAccountIds, activeWalletIds],
-    queryFn: () => dashboard.summary(monthParam, undefined, acctIds, walletIds),
+    queryKey: ['dashboard', 'summary', selectedMonth, activeAccountIds, activeWalletIds, activeUserId],
+    queryFn: () => dashboard.summary(monthParam, undefined, acctIds, walletIds, filterUserId),
   })
 
   const { data: spending, isLoading: spendingLoading } = useQuery({
-    queryKey: ['dashboard', 'spending', selectedMonth, activeAccountIds],
-    queryFn: () => dashboard.spendingByCategory(monthParam, acctIds),
+    queryKey: ['dashboard', 'spending', selectedMonth, activeAccountIds, activeUserId],
+    queryFn: () => dashboard.spendingByCategory(monthParam, acctIds, filterUserId),
     enabled: !noAccounts,
   })
 
   const prevMonth = shiftMonth(selectedMonth, -1)
 
   const { data: balanceHistory, isLoading: balanceHistoryLoading } = useQuery({
-    queryKey: ['dashboard', 'balance-history', selectedMonth, activeAccountIds],
-    queryFn: () => dashboard.balanceHistory(monthParam, acctIds),
+    queryKey: ['dashboard', 'balance-history', selectedMonth, activeAccountIds, activeUserId],
+    queryFn: () => dashboard.balanceHistory(monthParam, acctIds, filterUserId),
     enabled: !noAccounts,
   })
 
@@ -213,14 +221,14 @@ export default function DashboardPage() {
       to: monthEnd,
       limit: 500,
       exclude_transfers: true,
-      account_ids: acctIds,
+      account_ids: listAcctIds,
     }),
     enabled: !noAccounts,
   })
 
   // Same month grid the transactions page renders, scoped to the active
   // collection's accounts. Only fetched while the calendar is on screen.
-  const calendarAccountIds = acctIds && acctIds.length > 0 ? acctIds : undefined
+  const calendarAccountIds = listAcctIds && listAcctIds.length > 0 ? listAcctIds : undefined
   const { data: calendarData, isLoading: calendarLoading } = useQuery({
     queryKey: ['transactions', 'calendar', selectedMonth, activeAccountIds],
     enabled: txViewMode === 'calendar' && !noAccounts,
@@ -247,9 +255,11 @@ export default function DashboardPage() {
     queryFn: () => dashboard.projectedTransactions({ month: monthParam }),
   })
 
+  // A budget measures consumption, so it takes the user filter too. It
+  // takes no collection: a budget is not a cash view of some accounts.
   const { data: budgetComparison } = useQuery({
-    queryKey: ['budgets', 'comparison', selectedMonth],
-    queryFn: () => budgets.comparison(monthParam),
+    queryKey: ['budgets', 'comparison', selectedMonth, activeUserId],
+    queryFn: () => budgets.comparison(monthParam, filterUserId),
   })
 
   const { data: categoriesList } = useQuery({
@@ -1558,7 +1568,7 @@ export default function DashboardPage() {
                 // Keep drill-downs consistent with the collection-scoped cards
                 // they open from (e.g. "Categorize now").
                 account_ids:
-                  drillDown.account_ids ?? (acctIds && acctIds.length > 0 ? acctIds : undefined),
+                  drillDown.account_ids ?? (listAcctIds && listAcctIds.length > 0 ? listAcctIds : undefined),
               }
             : null
         }

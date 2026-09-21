@@ -5,6 +5,7 @@ aggregation site agrees. Changes to the rule (e.g. adding a new exclusion
 signal) only need to be made here.
 """
 import uuid
+from dataclasses import dataclass
 from datetime import date
 from typing import Optional
 
@@ -15,6 +16,7 @@ from app.models.account import Account
 from app.models.category import Category
 from app.models.group_settlement import GroupSettlement
 from app.models.transaction import Transaction
+from app.models.workspace import Workspace, WorkspaceMember
 
 
 def is_contribution_link():
@@ -301,211 +303,224 @@ def counts_as_user_pnl():
     )
 
 
-async def owner_split_offset_pnl(
-    session: AsyncSession,
-    user_id: uuid.UUID,
-    month_start: date,
-    month_end: date,
-    use_effective_date: bool = False,
-    primary_currency: Optional[str] = None,
-    workspace_id: Optional[uuid.UUID] = None,
-) -> tuple[float, float]:
-    """Return (income_offset, expense_offset) — the totals to *subtract*
-    from the owner's full-amount aggregations so only their own share
-    remains. We sum every split share that belongs to a non-owner
-    member; subtracting that from the parent's full amount leaves the
-    owner's share."""
-    from app.models.group import Group, GroupMember
-    from app.models.transaction_split import TransactionSplit
-
-    # The user's own member entries: linked_user_id matches OR is_self=true
-    # in a group they own. The first form covers groups they're invited to;
-    # the second covers their own groups (where is_self=true marks the owner).
-    viewer_member_ids = (
-        select(GroupMember.id)
-        .outerjoin(Group, Group.id == GroupMember.group_id)
-        .where(
-            or_(
-                GroupMember.linked_user_id == user_id,
-                and_(GroupMember.is_self == True, Group.user_id == user_id),
-            )
-        )
-    )
-    date_col = func.coalesce(
-        Transaction.effective_bill_date,
-        Transaction.effective_date if use_effective_date else Transaction.date,
-    )
-
-    result = await session.execute(
-        select(
-            Transaction.currency,
-            func.sum(
-                case(
-                    (Transaction.type == "credit", TransactionSplit.share_amount),
-                    else_=0,
-                )
-            ),
-            func.sum(
-                case(
-                    (Transaction.type == "debit", TransactionSplit.share_amount),
-                    else_=0,
-                )
-            ),
-        )
-        .join(Transaction, TransactionSplit.transaction_id == Transaction.id)
-        .where(
-            Transaction.user_id == user_id,
-            *(
-                [Transaction.workspace_id == workspace_id]
-                if workspace_id is not None
-                else []
-            ),
-            TransactionSplit.group_member_id.notin_(viewer_member_ids),
-            Transaction.source != "opening_balance",
-            date_col >= month_start,
-            date_col < month_end,
-            date_col <= date.today(),
-            Transaction.status == "posted",
-            counts_as_user_pnl(),
-        )
-        .group_by(Transaction.currency)
-    )
-
-    if primary_currency is None:
-        income_total = 0.0
-        expense_total = 0.0
-        for row in result.all():
-            income_total += float(row[1] or 0)
-            expense_total += float(row[2] or 0)
-        return income_total, expense_total
-
-    from decimal import Decimal as _Decimal
-
-    from app.services.fx_rate_service import convert as _convert
-
-    income_total = 0.0
-    expense_total = 0.0
-    for row in result.all():
-        cur, inc_raw, exp_raw = row[0], row[1] or 0, row[2] or 0
-        if inc_raw:
-            inc_pri, _ = await _convert(session, _Decimal(str(inc_raw)), cur, primary_currency)
-            income_total += float(inc_pri)
-        if exp_raw:
-            exp_pri, _ = await _convert(session, _Decimal(str(exp_raw)), cur, primary_currency)
-            expense_total += float(exp_pri)
-    return income_total, expense_total
+# ─────────────────────── the consumption subject ────────────────────────
+#
+# Consumption is a person's own costs plus their shares of shared costs,
+# whoever paid. Which shares count is therefore a question about the
+# *subject* of a figure, never about who is looking at it: with the user
+# filter on my partner I have to see her consumption from my own login.
+#
+# Every helper below takes that subject explicitly. Three cases, and
+# nothing else:
+#
+#   user filter    subject = that user, scope = the accounts they own.
+#   no filter      subject = everyone in the workspace, scope = the
+#                  workspace. Shares between two members of it cancel,
+#                  because both sides are the subject; only shares of
+#                  members outside it adjust the total.
+#   a collection   no subject at all. A collection is cash flow over its
+#                  accounts, with no share adjustment, as it always was.
 
 
-async def owner_split_offset_by_category(
-    session: AsyncSession,
-    user_id: uuid.UUID,
-    month_start: date,
-    month_end: date,
-    use_effective_date: bool = False,
-    primary_currency: Optional[str] = None,
-    workspace_id: Optional[uuid.UUID] = None,
-) -> dict:
-    """Per-category, sum of non-owner shares on owner-side debit splits —
-    subtract from full owner debits to get the owner's category share."""
-    from app.models.group import Group, GroupMember
-    from app.models.transaction_split import TransactionSplit
+@dataclass(frozen=True)
+class ConsumptionSubject:
+    """Whose consumption a user-level figure measures.
 
-    viewer_member_ids = (
-        select(GroupMember.id)
-        .outerjoin(Group, Group.id == GroupMember.group_id)
-        .where(
-            or_(
-                GroupMember.linked_user_id == user_id,
-                and_(GroupMember.is_self == True, Group.user_id == user_id),
-            )
-        )
-    )
-    date_col = func.coalesce(
-        Transaction.effective_bill_date,
-        Transaction.effective_date if use_effective_date else Transaction.date,
-    )
-
-    result = await session.execute(
-        select(
-            Transaction.category_id,
-            Transaction.currency,
-            func.sum(TransactionSplit.share_amount),
-        )
-        .join(Transaction, TransactionSplit.transaction_id == Transaction.id)
-        .where(
-            Transaction.user_id == user_id,
-            *(
-                [Transaction.workspace_id == workspace_id]
-                if workspace_id is not None
-                else []
-            ),
-            Transaction.type == "debit",
-            TransactionSplit.group_member_id.notin_(viewer_member_ids),
-            Transaction.source != "opening_balance",
-            date_col >= month_start,
-            date_col < month_end,
-            date_col <= date.today(),
-            Transaction.status == "posted",
-            counts_as_user_pnl(),
-        )
-        .group_by(Transaction.category_id, Transaction.currency)
-    )
-
-    out: dict = {}
-    if primary_currency is None:
-        for cat_id, _cur, total in result.all():
-            out[cat_id] = out.get(cat_id, 0.0) + float(total or 0)
-        return out
-
-    from decimal import Decimal as _Decimal
-
-    from app.services.fx_rate_service import convert as _convert
-
-    for cat_id, cur, total in result.all():
-        if not total:
-            continue
-        converted, _ = await _convert(session, _Decimal(str(total)), cur, primary_currency)
-        out[cat_id] = out.get(cat_id, 0.0) + float(converted)
-    return out
-
-
-async def viewer_shared_pnl(
-    session: AsyncSession,
-    user_id: uuid.UUID,
-    month_start: date,
-    month_end: date,
-    use_effective_date: bool = False,
-    primary_currency: Optional[str] = None,
-) -> tuple[float, float]:
-    """Return (income, expense) totals contributed by transactions the
-    viewer doesn't own but participates in via a group split.
-
-    Concert tickets paid by a friend show up as the viewer's share in
-    their own spending picture — without inflating account balances.
-
-    When `primary_currency` is given, mixed-currency shares are
-    converted to that currency via the FX service. Otherwise, sums
-    are taken in raw nominal terms (only safe when all shares are
-    same-currency, e.g., during single-currency tests).
+    ``user_ids`` are the people the figure is about. ``account_ids`` are
+    the accounts their own costs sit on — ``None`` means the whole
+    workspace, which is the no-filter case.
     """
-    from app.models.group import GroupMember
-    from app.models.transaction_split import TransactionSplit
 
-    # Cross-workspace Splitwise projection: include only invitations
-    # (linked_user_id matches but is_self is False). Self-memberships
-    # represent the user in their own group and are already counted via
-    # the workspace-scoped Transaction filter at the caller.
-    member_ids = select(GroupMember.id).where(
-        GroupMember.linked_user_id == user_id,
-        GroupMember.is_self.is_(False),
+    workspace_id: uuid.UUID
+    user_ids: tuple[uuid.UUID, ...]
+    account_ids: Optional[tuple[uuid.UUID, ...]] = None
+
+
+async def workspace_user_ids(
+    session: AsyncSession, workspace_id: uuid.UUID
+) -> tuple[uuid.UUID, ...]:
+    """Every user who belongs to this workspace.
+
+    Membership rows plus the workspace's creator and its manager: a
+    business workspace is operated through `managed_by_user_id` rather
+    than a membership row, and a subject that missed its only user would
+    read every share as somebody else's.
+    """
+    rows = await session.execute(
+        select(WorkspaceMember.user_id).where(
+            WorkspaceMember.workspace_id == workspace_id
+        )
     )
-    date_col = func.coalesce(
+    ids = {row[0] for row in rows.all() if row[0] is not None}
+    owners = await session.execute(
+        select(Workspace.created_by_user_id, Workspace.managed_by_user_id).where(
+            Workspace.id == workspace_id
+        )
+    )
+    row = owners.one_or_none()
+    if row is not None:
+        ids.update(value for value in row if value is not None)
+    return tuple(sorted(ids, key=str))
+
+
+async def user_owned_account_ids(
+    session: AsyncSession, workspace_id: uuid.UUID, user_id: uuid.UUID
+) -> list[uuid.UUID]:
+    """The accounts in this workspace that `user_id` owns.
+
+    What the user filter resolves to. Ownership is the same signal the
+    pot uses to name a payer, so "her accounts" means the same thing on
+    the group page and on the dashboard.
+    """
+    result = await session.execute(
+        select(Account.id).where(
+            Account.workspace_id == workspace_id,
+            Account.user_id == user_id,
+        )
+    )
+    return [row[0] for row in result.all()]
+
+
+async def resolve_consumption_scope(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    *,
+    user_id: Optional[uuid.UUID] = None,
+    account_ids: Optional[list[uuid.UUID]] = None,
+) -> tuple[Optional[list[uuid.UUID]], Optional[ConsumptionSubject]]:
+    """Turn the two filters a page can carry into (accounts, subject).
+
+    The returned account list is what the plain cash-flow queries filter
+    on; the subject is what the share helpers adjust for, or ``None``
+    when no adjustment is wanted.
+
+    A user filter wins over a collection: the two are alternatives in
+    the UI, and reading them as an intersection would give a figure that
+    is neither person's consumption nor the collection's cash flow.
+    """
+    if user_id is not None:
+        owned = await user_owned_account_ids(session, workspace_id, user_id)
+        return owned, ConsumptionSubject(
+            workspace_id=workspace_id,
+            user_ids=(user_id,),
+            account_ids=tuple(owned),
+        )
+    if account_ids is not None:
+        return account_ids, None
+    return None, ConsumptionSubject(
+        workspace_id=workspace_id,
+        user_ids=await workspace_user_ids(session, workspace_id),
+        account_ids=None,
+    )
+
+
+def subject_member_ids(subject: ConsumptionSubject):
+    """The group members that are this subject's own.
+
+    Read from persisted columns only — a member's stored link, or the
+    stored self flag inside a group one of the subject's users owns. The
+    `is_self` the group service rewrites per request never reaches a
+    query, so two people looking at the same figure see the same number.
+    """
+    from app.models.group import Group, GroupMember
+
+    return (
+        select(GroupMember.id)
+        .outerjoin(Group, Group.id == GroupMember.group_id)
+        .where(
+            or_(
+                GroupMember.linked_user_id.in_(subject.user_ids),
+                and_(
+                    GroupMember.is_self == True,  # noqa: E712
+                    Group.user_id.in_(subject.user_ids),
+                ),
+            )
+        )
+    )
+
+
+def in_subject_scope(subject: ConsumptionSubject) -> list:
+    """Filters picking the transactions whose full amount the subject's
+    own aggregation already counted."""
+    filters = [Transaction.workspace_id == subject.workspace_id]
+    if subject.account_ids is not None:
+        filters.append(Transaction.account_id.in_(subject.account_ids))
+    return filters
+
+
+def outside_subject_scope(subject: ConsumptionSubject):
+    """The negation of `in_subject_scope`, as one clause.
+
+    A share counts for the subject on exactly the transactions their own
+    aggregation did *not* count at full amount, so the two sides cannot
+    overlap and nothing is double counted — which is what went wrong
+    when "not mine" was spelled as `Transaction.user_id != me` and two
+    people shared a workspace.
+    """
+    if subject.account_ids is None:
+        return Transaction.workspace_id != subject.workspace_id
+    return or_(
+        Transaction.workspace_id != subject.workspace_id,
+        Transaction.account_id.is_(None),
+        Transaction.account_id.notin_(subject.account_ids),
+    )
+
+
+def _reporting_date_expr(use_effective_date: bool):
+    return func.coalesce(
         Transaction.effective_bill_date,
         Transaction.effective_date if use_effective_date else Transaction.date,
     )
 
+
+def _scope_filters(subject: ConsumptionSubject, scope: str) -> list:
+    if scope == "in":
+        return in_subject_scope(subject)
+    if scope == "out":
+        return [outside_subject_scope(subject)]
+    return []
+
+
+def _member_filter(subject: ConsumptionSubject, mine: bool):
+    member_ids = subject_member_ids(subject)
+    from app.models.transaction_split import TransactionSplit
+
+    return (
+        TransactionSplit.group_member_id.in_(member_ids)
+        if mine
+        else TransactionSplit.group_member_id.notin_(member_ids)
+    )
+
+
+async def _share_pnl(
+    session: AsyncSession,
+    subject: ConsumptionSubject,
+    start: date,
+    end: date,
+    *,
+    mine: bool,
+    scope: str,
+    use_effective_date: bool,
+    primary_currency: Optional[str],
+    label_expr=None,
+) -> dict:
+    """{period label: (credit total, debit total)} of the matching shares.
+
+    Without `label_expr` there is one bucket, keyed ``None`` — the whole
+    range. With it, the caller's own period expression decides the keys,
+    so a report's series and its totals cannot bucket differently.
+
+    Sums are taken per currency and converted when `primary_currency` is
+    given; without it the caller is responsible for currency homogeneity,
+    as the single-currency tests are.
+    """
+    from app.models.transaction_split import TransactionSplit
+
+    date_col = _reporting_date_expr(use_effective_date)
+    labels = [label_expr] if label_expr is not None else []
     result = await session.execute(
         select(
+            *labels,
             Transaction.currency,
             func.sum(
                 case(
@@ -520,113 +535,296 @@ async def viewer_shared_pnl(
                 )
             ),
         )
+        .select_from(TransactionSplit)
         .join(Transaction, TransactionSplit.transaction_id == Transaction.id)
         .where(
-            TransactionSplit.group_member_id.in_(member_ids),
-            # Avoid double-counting if the viewer also owns the parent.
-            Transaction.user_id != user_id,
+            _member_filter(subject, mine),
+            *_scope_filters(subject, scope),
             Transaction.source != "opening_balance",
-            date_col >= month_start,
-            date_col < month_end,
+            date_col >= start,
+            date_col < end,
             date_col <= date.today(),
             Transaction.status == "posted",
-            counts_as_pnl(),
+            counts_as_user_pnl(),
         )
-        .group_by(Transaction.currency)
+        .group_by(*labels, Transaction.currency)
     )
-
-    if primary_currency is None:
-        # Backward-compatible nominal sum (caller is responsible for
-        # currency homogeneity). Acceptable when only one currency is
-        # in play.
-        income_total = 0.0
-        expense_total = 0.0
-        for row in result.all():
-            income_total += float(row[1] or 0)
-            expense_total += float(row[2] or 0)
-        return income_total, expense_total
-
-    # FX-aware: convert each currency bucket to primary.
     from decimal import Decimal as _Decimal
 
     from app.services.fx_rate_service import convert as _convert
 
-    income_total = 0.0
-    expense_total = 0.0
+    out: dict = {}
     for row in result.all():
-        cur, inc_raw, exp_raw = row[0], row[1] or 0, row[2] or 0
-        if inc_raw:
-            inc_pri, _ = await _convert(session, _Decimal(str(inc_raw)), cur, primary_currency)
-            income_total += float(inc_pri)
-        if exp_raw:
-            exp_pri, _ = await _convert(session, _Decimal(str(exp_raw)), cur, primary_currency)
-            expense_total += float(exp_pri)
-    return income_total, expense_total
+        label = row[0] if label_expr is not None else None
+        currency, raw_credit, raw_debit = row[-3], row[-2], row[-1]
+        credit = float(raw_credit or 0)
+        debit = float(raw_debit or 0)
+        if primary_currency is not None:
+            if credit:
+                converted, _ = await _convert(
+                    session, _Decimal(str(raw_credit)), currency, primary_currency
+                )
+                credit = float(converted)
+            if debit:
+                converted, _ = await _convert(
+                    session, _Decimal(str(raw_debit)), currency, primary_currency
+                )
+                debit = float(converted)
+        previous = out.get(label, (0.0, 0.0))
+        out[label] = (previous[0] + credit, previous[1] + debit)
+    return out
 
 
-async def viewer_shared_spending_by_category(
+async def _share_by_category(
     session: AsyncSession,
-    user_id: uuid.UUID,
-    month_start: date,
-    month_end: date,
-    use_effective_date: bool = False,
-    primary_currency: Optional[str] = None,
+    subject: ConsumptionSubject,
+    start: date,
+    end: date,
+    *,
+    mine: bool,
+    scope: str,
+    tx_type: str,
+    use_effective_date: bool,
+    primary_currency: Optional[str],
+    label_expr=None,
 ) -> dict:
-    """Return {category_id (uuid|None): total_share_expense_float} for
-    transactions where the viewer participates via a group split.
+    """{category_id: total} of the matching shares, or
+    {(period label, category_id): total} when `label_expr` is given.
 
-    With `primary_currency`, totals are FX-converted; otherwise raw
-    nominal sums (single-currency only)."""
-    from app.models.group import GroupMember
+    A category id is a uuid, or ``None`` for the uncategorized bucket.
+    """
     from app.models.transaction_split import TransactionSplit
 
-    # Cross-workspace Splitwise projection: include only invitations
-    # (linked_user_id matches but is_self is False). Self-memberships
-    # represent the user in their own group and are already counted via
-    # the workspace-scoped Transaction filter at the caller.
-    member_ids = select(GroupMember.id).where(
-        GroupMember.linked_user_id == user_id,
-        GroupMember.is_self.is_(False),
-    )
-    date_col = func.coalesce(
-        Transaction.effective_bill_date,
-        Transaction.effective_date if use_effective_date else Transaction.date,
-    )
-
+    date_col = _reporting_date_expr(use_effective_date)
+    labels = [label_expr] if label_expr is not None else []
     result = await session.execute(
         select(
+            *labels,
             Transaction.category_id,
             Transaction.currency,
             func.sum(TransactionSplit.share_amount),
         )
+        .select_from(TransactionSplit)
         .join(Transaction, TransactionSplit.transaction_id == Transaction.id)
         .where(
-            TransactionSplit.group_member_id.in_(member_ids),
-            Transaction.user_id != user_id,
-            Transaction.type == "debit",
+            _member_filter(subject, mine),
+            *_scope_filters(subject, scope),
+            Transaction.type == tx_type,
             Transaction.source != "opening_balance",
-            date_col >= month_start,
-            date_col < month_end,
+            date_col >= start,
+            date_col < end,
             date_col <= date.today(),
             Transaction.status == "posted",
-            counts_as_pnl(),
+            counts_as_user_pnl(),
         )
-        .group_by(Transaction.category_id, Transaction.currency)
+        .group_by(*labels, Transaction.category_id, Transaction.currency)
     )
-
-    out: dict = {}
-    if primary_currency is None:
-        for cat_id, _cur, total in result.all():
-            out[cat_id] = out.get(cat_id, 0.0) + float(total or 0)
-        return out
-
     from decimal import Decimal as _Decimal
 
     from app.services.fx_rate_service import convert as _convert
 
-    for cat_id, cur, total in result.all():
+    out: dict = {}
+    for row in result.all():
+        category_id, currency, total = row[-3], row[-2], row[-1]
         if not total:
             continue
-        converted, _ = await _convert(session, _Decimal(str(total)), cur, primary_currency)
-        out[cat_id] = out.get(cat_id, 0.0) + float(converted)
+        key = (row[0], category_id) if label_expr is not None else category_id
+        amount = float(total)
+        if primary_currency is not None:
+            converted, _ = await _convert(
+                session, _Decimal(str(total)), currency, primary_currency
+            )
+            amount = float(converted)
+        out[key] = out.get(key, 0.0) + amount
     return out
+
+
+async def foreign_shares_pnl(
+    session: AsyncSession,
+    subject: ConsumptionSubject,
+    start: date,
+    end: date,
+    *,
+    use_effective_date: bool = False,
+    primary_currency: Optional[str] = None,
+) -> tuple[float, float]:
+    """(income offset, expense offset) — what to *subtract* from the
+    subject's own full-amount aggregation.
+
+    Every share on a transaction inside the subject's scope that belongs
+    to somebody else. Subtracting it leaves the subject carrying only
+    their part of what their own accounts paid or received.
+    """
+    buckets = await _share_pnl(
+        session,
+        subject,
+        start,
+        end,
+        mine=False,
+        scope="in",
+        use_effective_date=use_effective_date,
+        primary_currency=primary_currency,
+    )
+    return buckets.get(None, (0.0, 0.0))
+
+
+async def foreign_shares_pnl_by_period(
+    session: AsyncSession,
+    subject: ConsumptionSubject,
+    start: date,
+    end: date,
+    *,
+    label_expr,
+    use_effective_date: bool = False,
+    primary_currency: Optional[str] = None,
+) -> dict:
+    """`foreign_shares_pnl`, one bucket per period of the caller's own
+    label expression."""
+    return await _share_pnl(
+        session,
+        subject,
+        start,
+        end,
+        mine=False,
+        scope="in",
+        use_effective_date=use_effective_date,
+        primary_currency=primary_currency,
+        label_expr=label_expr,
+    )
+
+
+async def foreign_shares_by_category(
+    session: AsyncSession,
+    subject: ConsumptionSubject,
+    start: date,
+    end: date,
+    *,
+    use_effective_date: bool = False,
+    primary_currency: Optional[str] = None,
+    label_expr=None,
+) -> dict:
+    """Per category, the debit shares inside the subject's scope that
+    belong to somebody else — subtract from the full debits."""
+    return await _share_by_category(
+        session,
+        subject,
+        start,
+        end,
+        mine=False,
+        scope="in",
+        tx_type="debit",
+        use_effective_date=use_effective_date,
+        primary_currency=primary_currency,
+        label_expr=label_expr,
+    )
+
+
+async def subject_shares_pnl(
+    session: AsyncSession,
+    subject: ConsumptionSubject,
+    start: date,
+    end: date,
+    *,
+    use_effective_date: bool = False,
+    primary_currency: Optional[str] = None,
+) -> tuple[float, float]:
+    """(income, expense) the subject carries on transactions outside
+    their own scope — my share of the groceries my partner paid, or of
+    the concert tickets a friend in another workspace paid."""
+    buckets = await _share_pnl(
+        session,
+        subject,
+        start,
+        end,
+        mine=True,
+        scope="out",
+        use_effective_date=use_effective_date,
+        primary_currency=primary_currency,
+    )
+    return buckets.get(None, (0.0, 0.0))
+
+
+async def subject_shares_pnl_by_period(
+    session: AsyncSession,
+    subject: ConsumptionSubject,
+    start: date,
+    end: date,
+    *,
+    label_expr,
+    use_effective_date: bool = False,
+    primary_currency: Optional[str] = None,
+) -> dict:
+    """`subject_shares_pnl`, one bucket per period of the caller's own
+    label expression."""
+    return await _share_pnl(
+        session,
+        subject,
+        start,
+        end,
+        mine=True,
+        scope="out",
+        use_effective_date=use_effective_date,
+        primary_currency=primary_currency,
+        label_expr=label_expr,
+    )
+
+
+async def subject_shares_by_category(
+    session: AsyncSession,
+    subject: ConsumptionSubject,
+    start: date,
+    end: date,
+    *,
+    use_effective_date: bool = False,
+    primary_currency: Optional[str] = None,
+    label_expr=None,
+) -> dict:
+    """Per category, the debit shares the subject carries on
+    transactions outside their own scope — add to the full debits."""
+    return await _share_by_category(
+        session,
+        subject,
+        start,
+        end,
+        mine=True,
+        scope="out",
+        tx_type="debit",
+        use_effective_date=use_effective_date,
+        primary_currency=primary_currency,
+        label_expr=label_expr,
+    )
+
+
+async def subject_credit_shares_by_category(
+    session: AsyncSession,
+    subject: ConsumptionSubject,
+    start: date,
+    end: date,
+    *,
+    use_effective_date: bool = False,
+    primary_currency: Optional[str] = None,
+    label_expr=None,
+) -> dict:
+    """Per category, the subject's shares of shared *credits*.
+
+    A share is signed: a debit costs, a credit gives back. In a spending
+    view a shared refund therefore lowers the category it was booked to,
+    so a shared purchase and its shared refund leave that category at
+    zero — which a debit-only reading could never do.
+
+    Scope is deliberately both sides: a refund of a cost the subject
+    carries is theirs whether it landed on their own account or on the
+    account of the member who paid.
+    """
+    return await _share_by_category(
+        session,
+        subject,
+        start,
+        end,
+        mine=True,
+        scope="any",
+        tx_type="credit",
+        use_effective_date=use_effective_date,
+        primary_currency=primary_currency,
+        label_expr=label_expr,
+    )
