@@ -18,6 +18,8 @@ import {
   AlertTriangle,
   ArrowLeft,
   ArrowRight,
+  ChevronLeft,
+  ChevronRight,
   Link2,
   Receipt,
   Trash2,
@@ -37,8 +39,13 @@ import {
   exclusiveEnd,
   inclusiveEnd,
   keepInOrder,
+  monthLabel,
+  monthOf,
+  monthRange,
   presetRange,
+  shiftMonth,
   PERIOD_PRESETS,
+  type CalendarMonth,
   type PeriodPreset,
   type PeriodRange,
 } from '@/lib/group-period'
@@ -68,6 +75,11 @@ import { formatCurrency } from '@/lib/format'
 
 /** The transaction list is paged on the server; the figures above it are not. */
 const PAGE_SIZE = 25
+
+/** What the period picker is set to. A month is its own mode: the month
+ *  picker holds which one, and the year, all time and custom ranges sit
+ *  beside it. */
+type RangeMode = 'month' | 'thisYear' | 'allTime' | 'custom'
 
 function SectionCard({ children }: { children: React.ReactNode }) {
   return (
@@ -189,21 +201,25 @@ export default function GroupDetailPage() {
   const isHousehold = group?.kind === 'household'
 
   // ── The period ───────────────────────────────────────────────
-  const [preset, setPreset] = useState<PeriodPreset | null>(null)
+  // A month is a mode of its own, so the month picker holds the choice
+  // and "This month" and "Last month" are two of its positions rather
+  // than a second way of saying the same thing.
+  const [mode, setMode] = useState<RangeMode | null>(null)
+  const [month, setMonth] = useState<CalendarMonth>(() => monthOf())
   const [customStart, setCustomStart] = useState('')
   // What the picker shows: the last day inside the range, not the
   // exclusive `end` the API takes.
   const [customEnd, setCustomEnd] = useState('')
   const [page, setPage] = useState(1)
 
-  const activePreset: PeriodPreset = preset ?? (isHousehold ? 'thisMonth' : 'allTime')
-  const range: PeriodRange = useMemo(
-    () =>
-      activePreset === 'custom'
-        ? { start: customStart || null, end: exclusiveEnd(customEnd) }
-        : presetRange(activePreset),
-    [activePreset, customStart, customEnd],
-  )
+  const activeMode: RangeMode = mode ?? (isHousehold ? 'month' : 'allTime')
+  const range: PeriodRange = useMemo(() => {
+    if (activeMode === 'month') return monthRange(month)
+    if (activeMode === 'custom') {
+      return { start: customStart || null, end: exclusiveEnd(customEnd) }
+    }
+    return presetRange(activeMode)
+  }, [activeMode, month, customStart, customEnd])
 
   // Every way of changing the range goes through here, so page 2 of the
   // old period never survives into the new one.
@@ -243,8 +259,44 @@ export default function GroupDetailPage() {
     // to Custom never blanks the page.
     if (!customStart && range.start) setCustomStart(range.start)
     if (!customEnd && range.end) setCustomEnd(inclusiveEnd(range.end))
-    setPreset('custom')
+    setMode('custom')
   }
+
+  // One of the five buttons. The two month ones move the month picker.
+  const pickPreset = (preset: PeriodPreset) =>
+    changeRange(() => {
+      if (preset === 'thisMonth' || preset === 'lastMonth') {
+        setMode('month')
+        setMonth(preset === 'thisMonth' ? monthOf() : shiftMonth(monthOf(), -1))
+      } else if (preset === 'custom') {
+        openCustomRange()
+      } else {
+        setMode(preset)
+      }
+    })
+
+  const pickMonth = (value: CalendarMonth) =>
+    changeRange(() => {
+      setMode('month')
+      setMonth(value)
+    })
+
+  /** True when a button stands for what is on screen. */
+  const presetIsActive = (preset: PeriodPreset) => {
+    if (preset === 'thisMonth') return activeMode === 'month' && month === monthOf()
+    if (preset === 'lastMonth') {
+      return activeMode === 'month' && month === shiftMonth(monthOf(), -1)
+    }
+    return activeMode === preset
+  }
+
+  // The last two years, newest first, plus wherever the arrows have
+  // taken the reader.
+  const monthOptions = useMemo(() => {
+    const options = new Set<CalendarMonth>([month])
+    for (let back = 0; back < 24; back++) options.add(shiftMonth(monthOf(), -back))
+    return [...options].sort().reverse()
+  }, [month])
 
   // The range stays in order whatever the user picks, so `start > end`
   // and the 400 it earns never happen.
@@ -618,21 +670,58 @@ export default function GroupDetailPage() {
           <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide mr-1">
             {t('splitGroups.pot.periodLabel')}
           </span>
+          {/* The month picker. "This month" and "Last month" below move
+              it rather than compete with it, so whichever month is on
+              screen is always the one named here. */}
+          <div
+            className={`flex items-center gap-1 rounded-md border px-1 py-0.5 ${
+              activeMode === 'month' ? 'border-primary' : 'border-border'
+            }`}
+          >
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0"
+              aria-label={t('splitGroups.pot.previousMonth')}
+              onClick={() => pickMonth(shiftMonth(month, -1))}
+            >
+              <ChevronLeft size={14} />
+            </Button>
+            <select
+              className="h-7 bg-transparent text-sm font-medium focus:outline-none cursor-pointer"
+              aria-label={t('splitGroups.pot.monthLabel')}
+              value={month}
+              onChange={(e) => pickMonth(e.target.value)}
+            >
+              {monthOptions.map((option) => (
+                <option key={option} value={option}>
+                  {monthLabel(option, dateLocale)}
+                </option>
+              ))}
+            </select>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0"
+              aria-label={t('splitGroups.pot.nextMonth')}
+              onClick={() => pickMonth(shiftMonth(month, 1))}
+            >
+              <ChevronRight size={14} />
+            </Button>
+          </div>
           {PERIOD_PRESETS.map((option) => (
             <Button
               key={option}
               size="sm"
-              variant={activePreset === option ? 'default' : 'outline'}
+              variant={presetIsActive(option) ? 'default' : 'outline'}
               className="h-8"
-              aria-pressed={activePreset === option}
-              onClick={() =>
-                changeRange(() => (option === 'custom' ? openCustomRange() : setPreset(option)))
-              }
+              aria-pressed={presetIsActive(option)}
+              onClick={() => pickPreset(option)}
             >
               {t(`splitGroups.pot.${option}`)}
             </Button>
           ))}
-          {activePreset === 'custom' && (
+          {activeMode === 'custom' && (
             <div className="flex flex-wrap items-end gap-2 w-full sm:w-auto">
               <div className="space-y-1">
                 <Label className="text-xs">{t('splitGroups.pot.rangeStart')}</Label>

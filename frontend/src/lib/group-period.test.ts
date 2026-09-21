@@ -9,7 +9,11 @@ import {
   exclusiveEnd,
   inclusiveEnd,
   keepInOrder,
+  monthLabel,
+  monthOf,
+  monthRange,
   presetRange,
+  shiftMonth,
 } from '@/lib/group-period'
 
 const may15 = new Date('2026-05-15T12:00:00')
@@ -29,6 +33,35 @@ describe('presetRange', () => {
 
   it('leaves all time unbounded', () => {
     expect(presetRange('allTime', may15)).toEqual({ start: null, end: null })
+  })
+})
+
+describe('the month picker', () => {
+  it('reads the month a date falls in', () => {
+    expect(monthOf(may15)).toBe('2026-05')
+  })
+
+  it('turns a month into the half-open range it stands for', () => {
+    expect(monthRange('2026-05')).toEqual({ start: '2026-05-01', end: '2026-06-01' })
+  })
+
+  it('crosses the year boundary in both directions', () => {
+    expect(shiftMonth('2026-12', 1)).toBe('2027-01')
+    expect(shiftMonth('2026-01', -1)).toBe('2025-12')
+    expect(monthRange('2026-12')).toEqual({ start: '2026-12-01', end: '2027-01-01' })
+    expect(monthRange('2027-01')).toEqual({ start: '2027-01-01', end: '2027-02-01' })
+  })
+
+  it('names the month in the reader’s language, not from a key', () => {
+    expect(monthLabel('2026-09', 'en-US')).toBe('September 2026')
+    expect(monthLabel('2026-09', 'pt-BR')).toMatch(/setembro/i)
+  })
+
+  it('agrees with the two month presets', () => {
+    expect(presetRange('thisMonth', may15)).toEqual(monthRange(monthOf(may15)))
+    expect(presetRange('lastMonth', may15)).toEqual(
+      monthRange(shiftMonth(monthOf(may15), -1)),
+    )
   })
 })
 

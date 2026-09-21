@@ -6,7 +6,7 @@
  * custom range shows the last day the user means and this module is the
  * one place that converts between the two.
  */
-import { addDays, addMonths, addYears, format, startOfMonth, startOfYear, subMonths } from 'date-fns'
+import { addDays, addMonths, addYears, format, startOfYear } from 'date-fns'
 
 export type PeriodPreset = 'thisMonth' | 'lastMonth' | 'thisYear' | 'allTime' | 'custom'
 
@@ -26,17 +26,46 @@ export const PERIOD_PRESETS: PeriodPreset[] = [
 
 const iso = (date: Date) => format(date, 'yyyy-MM-dd')
 
+/** A calendar month, as `YYYY-MM`. The month picker's whole state. */
+export type CalendarMonth = string
+
+/** The month a date falls in. */
+export function monthOf(today: Date = new Date()): CalendarMonth {
+  return format(today, 'yyyy-MM')
+}
+
+/** A month moved by whole months, across year boundaries. */
+export function shiftMonth(month: CalendarMonth, delta: number): CalendarMonth {
+  const [year, index] = month.split('-').map(Number)
+  return format(addMonths(new Date(year, index - 1, 1), delta), 'yyyy-MM')
+}
+
+/** The half-open range a calendar month stands for: the first of the
+ *  month up to, but not including, the first of the next. */
+export function monthRange(month: CalendarMonth): PeriodRange {
+  return { start: `${month}-01`, end: `${shiftMonth(month, 1)}-01` }
+}
+
+/** The month's name and year in the reader's language. Month names come
+ *  from the platform, never from a translation key per month. */
+export function monthLabel(month: CalendarMonth, locale: string): string {
+  const [year, index] = month.split('-').map(Number)
+  return new Date(year, index - 1, 1).toLocaleDateString(locale, {
+    month: 'long',
+    year: 'numeric',
+  })
+}
+
 /** The range a preset stands for. `custom` keeps whatever the user set,
- *  so it is answered with an unbounded range and the caller's dates. */
+ *  so it is answered with an unbounded range and the caller's dates.
+ *  The two month presets are positions of the month picker, so they are
+ *  answered by the same arithmetic. */
 export function presetRange(preset: PeriodPreset, today: Date = new Date()): PeriodRange {
   switch (preset) {
     case 'thisMonth':
-      return { start: iso(startOfMonth(today)), end: iso(startOfMonth(addMonths(today, 1))) }
+      return monthRange(monthOf(today))
     case 'lastMonth':
-      return {
-        start: iso(startOfMonth(subMonths(today, 1))),
-        end: iso(startOfMonth(today)),
-      }
+      return monthRange(shiftMonth(monthOf(today), -1))
     case 'thisYear':
       return { start: iso(startOfYear(today)), end: iso(startOfYear(addYears(today, 1))) }
     default:

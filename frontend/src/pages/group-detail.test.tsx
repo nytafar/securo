@@ -12,7 +12,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { screen, waitFor, within } from '@testing-library/react'
 
 import GroupDetailPage from '@/pages/group-detail'
-import { presetRange } from '@/lib/group-period'
+import {
+  monthLabel,
+  monthOf,
+  monthRange,
+  presetRange,
+  shiftMonth,
+} from '@/lib/group-period'
 import { renderWithProviders, t } from '@/test/utils'
 
 const api = vi.hoisted(() => ({
@@ -435,6 +441,133 @@ describe('the group page as a common pot', () => {
 
     expect(await screen.findByText(/1 month to clear/)).toBeInTheDocument()
     expect(screen.queryByText(/1 months/)).not.toBeInTheDocument()
+  })
+
+  it('asks for the month the picker names, across the new year', async () => {
+    // The nearest December behind us: in the picker's two-year window
+    // whatever month the suite happens to run in.
+    let december = monthOf()
+    while (!december.endsWith('-12')) december = shiftMonth(december, -1)
+    const year = Number(december.slice(0, 4))
+
+    const decemberPeriod = {
+      ...thisMonth,
+      start: `${year}-12-01`,
+      end: `${year + 1}-01-01`,
+      costs: [
+        {
+          ...thisMonth.costs[0],
+          category_name: 'Christmas',
+          total: 900,
+          shares: [
+            { member_id: ME, amount: 450 },
+            { member_id: ANNA, amount: 450 },
+          ],
+        },
+      ],
+      shared_income: [],
+      totals: [
+        {
+          currency: 'USD',
+          costs: 900,
+          shared_income: 0,
+          net: 900,
+          shares: [
+            { member_id: ME, amount: 450 },
+            { member_id: ANNA, amount: 450 },
+          ],
+        },
+      ],
+    }
+    api.groups.period.mockImplementation(async (_id: string, params: { start?: string | null }) =>
+      params?.start === `${year}-12-01` ? decemberPeriod : thisMonth,
+    )
+
+    const { user } = await renderLoaded()
+    await user.selectOptions(
+      screen.getByLabelText(t('splitGroups.pot.monthLabel')),
+      december,
+    )
+
+    await waitFor(() =>
+      expect(
+        api.groups.period.mock.calls.some(
+          ([, params]) =>
+            params?.start === `${year}-12-01` && params?.end === `${year + 1}-01-01`,
+        ),
+      ).toBe(true),
+    )
+    // Every section follows: the breakdown is December's.
+    expect(await screen.findByText('Christmas')).toBeInTheDocument()
+    const christmas = within(card(t('splitGroups.pot.costs')))
+      .getAllByRole('row')
+      .find((row) => within(row).queryByText('Christmas') !== null)!
+    expect(within(christmas).getAllByRole('cell').map((cell) => cell.textContent)).toEqual([
+      'Christmas',
+      '$900.00',
+      '$450.00',
+      '$450.00',
+    ])
+
+    // And the arrow rolls over into January.
+    await user.click(screen.getByRole('button', { name: t('splitGroups.pot.nextMonth') }))
+    await waitFor(() =>
+      expect(
+        api.groups.period.mock.calls.some(
+          ([, params]) =>
+            params?.start === `${year + 1}-01-01` && params?.end === `${year + 1}-02-01`,
+        ),
+      ).toBe(true),
+    )
+    expect(
+      (screen.getByLabelText(t('splitGroups.pot.monthLabel')) as HTMLSelectElement).value,
+    ).toBe(`${year + 1}-01`)
+  })
+
+  it('moves the month picker with the two month presets', async () => {
+    const { user } = await renderLoaded()
+    const picker = () => screen.getByLabelText(t('splitGroups.pot.monthLabel')) as HTMLSelectElement
+
+    // A household opens on this month, and the button says so.
+    expect(picker().value).toBe(monthOf())
+    expect(screen.getByRole('button', { name: t('splitGroups.pot.thisMonth') })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+
+    await user.click(screen.getByRole('button', { name: t('splitGroups.pot.lastMonth') }))
+    expect(picker().value).toBe(shiftMonth(monthOf(), -1))
+    await waitFor(() =>
+      expect(
+        api.groups.period.mock.calls.some(
+          ([, params]) => params?.start === presetRange('lastMonth').start,
+        ),
+      ).toBe(true),
+    )
+
+    // Stepping back once more is no longer "last month", and the button
+    // stops claiming it is.
+    await user.click(screen.getByRole('button', { name: t('splitGroups.pot.previousMonth') }))
+    expect(picker().value).toBe(shiftMonth(monthOf(), -2))
+    expect(screen.getByRole('button', { name: t('splitGroups.pot.lastMonth') })).toHaveAttribute(
+      'aria-pressed',
+      'false',
+    )
+    expect(
+      screen.getByText(monthLabel(shiftMonth(monthOf(), -2), 'en-US')),
+    ).toBeInTheDocument()
+
+    // Stepping forward twice lands on this month, and it says so again.
+    await user.click(screen.getByRole('button', { name: t('splitGroups.pot.nextMonth') }))
+    await user.click(screen.getByRole('button', { name: t('splitGroups.pot.nextMonth') }))
+    expect(picker().value).toBe(monthOf())
+    expect(screen.getByRole('button', { name: t('splitGroups.pot.thisMonth') })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    for (const [, params] of api.groups.period.mock.calls) {
+      if (params?.start) expect(params.start).toBe(monthRange(params.start.slice(0, 7)).start)
+    }
   })
 
   it('leaves the calculator out when the range has no start', async () => {
