@@ -112,6 +112,15 @@ async def test_period_endpoint_contract(client, auth_headers, test_user):
 
     assert [float(c["total"]) for c in body["costs"]] == [300.0]
     assert [float(c["total"]) for c in body["shared_income"]] == [80.0]
+    # The net of the two, per currency, so no client has to subtract them.
+    assert [
+        (t["currency"], float(t["costs"]), float(t["shared_income"]), float(t["net"]))
+        for t in body["totals"]
+    ] == [("USD", 300.0, 80.0, 220.0)]
+    assert {s["member_id"]: float(s["amount"]) for s in body["totals"][0]["shares"]} == {
+        me["id"]: 110.0,
+        partner["id"]: 110.0,
+    }
     assert [float(c["amount"]) for c in body["contributions"]] == [60.0]
     assert "receiver_transaction_id" in body["contributions"][0]
     assert body["payer_assumed_transactions"] == []

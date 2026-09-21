@@ -800,3 +800,54 @@ async def test_period_breaks_costs_down_by_category_with_income_apart(
     # Her May position: 40 % of (190 - 4000), minus 500 contributed.
     assert _by_member(period)[her.id] == D("-2024.00")
     assert _by_member(period, "backlog")[her.id] == D("399.60")
+
+
+@pytest.mark.asyncio
+async def test_period_totals_net_costs_against_shared_income_per_currency(
+    session, test_user, test_workspace, test_categories
+):
+    """The group's total for the period, netted on the server: the page
+    never subtracts shared income from costs in the browser."""
+    group, me, her, _ = await _household(session, test_user, test_workspace.id)
+    account = await _make_account(session, test_user.id, test_workspace.id)
+    euros = await _make_account(session, test_user.id, test_workspace.id, currency="EUR")
+    food = test_categories[0]
+    facts = [
+        (account, "100.00", "debit", date(2026, 5, 2)),
+        # A refund of part of that purchase, in the same category.
+        (account, "40.00", "credit", date(2026, 5, 6)),
+        (euros, "30.00", "debit", date(2026, 5, 7)),
+        # Outside the period: it must not reach the totals.
+        (account, "999.00", "debit", date(2026, 4, 30)),
+    ]
+    for acc, amount, type_, when in facts:
+        tx = await _make_tx(session, acc, amount, type_=type_, when=when, currency=acc.currency)
+        tx.category_id = food.id
+        await _share(session, tx, test_user.id, [me, her])
+
+    period = await position_service.compute_period(
+        session,
+        group.id,
+        test_workspace.id,
+        test_user.id,
+        start=date(2026, 5, 1),
+        end=date(2026, 6, 1),
+    )
+    assert period is not None
+
+    totals = {tl.currency: tl for tl in period.totals}
+    assert set(totals) == {"EUR", "USD"}
+    assert (totals["USD"].costs, totals["USD"].shared_income) == (D("100.00"), D("40.00"))
+    assert totals["USD"].net == D("60.00")
+    assert {s.member_id: s.amount for s in totals["USD"].shares} == {
+        me.id: D("30.00"),
+        her.id: D("30.00"),
+    }
+    assert (totals["EUR"].costs, totals["EUR"].shared_income) == (D("30.00"), D("0"))
+    assert totals["EUR"].net == D("30.00")
+
+    # The net is exactly what the members carry, per currency.
+    for currency, line in totals.items():
+        assert line.net == sum(
+            (p.share for p in period.positions if p.currency == currency), D("0")
+        )

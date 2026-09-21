@@ -65,6 +65,21 @@ class CategoryLine(BaseModel):
     shares: list[CategoryMemberShare] = []
 
 
+class PeriodTotal(BaseModel):
+    """The period's totals for one currency, netted here so no reader has
+    to subtract shared income from costs itself."""
+
+    currency: str
+    # Magnitudes: what the period's debits came to, and its credits.
+    costs: Decimal
+    shared_income: Decimal
+    # costs - shared_income: what the pot carried, and what the members'
+    # shares add up to.
+    net: Decimal
+    # One entry per member, in member order, signed like `net`.
+    shares: list[CategoryMemberShare] = []
+
+
 class PeriodContribution(BaseModel):
     id: uuid.UUID
     from_member_id: uuid.UUID
@@ -125,6 +140,7 @@ class GroupPositions(BaseModel):
 class GroupPeriod(GroupPositions):
     costs: list[CategoryLine] = []
     shared_income: list[CategoryLine] = []
+    totals: list[PeriodTotal] = []
     contributions: list[PeriodContribution] = []
     payer_assumed_transactions: list[PeriodTransaction] = []
     transactions: PeriodTransactionPage

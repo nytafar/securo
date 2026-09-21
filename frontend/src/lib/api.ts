@@ -72,6 +72,7 @@ import type {
   GroupMember,
   GroupSettlement,
   GroupBalances,
+  GroupPeriod,
   TransactionSplitsInput,
   TransactionEditPayload,
   InstallmentSeriesInput,
@@ -900,6 +901,29 @@ export const groups = {
   transactions: async (groupId: string, limit = 20): Promise<Transaction[]> => {
     const { data } = await api.get(`/groups/${groupId}/transactions`, {
       params: { limit },
+    })
+    return data
+  },
+  // The group's common pot over [start, end): start is inclusive and end
+  // exclusive, so a calendar month is 2026-05-01 → 2026-06-01. Both are
+  // optional; omitting them asks for all time. Everything the group page
+  // shows comes from this one call.
+  period: async (
+    groupId: string,
+    params: {
+      start?: string | null
+      end?: string | null
+      page?: number
+      page_size?: number
+    } = {},
+  ): Promise<GroupPeriod> => {
+    const { data } = await api.get(`/groups/${groupId}/period`, {
+      params: {
+        start: params.start ?? undefined,
+        end: params.end ?? undefined,
+        page: params.page,
+        page_size: params.page_size,
+      },
     })
     return data
   },

@@ -42,6 +42,7 @@ from app.schemas.group_position import (
     GroupPositions,
     MemberPosition,
     PeriodContribution,
+    PeriodTotal,
     PeriodTransaction,
     PeriodTransactionPage,
     PositionMember,
@@ -474,6 +475,41 @@ def _category_lines(
     )
 
 
+def _period_totals(
+    transactions: list[_SharedTransaction], member_order: list[uuid.UUID]
+) -> list[PeriodTotal]:
+    """Gross costs, gross shared income and their net per currency, with
+    each member's net share.
+
+    The category lines keep debits and credits apart so shared income can
+    be shown on its own line; a refund therefore sits in both lists. The
+    net belongs on the server rather than in whichever reader would
+    otherwise subtract one list from the other.
+    """
+    costs: dict[str, Decimal] = defaultdict(lambda: ZERO)
+    income: dict[str, Decimal] = defaultdict(lambda: ZERO)
+    shares: dict[str, dict[uuid.UUID, Decimal]] = defaultdict(lambda: defaultdict(lambda: ZERO))
+    for tx in transactions:
+        bucket = income if tx.type == "credit" else costs
+        for member_id, amount in tx.shares.items():
+            bucket[tx.currency] += abs(amount)
+            shares[tx.currency][member_id] += amount
+
+    return [
+        PeriodTotal(
+            currency=currency,
+            costs=costs[currency],
+            shared_income=income[currency],
+            net=costs[currency] - income[currency],
+            shares=[
+                CategoryMemberShare(member_id=m, amount=shares[currency][m])
+                for m in member_order
+            ],
+        )
+        for currency in sorted(set(costs) | set(income))
+    ]
+
+
 def _to_period_transaction(
     tx: _SharedTransaction, member_order: list[uuid.UUID]
 ) -> PeriodTransaction:
@@ -552,6 +588,7 @@ async def compute_period(
         **positions.model_dump(),
         costs=_category_lines(in_period, member_order, income=False),
         shared_income=_category_lines(in_period, member_order, income=True),
+        totals=_period_totals(in_period, member_order),
         contributions=[c for c in contributions if _in_period(c.date, start)],
         payer_assumed_transactions=[
             _to_period_transaction(tx, member_order) for tx in in_period if tx.payer_assumed
