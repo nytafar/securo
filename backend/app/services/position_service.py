@@ -153,17 +153,20 @@ async def _load_identity(
         )
     ).all()
 
-    # The owner's member: the one linked to the group's owner; failing
-    # that, the one carrying the stored owner flag.
-    owner_member_id: Optional[uuid.UUID] = None
-    linked_to_owner = [r for r in member_rows if r.linked_user_id == group_row.user_id]
-    if linked_to_owner:
-        flagged = [r for r in linked_to_owner if r.is_self]
-        owner_member_id = (flagged or linked_to_owner)[0].id
-    else:
-        flagged = [r for r in member_rows if r.is_self]
-        if flagged:
-            owner_member_id = flagged[0].id
+    # The owner's member, as the owner-centred ledger resolved it when
+    # the owner looked: a member linked to the group's owner, or an
+    # unlinked member carrying the stored owner flag; the earliest such
+    # member wins. `is_self` here is the persisted column, not the
+    # attribute the group service rewrites on loaded members.
+    owner_member_id: Optional[uuid.UUID] = next(
+        (
+            r.id
+            for r in member_rows
+            if r.linked_user_id == group_row.user_id
+            or (r.linked_user_id is None and r.is_self)
+        ),
+        None,
+    )
 
     return _GroupIdentity(
         group_id=group_row.id,
@@ -184,15 +187,19 @@ def _resolve_payer(
     The payer is the member linked to the account's owner, or the owner's
     member when that user owns the group. When the account's owner is no
     member, or several members link that user, the payer falls back to
-    the owner's member and is flagged as assumed. In a group with no
-    owner's member the fallback is nobody: shares count and the owner's
-    side stays implicit.
+    the owner's member and is flagged as assumed. A group with no owner's
+    member keeps today's behaviour: shares count, the owner's side stays
+    implicit and no member is ever the payer.
     """
-    linked = [m for m in identity.members if m.linked_user_id == account_owner_id]
-    if account_owner_id is not None and len(linked) > 1:
+    if identity.owner_member_id is None:
+        # Today's behaviour, kept: nobody is credited as payer, not even
+        # a linked member on whose account the transaction sits.
+        return None, account_owner_id != identity.owner_user_id
+    if account_owner_id is None:
         return identity.owner_member_id, True
     if account_owner_id == identity.owner_user_id:
         return identity.owner_member_id, False
+    linked = [m for m in identity.members if m.linked_user_id == account_owner_id]
     if len(linked) == 1:
         return linked[0].id, False
     return identity.owner_member_id, True
@@ -359,7 +366,10 @@ async def _build_positions(
         if tx.payer_member_id is not None:
             bucket[(tx.payer_member_id, tx.currency)].paid += tx.shared_total
 
-    for c in contributions:
+    # Without an owner's member contributions do not count, as today:
+    # the ledger has no owner's side for them to be settled against.
+    counted = contributions if identity.owner_member_id is not None else []
+    for c in counted:
         bucket = period if _in_period(c.date, start) else before
         currencies.add(c.currency)
         bucket[(c.from_member_id, c.currency)].made += c.amount

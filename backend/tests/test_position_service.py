@@ -500,6 +500,124 @@ async def test_group_with_no_owner_member_counts_shares_only(session, test_user,
     assert period.transfers_running == []
 
 
+async def _no_owner_group(session, owner, workspace_id, a_email=None):
+    group = await group_service.create_group(
+        session, workspace_id, owner.id, GroupCreate(name="NoOwner")
+    )
+    a = await _member(session, group, workspace_id, name="A", email=a_email)
+    b = await _member(session, group, workspace_id, name="B")
+    return group, a, b
+
+
+@pytest.mark.asyncio
+async def test_no_owner_member_ignores_contributions_as_today(
+    session, test_user, test_workspace
+):
+    group, a, b = await _no_owner_group(session, test_user, test_workspace.id)
+    account = await _make_account(session, test_user.id, test_workspace.id)
+    tx = await _make_tx(session, account, "20.00")
+    await _share(session, tx, test_user.id, [a, b])
+    await _contribute(session, group, test_workspace.id, test_user.id, a, b, "7.00")
+
+    period = await position_service.compute_period(
+        session, group.id, test_workspace.id, test_user.id
+    )
+    assert period is not None
+    assert _by_member(period) == {a.id: D("10.00"), b.id: D("10.00")}
+    assert _by_member(period, "contributions_made")[a.id] == D("0")
+    # Still listed, so it can be checked against the bank.
+    assert [c.amount for c in period.contributions] == [D("7.00")]
+
+    balances = await balance_service.compute_balances(
+        session, group.id, test_workspace.id, test_user.id
+    )
+    assert balances is not None
+    assert {ln["member_id"]: ln["amount"] for ln in balances["lines"]} == {
+        a.id: D("10.00"),
+        b.id: D("10.00"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_no_owner_member_never_credits_a_linked_member_as_payer(
+    session, test_user, test_workspace
+):
+    x = await _make_user(session, "x@example.com", test_workspace.id)
+    group, a, b = await _no_owner_group(
+        session, test_user, test_workspace.id, a_email="x@example.com"
+    )
+    assert a.linked_user_id == x.id
+    x_account = await _make_account(session, x.id, test_workspace.id)
+    tx = await _make_tx(session, x_account, "100.00")
+    await _share(session, tx, test_user.id, [a, b])
+
+    period = await position_service.compute_period(
+        session, group.id, test_workspace.id, test_user.id
+    )
+    assert period is not None
+    assert _by_member(period) == {a.id: D("50.00"), b.id: D("50.00")}
+    assert _by_member(period, "paid") == {a.id: D("0"), b.id: D("0")}
+    assert period.transactions.items[0].payer_member_id is None
+
+
+@pytest.mark.asyncio
+async def test_owner_member_is_the_one_the_owner_ledger_used(
+    session, test_user, test_workspace
+):
+    """An unlinked member carrying the stored owner flag, created before
+    a member linked to the owner by email: the ledger took the first, and
+    so do positions."""
+    ws = test_workspace.id
+    group = await group_service.create_group(
+        session, ws, test_user.id, GroupCreate(name="TwoMes")
+    )
+    me_cash = await _member(session, group, ws, name="MeCash", is_self=True)
+    me_email = await _member(session, group, ws, name="MeEmail", email=test_user.email)
+    friend = await _member(session, group, ws, name="F")
+    assert me_cash.linked_user_id is None and me_email.linked_user_id == test_user.id
+    account = await _make_account(session, test_user.id, ws)
+    tx = await _make_tx(session, account, "90.00")
+    await _share(session, tx, test_user.id, [me_cash, me_email, friend])
+
+    balances = await balance_service.compute_balances(session, group.id, ws, test_user.id)
+    assert balances is not None
+    assert balances["self_member_id"] == me_cash.id
+    assert {ln["member_id"]: ln["amount"] for ln in balances["lines"]} == {
+        me_email.id: D("30.00"),
+        friend.id: D("30.00"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_stored_owner_flag_on_a_member_linked_to_someone_else_is_not_the_owner(
+    session, test_user, test_workspace
+):
+    ws = test_workspace.id
+    await _make_user(session, "other@example.com", ws)
+    group = await group_service.create_group(
+        session, ws, test_user.id, GroupCreate(name="Flagged")
+    )
+    await _member(session, group, ws, name="Other", email="other@example.com", is_self=True)
+    result = await _positions(session, group, ws, test_user.id)
+    assert result.owner_member_id is None
+
+
+def test_payer_with_no_account_owner_falls_back_to_the_owner_member():
+    owner_user, me, cash = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    identity = position_service._GroupIdentity(
+        group_id=uuid.uuid4(),
+        owner_user_id=owner_user,
+        kind="household",
+        default_currency="USD",
+        members=[
+            position_service._Member(me, "Me", owner_user),
+            position_service._Member(cash, "Cash", None),
+        ],
+        owner_member_id=me,
+    )
+    assert position_service._resolve_payer(identity, None) == (me, True)
+
+
 # ----------------------------------------------------------------- viewers
 
 
@@ -534,27 +652,45 @@ async def test_positions_are_identical_for_every_viewer(session, test_user, test
     ]
     group_id, me_id = group.id, me.id
 
+    partner_id, her_id = partner.id, her.id
+    held = []  # keeps the tagged groups, and so their members, alive
+
     async def read(user_id, workspace_id):
         # Go through the group service first, as a request does: this is
-        # what rewrites `is_self` on the loaded members.
-        assert await group_service.get_group_visible(session, group_id, workspace_id, user_id)
+        # what rewrites `is_self` on the loaded members. The group is
+        # held so the rewritten members stay in the session's identity
+        # map while the positions are computed.
+        tagged = await group_service.get_group_visible(
+            session, group_id, workspace_id, user_id
+        )
+        assert tagged is not None
+        held.append(tagged)
+        if user_id == partner_id:
+            # The rewrite really happened: the viewer is "self" now, the
+            # owner's member is not.
+            assert {m.id: m.is_self for m in tagged.members}[her_id] is True
+            assert {m.id: m.is_self for m in tagged.members}[me_id] is False
         positions = await position_service.compute_positions(
             session, group_id, workspace_id, user_id
         )
         balances = await balance_service.compute_balances(
             session, group_id, workspace_id, user_id
         )
+        assert tagged in session
         assert positions is not None and balances is not None
         return positions.model_dump(), balances
 
     # A clean session per read: members are loaded and tagged afresh.
     clean = []
     for user_id, workspace_id in viewers:
+        held.clear()
         session.expire_all()
         session.expunge_all()
         clean.append(await read(user_id, workspace_id))
-    # Successive reads in one session.
-    successive = [await read(user_id, workspace_id) for user_id, workspace_id in viewers]
+    # Successive reads in one session, ending on the owner's view again.
+    successive = [
+        await read(user_id, workspace_id) for user_id, workspace_id in viewers + viewers[:1]
+    ]
 
     expected = clean[0]
     assert expected[0]["owner_member_id"] == me_id
