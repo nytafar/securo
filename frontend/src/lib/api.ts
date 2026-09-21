@@ -889,6 +889,20 @@ export const groups = {
       const { data } = await api.post(`/groups/${groupId}/settlements`, payload)
       return data
     },
+    // Mark a real transaction as a contribution. Amount, currency, date
+    // and which side the transaction is on all come from the transaction
+    // itself, and when the other leg of the same transfer is already a
+    // contribution this one joins it instead of becoming a second.
+    markFromTransaction: async (
+      groupId: string,
+      payload: { transaction_id: string; member_id: string; notes?: string | null },
+    ): Promise<GroupSettlement> => {
+      const { data } = await api.post(
+        `/groups/${groupId}/settlements/from-transaction`,
+        payload,
+      )
+      return data
+    },
     update: async (groupId: string, settlementId: string, payload: Partial<GroupSettlementPayload>): Promise<GroupSettlement> => {
       const { data } = await api.patch(`/groups/${groupId}/settlements/${settlementId}`, payload)
       return data

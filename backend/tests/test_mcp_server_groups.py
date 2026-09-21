@@ -566,3 +566,117 @@ async def test_propose_mark_contribution_says_when_it_will_attach_to_the_other_l
     assert preview["outcome"] == "attach"
     assert preview["existing_settlement_id"] == str(first.id)
     assert preview["proposed"]["side"] == "payer"
+
+
+@pytest.mark.asyncio
+async def test_an_attach_preview_shows_the_date_and_notes_that_will_stand(
+    session, test_user, test_workspace
+):
+    """Attaching keeps the contribution's own date and fills its notes
+    only when it has none. A preview showing the incoming values would
+    promise an edit the Apply does not make."""
+    from datetime import date as _date
+
+    from app.schemas.group_settlement import MarkContributionFromTransaction
+    from app.services import settlement_service
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=_date(2026, 5, 20),
+    )
+    # One day later, and inside the window, so the two are one transfer.
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=_date(2026, 5, 21),
+    )
+    await session.commit()
+
+    first = await settlement_service.mark_transaction_as_contribution(
+        session,
+        home["group"].id,
+        test_workspace.id,
+        test_user.id,
+        MarkContributionFromTransaction(
+            transaction_id=credit.id, member_id=home["partner"].id, notes="May"
+        ),
+    )
+    assert first is not None
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(debit.id),
+        member_id=str(home["me"].id),
+        notes="a different note",
+    )
+    assert preview["outcome"] == "attach"
+    assert preview["proposed"]["date"] == "2026-05-20"
+    assert preview["proposed"]["notes"] == "May"
+
+    applied = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        group_id=str(home["group"].id),
+        transaction_id=str(debit.id),
+        member_id=str(home["me"].id),
+        notes="a different note",
+        apply=True,
+    )
+    assert applied.get("applied") is True
+
+    await session.refresh(first)
+    assert first.date == _date(2026, 5, 20)
+    assert first.notes == "May"
+
+
+@pytest.mark.asyncio
+async def test_an_attach_preview_offers_the_incoming_note_when_there_is_none(
+    session, test_user, test_workspace
+):
+    from datetime import date as _date
+
+    from app.schemas.group_settlement import MarkContributionFromTransaction
+    from app.services import settlement_service
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    when = _date(2026, 5, 20)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=when,
+    )
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    await session.commit()
+
+    await settlement_service.mark_transaction_as_contribution(
+        session,
+        home["group"].id,
+        test_workspace.id,
+        test_user.id,
+        MarkContributionFromTransaction(
+            transaction_id=credit.id, member_id=home["partner"].id
+        ),
+    )
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(debit.id),
+        member_id=str(home["me"].id),
+        notes="May",
+    )
+    assert preview["outcome"] == "attach"
+    assert preview["proposed"]["notes"] == "May"

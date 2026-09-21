@@ -3,7 +3,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Optional, cast
 
-from sqlalchemy import CursorResult, case, literal, select, func, update, delete
+from sqlalchemy import CursorResult, and_, case, literal, select, func, update, delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,6 +11,7 @@ from app.models.payee import Payee, PayeeMapping, PayeeTaxId
 from app.models.transaction import Transaction
 from app.models.category import Category
 from app.fiscal.registry import TaxIdKind, normalise_and_validate
+from app.services._query_filters import is_contribution_link
 from app.schemas.payee import PayeeCreate, PayeeUpdate
 
 
@@ -449,18 +450,28 @@ async def get_payee_summary(
     if end_date:
         base = base.where(Transaction.date <= end_date)
 
-    # Totals
+    # Totals. A contribution's bank row is money a group member moved to
+    # carry their share, neither spent at this payee nor received from
+    # them, so it stays out of both sums — while still being counted in
+    # `tx_count` and listed, as it is everywhere else.
+    counts_here = ~is_contribution_link()
     totals = await session.execute(
         select(
             func.coalesce(func.sum(
                 case(
-                    (Transaction.type == "debit", Transaction.amount),
+                    (
+                        and_(Transaction.type == "debit", counts_here),
+                        Transaction.amount,
+                    ),
                     else_=Decimal("0"),
                 )
             ), Decimal("0")).label("total_spent"),
             func.coalesce(func.sum(
                 case(
-                    (Transaction.type == "credit", Transaction.amount),
+                    (
+                        and_(Transaction.type == "credit", counts_here),
+                        Transaction.amount,
+                    ),
                     else_=Decimal("0"),
                 )
             ), Decimal("0")).label("total_received"),

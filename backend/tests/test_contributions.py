@@ -1413,3 +1413,302 @@ async def test_a_linked_member_cannot_record_between_two_other_people(
     )
     assert refused.status_code == 403
     assert "you are part of" in refused.json()["detail"]
+
+
+# ─────────── history, when the second leg arrives after the fact ─────────
+
+
+def _legacy_row(home, workspace, credit, *, when=None, notes=None) -> GroupSettlement:
+    """A settlement as the owner's books hold them: the credit that
+    landed on his account, stored in the payer-side column, because the
+    receiver side did not exist when it was written."""
+    return GroupSettlement(
+        id=uuid.uuid4(),
+        group_id=home["group"].id,
+        workspace_id=workspace.id,
+        from_member_id=home["partner"].id,
+        to_member_id=home["me"].id,
+        amount=Decimal("2000.00"),
+        currency="USD",
+        date=when or date(2026, 5, 20),
+        transaction_id=credit.id,
+        notes=notes,
+    )
+
+
+@pytest.mark.asyncio
+async def test_marking_the_debit_of_a_legacy_contribution_joins_it(
+    client, auth_headers, session, test_user, test_workspace
+):
+    """The matcher has to read the links, not the columns: a legacy row's
+    credit occupies the receiver side, so its payer side is free and her
+    debit belongs there. Reading the raw column instead would find no
+    candidate and write a second 2 000 nothing could repair."""
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=date(2026, 5, 20),
+    )
+    legacy = _legacy_row(home, test_workspace, credit)
+    session.add(legacy)
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=date(2026, 5, 20),
+    )
+    await session.commit()
+    legacy_id, credit_id, debit_id = legacy.id, credit.id, debit.id
+
+    marked = await client.post(
+        f"/api/groups/{home['group'].id}/settlements/from-transaction",
+        headers=auth_headers,
+        json={"transaction_id": str(debit.id), "member_id": str(home["me"].id)},
+    )
+    assert marked.status_code == 201, marked.text
+    assert marked.json()["id"] == str(legacy_id)
+
+    rows = (await session.execute(select(GroupSettlement))).scalars().all()
+    assert len(rows) == 1
+
+    # The columns are normalised in passing: the credit moves to the side
+    # it was always read on, because the payer's leg needs its place.
+    session.expire_all()
+    stored = await session.get(GroupSettlement, legacy_id)
+    assert stored is not None
+    assert stored.transaction_id == debit_id
+    assert stored.receiver_transaction_id == credit_id
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_contribution_takes_a_notes_only_edit(
+    client, auth_headers, session, test_user, test_workspace
+):
+    """Every contribution in the owner's books is a legacy row. Judging
+    its credit on the payer side would refuse him a note."""
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    legacy = _legacy_row(home, test_workspace, credit)
+    session.add(legacy)
+    await session.commit()
+
+    url = f"/api/groups/{home['group'].id}/settlements/{legacy.id}"
+    noted = await client.patch(url, headers=auth_headers, json={"notes": "May"})
+    assert noted.status_code == 200, noted.text
+    assert noted.json()["notes"] == "May"
+
+    amended = await client.patch(url, headers=auth_headers, json={"amount": "2100.00"})
+    assert amended.status_code == 200, amended.text
+    assert amended.json()["amount"] == "2100.00"
+
+    # Its links still read as they did, and the row was not rewritten.
+    assert amended.json()["links"] == {
+        "payer_transaction_id": None,
+        "receiver_transaction_id": str(credit.id),
+    }
+
+
+@pytest.mark.asyncio
+async def test_turning_a_legacy_contribution_round_is_still_refused(
+    client, auth_headers, session, test_user, test_workspace
+):
+    """A member change is exactly the edit that can put a link on the
+    wrong side, so that one is checked."""
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    legacy = _legacy_row(home, test_workspace, credit)
+    session.add(legacy)
+    await session.commit()
+
+    refused = await client.patch(
+        f"/api/groups/{home['group'].id}/settlements/{legacy.id}",
+        headers=auth_headers,
+        json={
+            "from_member_id": str(home["me"].id),
+            "to_member_id": str(home["partner"].id),
+        },
+    )
+    assert refused.status_code == 400
+    assert "Me's account" in refused.json()["detail"]
+    assert "receiver side" in refused.json()["detail"]
+
+
+# ──────────── two transfers of one amount, legs already paired ───────────
+
+
+@pytest.mark.asyncio
+async def test_a_leg_never_joins_the_contribution_of_another_transfer(
+    client, auth_headers, session, test_user, test_workspace
+):
+    """Two 2 000 transfers on the same day, both already paired by the
+    bank. Marking one credit and then the *other* transfer's debit must
+    not cross them over: the matcher follows the pairing."""
+    home = await _household(session, test_user, test_workspace)
+    when = date(2026, 5, 20)
+    pairs = []
+    for _ in range(2):
+        pair_id = uuid.uuid4()
+        credit = await _tx(
+            session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+            type_="credit", when=when,
+        )
+        debit = await _tx(
+            session, home["partner_user"].id, test_workspace.id, home["hers"].id,
+            "2000.00", when=when,
+        )
+        credit.transfer_pair_id = pair_id
+        debit.transfer_pair_id = pair_id
+        pairs.append((credit, debit))
+    await session.commit()
+
+    (credit_one, _debit_one), (_credit_two, debit_two) = pairs
+    url = f"/api/groups/{home['group'].id}/settlements/from-transaction"
+
+    first = await client.post(
+        url, headers=auth_headers,
+        json={"transaction_id": str(credit_one.id), "member_id": str(home["partner"].id)},
+    )
+    assert first.status_code == 201, first.text
+
+    second = await client.post(
+        url, headers=auth_headers,
+        json={"transaction_id": str(debit_two.id), "member_id": str(home["me"].id)},
+    )
+    assert second.status_code == 201, second.text
+    assert second.json()["id"] != first.json()["id"], (
+        "the second transfer's debit joined the first transfer's contribution"
+    )
+
+    rows = (await session.execute(select(GroupSettlement))).scalars().all()
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_pair_partner_that_is_a_contribution_is_the_only_candidate(
+    client, auth_headers, session, test_user, test_workspace
+):
+    home = await _household(session, test_user, test_workspace)
+    when = date(2026, 5, 20)
+    pair_id = uuid.uuid4()
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=when,
+    )
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    credit.transfer_pair_id = pair_id
+    debit.transfer_pair_id = pair_id
+    await session.commit()
+
+    url = f"/api/groups/{home['group'].id}/settlements/from-transaction"
+    first = await client.post(
+        url, headers=auth_headers,
+        json={"transaction_id": str(credit.id), "member_id": str(home["partner"].id)},
+    )
+    second = await client.post(
+        url, headers=auth_headers,
+        json={"transaction_id": str(debit.id), "member_id": str(home["me"].id)},
+    )
+    assert first.status_code == 201 and second.status_code == 201, second.text
+    assert second.json()["id"] == first.json()["id"]
+
+
+# ───────────── transfer detection obeys the same rules as a person ───────
+
+
+@pytest.mark.asyncio
+async def test_pairing_leaves_a_contribution_alone_when_the_other_leg_is_shared(
+    session, test_user, test_workspace
+):
+    """His credit is a contribution and her matching debit carries 50/50
+    shares. Linking it would make the same money both the pot's spending
+    and a payment into the pot, and positions would count both."""
+    from app.services import transfer_detection_service
+
+    home = await _household(session, test_user, test_workspace)
+    when = date(2026, 5, 20)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=when,
+    )
+    session.add(_legacy_row(home, test_workspace, credit, when=when))
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    await split_service.replace_splits(
+        session,
+        debit,
+        TransactionSplitsInput(
+            share_type="equal",
+            splits=[
+                TransactionSplitInput(group_member_id=home["me"].id),
+                TransactionSplitInput(group_member_id=home["partner"].id),
+            ],
+        ),
+        test_user.id,
+    )
+    await session.commit()
+
+    # The pairing itself still happens; only the contribution is spared.
+    pairs = await transfer_detection_service.detect_transfer_pairs(
+        session, test_workspace.id, candidate_ids=[debit.id]
+    )
+    await session.commit()
+    assert pairs == 1
+
+    row = (await session.execute(select(GroupSettlement))).scalars().one()
+    await session.refresh(row)
+    assert row.transaction_id == credit.id
+    assert row.receiver_transaction_id is None
+
+
+@pytest.mark.asyncio
+async def test_pairing_leaves_a_contribution_alone_when_the_leg_is_on_the_wrong_account(
+    session, test_user, test_workspace
+):
+    """An equal credit on her *own* second account is not the receiving
+    side of a her → him contribution, however well the amounts match."""
+    from app.services import transfer_detection_service
+
+    home = await _household(session, test_user, test_workspace)
+    when = date(2026, 5, 20)
+    her_savings = await _account(
+        session, home["partner_user"].id, test_workspace.id, "Her savings"
+    )
+    her_debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    session.add(
+        GroupSettlement(
+            id=uuid.uuid4(),
+            group_id=home["group"].id,
+            workspace_id=test_workspace.id,
+            from_member_id=home["partner"].id,
+            to_member_id=home["me"].id,
+            amount=Decimal("2000.00"),
+            currency="USD",
+            date=when,
+            transaction_id=her_debit.id,
+        )
+    )
+    her_credit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, her_savings.id, "2000.00",
+        type_="credit", when=when,
+    )
+    await session.commit()
+
+    await transfer_detection_service.detect_transfer_pairs(
+        session, test_workspace.id, candidate_ids=[her_credit.id]
+    )
+    await session.commit()
+
+    row = (await session.execute(select(GroupSettlement))).scalars().one()
+    await session.refresh(row)
+    assert row.transaction_id == her_debit.id
+    assert row.receiver_transaction_id is None

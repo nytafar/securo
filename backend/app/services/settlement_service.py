@@ -417,6 +417,41 @@ async def resolve_links(
     ]
 
 
+async def resolved_links_of(
+    session: AsyncSession, settlement: GroupSettlement
+) -> ContributionLinks:
+    """One settlement's links, as read. Every writer that asks which side
+    is taken has to ask this and not the raw columns: the owner's own
+    history is all legacy rows, where the payer column holds a credit
+    that really belongs to the receiver side."""
+    resolved = await resolve_links(
+        session, [(settlement.transaction_id, settlement.receiver_transaction_id)]
+    )
+    return resolved[0]
+
+
+def apply_leg(
+    settlement: GroupSettlement,
+    links: ContributionLinks,
+    side: str,
+    transaction_id: uuid.UUID,
+) -> None:
+    """Put `transaction_id` on `side` of the contribution and write the
+    other side back where it is read.
+
+    A legacy row is normalised in passing: its credit moves out of the
+    payer-side column into the receiver-side one, because the leg that
+    has just arrived is the payer's and needs the place it was standing
+    in. That is a write, but an event-driven one — never a migration.
+    """
+    settlement.transaction_id = (
+        transaction_id if side == "payer" else links.payer_transaction_id
+    )
+    settlement.receiver_transaction_id = (
+        transaction_id if side == "receiver" else links.receiver_transaction_id
+    )
+
+
 async def attach_links(
     session: AsyncSession, settlements: Sequence[GroupSettlement]
 ) -> None:
@@ -478,11 +513,21 @@ async def create_settlement(
         raise ValueError("The two sides of a contribution must be two transactions")
     await _validate_transaction(session, data.transaction_id, workspace_id)
     await _validate_transaction(session, data.receiver_transaction_id, workspace_id)
-    await _assert_link_side_matches_member(
-        session, group_id, data.transaction_id, data.from_member_id, "payer"
+    # Judged on the links as read, so a caller who puts a credit in the
+    # payer-side column the way history does is checked against the
+    # member who really received it.
+    created_links = await resolve_links(
+        session, [(data.transaction_id, data.receiver_transaction_id)]
     )
     await _assert_link_side_matches_member(
-        session, group_id, data.receiver_transaction_id, data.to_member_id, "receiver"
+        session, group_id, created_links[0].payer_transaction_id, data.from_member_id, "payer"
+    )
+    await _assert_link_side_matches_member(
+        session,
+        group_id,
+        created_links[0].receiver_transaction_id,
+        data.to_member_id,
+        "receiver",
     )
 
     payload = data.model_dump()
@@ -622,15 +667,28 @@ async def update_settlement(
             await _validate_transaction(
                 session, update_data[column], workspace_id, settlement_id=settlement.id
             )
-    # Both sides are re-checked, not only the changed one: moving a
-    # member is as capable of putting a link on the wrong side as moving
-    # a link is.
-    await _assert_link_side_matches_member(
-        session, group_id, new_payer_link, new_from, "payer"
-    )
-    await _assert_link_side_matches_member(
-        session, group_id, new_receiver_link, new_to, "receiver"
-    )
+
+    # Only an edit that moves a link or a member can put a link on the
+    # wrong side. Leaving the rest alone matters because the owner's
+    # history is all legacy rows: re-checking those on a notes-only edit
+    # would refuse to let him type a note.
+    touches_links = {
+        "transaction_id",
+        "receiver_transaction_id",
+        "from_member_id",
+        "to_member_id",
+    } & update_data.keys()
+    if touches_links:
+        # Checked against the links as *read*, so a legacy row's credit
+        # is judged on the receiver side where it belongs, and not on the
+        # payer side where the column happens to keep it.
+        links = await resolve_links(session, [(new_payer_link, new_receiver_link)])
+        await _assert_link_side_matches_member(
+            session, group_id, links[0].payer_transaction_id, new_from, "payer"
+        )
+        await _assert_link_side_matches_member(
+            session, group_id, links[0].receiver_transaction_id, new_to, "receiver"
+        )
 
     for key, value in update_data.items():
         setattr(settlement, key, value)
@@ -715,6 +773,12 @@ class ContributionPlan:
     # "payer" or "receiver" — which side the transaction is.
     side: str
     existing_settlement_id: Optional[uuid.UUID]
+    # What attaching would leave the contribution carrying. Attach keeps
+    # the existing row's date and fills its notes only when it has none,
+    # so a preview that showed the incoming values would promise what the
+    # write does not do.
+    existing_date: Optional[_date] = None
+    existing_notes: Optional[str] = None
 
 
 async def plan_contribution_from_transaction(
@@ -803,7 +867,8 @@ async def plan_contribution_from_transaction(
         amount=amount,
         currency=tx.currency,
         when=when,
-        side=_LINK_COLUMN[side],
+        side=side,
+        transfer_pair_id=tx.transfer_pair_id,
     )
 
     return ContributionPlan(
@@ -815,11 +880,12 @@ async def plan_contribution_from_transaction(
         currency=tx.currency,
         date=when,
         side=side,
-        existing_settlement_id=existing.id if existing is not None else None,
+        existing_settlement_id=existing[0].id if existing is not None else None,
+        existing_date=existing[0].date if existing is not None else None,
+        existing_notes=(
+            (existing[0].notes or data.notes) if existing is not None else None
+        ),
     )
-
-
-_LINK_COLUMN = {"payer": "transaction_id", "receiver": "receiver_transaction_id"}
 
 
 async def mark_transaction_as_contribution(
@@ -846,13 +912,16 @@ async def mark_transaction_as_contribution(
     if plan is None:
         return None
 
-    column = _LINK_COLUMN[plan.side]
-
     if plan.existing_settlement_id is not None:
         settlement = await session.get(GroupSettlement, plan.existing_settlement_id)
         if settlement is None:
             raise ValueError("The other leg's contribution is no longer there")
-        setattr(settlement, column, plan.transaction_id)
+        apply_leg(
+            settlement,
+            await resolved_links_of(session, settlement),
+            plan.side,
+            plan.transaction_id,
+        )
         if data.notes and not settlement.notes:
             settlement.notes = data.notes
     else:
@@ -865,7 +934,11 @@ async def mark_transaction_as_contribution(
             currency=plan.currency,
             date=plan.date,
             notes=data.notes,
-            **{column: plan.transaction_id},
+            **{
+                "transaction_id"
+                if plan.side == "payer"
+                else "receiver_transaction_id": plan.transaction_id
+            },
         )
         session.add(settlement)
 
@@ -891,24 +964,29 @@ async def _contribution_awaiting_this_leg(
     currency: str,
     when,
     side: str,
-) -> Optional[GroupSettlement]:
+    transfer_pair_id: Optional[uuid.UUID],
+) -> Optional[tuple[GroupSettlement, ContributionLinks]]:
     """The contribution this transaction is the missing leg of, if there
     is exactly one.
 
     A candidate is in the same group, runs between the same two members
     in the same direction, carries the same amount in the same currency,
     is dated within the window transfer detection pairs legs over, and
-    has *this* side of it still empty. The other side may be filled — the
-    usual case, where the first leg was marked — or empty, where the
-    contribution was recorded by hand and is only now being backed by a
-    bank row; either way there is one event and one contribution.
+    has *this* side of it still free **as read** — a legacy row's credit
+    sits in the payer-side column but occupies the receiver side, so its
+    payer side is free and the matching debit belongs there.
+
+    Transfer pairing decides the rest. A transaction the bank's two legs
+    were matched on belongs to the contribution holding its own partner
+    and to no other; one that is unpaired cannot join a contribution
+    whose other leg is paired with something else. Without that, two
+    transfers of the same amount on the same day cross over.
 
     Returns None when nothing matches. Raises when more than one does:
     which of two contributions this leg belongs to is a fact about money
     that only the user has, and guessing it would double-count either
     way.
     """
-    column = getattr(GroupSettlement, side)
     result = await session.execute(
         select(GroupSettlement).where(
             GroupSettlement.group_id == group_id,
@@ -916,21 +994,70 @@ async def _contribution_awaiting_this_leg(
             GroupSettlement.to_member_id == to_member_id,
             GroupSettlement.amount == amount,
             GroupSettlement.currency == currency,
-            column.is_(None),
             GroupSettlement.date >= when - timedelta(days=LEG_TOLERANCE_DAYS),
             GroupSettlement.date <= when + timedelta(days=LEG_TOLERANCE_DAYS),
         )
     )
-    candidates = list(result.scalars().all())
+    rows = list(result.scalars().all())
+    if not rows:
+        return None
+
+    resolved = await resolve_links(
+        session, [(r.transaction_id, r.receiver_transaction_id) for r in rows]
+    )
+    other = "receiver" if side == "payer" else "payer"
+    other_legs = [
+        getattr(links, f"{other}_transaction_id") for links in resolved
+    ]
+    pair_of = await _transfer_pairs_of(session, [leg for leg in other_legs if leg])
+
+    candidates: list[tuple[GroupSettlement, ContributionLinks]] = []
+    for row, links, other_leg in zip(rows, resolved, other_legs):
+        if getattr(links, f"{side}_transaction_id") is not None:
+            continue
+        if not _legs_of_one_transfer(transfer_pair_id, pair_of.get(other_leg)):
+            continue
+        candidates.append((row, links))
+
     if not candidates:
         return None
     if len(candidates) > 1:
-        ids = ", ".join(str(c.id) for c in candidates)
+        ids = ", ".join(str(row.id) for row, _ in candidates)
         raise ValueError(
             "More than one contribution could be the other leg of this "
             f"transaction ({ids}). Link it to the right one by hand."
         )
     return candidates[0]
+
+
+def _legs_of_one_transfer(
+    pair_id: Optional[uuid.UUID], other_pair_id: Optional[uuid.UUID]
+) -> bool:
+    """Whether a transaction and a contribution's other leg can be the
+    two halves of one transfer.
+
+    When the transaction is half of a matched pair, only the contribution
+    already holding the other half will do — anything else is a guess,
+    including a contribution with no leg linked at all. When it is
+    unpaired, the other leg has to be unpaired too, or it is half of some
+    other transfer.
+    """
+    if pair_id is not None:
+        return other_pair_id == pair_id
+    return other_pair_id is None
+
+
+async def _transfer_pairs_of(
+    session: AsyncSession, transaction_ids: Sequence[uuid.UUID]
+) -> dict[uuid.UUID, Optional[uuid.UUID]]:
+    if not transaction_ids:
+        return {}
+    result = await session.execute(
+        select(Transaction.id, Transaction.transfer_pair_id).where(
+            Transaction.id.in_(list(transaction_ids))
+        )
+    )
+    return {row.id: row.transfer_pair_id for row in result.all()}
 
 
 async def attach_paired_leg(
@@ -975,6 +1102,25 @@ async def attach_paired_leg(
         # Replacing that silently would drop a link nobody asked to drop.
         return False
     if occupied == legs and settlement.transaction_id == debit.id:
+        return False
+
+    # Bank sync gets no shortcut past the rules a person writing the same
+    # link has to obey: a leg that carries group shares is already the
+    # pot's spending and cannot also be money put into it, and a leg has
+    # to sit on the account of the member on its side. A pair that fails
+    # either test is simply left as two unlinked transactions — a sync is
+    # no place to raise, and the contribution it would have joined is
+    # better off untouched than wrong.
+    try:
+        for leg in (debit, credit):
+            await _assert_transaction_unshared(session, leg.id)
+        await _assert_link_side_matches_member(
+            session, settlement.group_id, debit.id, settlement.from_member_id, "payer"
+        )
+        await _assert_link_side_matches_member(
+            session, settlement.group_id, credit.id, settlement.to_member_id, "receiver"
+        )
+    except ValueError:
         return False
 
     settlement.transaction_id = debit.id

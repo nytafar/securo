@@ -1139,10 +1139,11 @@ async def propose_mark_contribution(
             "description": tx.description,
             "amount": num(plan.amount),
             "currency": plan.currency,
-            # The date the contribution will carry, which is the date the
-            # rest of the app buckets this transaction by — not always
-            # the transaction's own `date`.
-            "date": plan.date.isoformat(),
+            # The date the contribution will carry. Creating takes the
+            # date the rest of the app buckets this transaction by, which
+            # is not always the transaction's own; attaching keeps the
+            # date the contribution already has.
+            "date": (plan.existing_date or plan.date).isoformat(),
             "side": plan.side,
             "from_member_id": str(plan.from_member_id),
             "from_member_name": names.get(plan.from_member_id),
@@ -1152,7 +1153,9 @@ async def propose_mark_contribution(
             "member_name": names.get(
                 plan.to_member_id if plan.side == "payer" else plan.from_member_id
             ),
-            "notes": notes,
+            # Attaching fills the notes only when the contribution has
+            # none, so this is what it will read afterwards either way.
+            "notes": plan.existing_notes if plan.existing_settlement_id else notes,
         },
         # "create" writes a new contribution; "attach" hangs this
         # transaction off the one the other leg of the same transfer

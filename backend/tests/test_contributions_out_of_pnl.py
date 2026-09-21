@@ -551,3 +551,99 @@ async def test_the_calendar_leaves_a_pending_contribution_out_of_projected_incom
     # The projected walk still carries them: they will land.
     assert after.projected_count == 2
     assert after.ending_balance == before.ending_balance
+
+
+@pytest.mark.asyncio
+async def test_the_agents_aggregate_tool_leaves_the_transfer_out(
+    session: AsyncSession, test_user, test_workspace
+):
+    """An agent asking "how much came in last month?" must give the same
+    answer as the screen."""
+    import mcp_server.tools.aggregate as aggregate_tool
+    from mcp_server.auth import CallContext
+
+    home = await _household(session, test_user, test_workspace)
+    today = date.today().replace(day=15)
+    credit, debit = await _transfer_legs(session, home, test_user, test_workspace, today)
+    await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        GROCERIES,
+        type_="debit",
+        when=today,
+        description="Groceries",
+    )
+    await session.commit()
+
+    async def income() -> float:
+        result = await aggregate_tool.aggregate(
+            session=session,
+            ctx=CallContext(user_id=test_user.id),
+            metric="sum",
+            group_by="month",
+            tx_type="income",
+        )
+        return sum(item["value"] or 0 for item in result["items"])
+
+    async def expense() -> float:
+        result = await aggregate_tool.aggregate(
+            session=session,
+            ctx=CallContext(user_id=test_user.id),
+            metric="sum",
+            group_by="month",
+            tx_type="expense",
+        )
+        return sum(item["value"] or 0 for item in result["items"])
+
+    assert await income() == pytest.approx(2000.0, abs=0.01)
+    assert await expense() == pytest.approx(2300.0, abs=0.01)
+
+    await _mark(session, home, test_workspace, credit, debit)
+
+    assert await income() == 0.0
+    assert await expense() == pytest.approx(300.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_a_payee_summary_does_not_count_the_transfer(
+    session: AsyncSession, test_user, test_workspace
+):
+    """Her transfers are filed under a payee. They are neither money
+    spent at that payee nor received from them."""
+    from app.models.payee import Payee
+    from app.services import payee_service
+
+    home = await _household(session, test_user, test_workspace)
+    today = date.today().replace(day=15)
+    payee = Payee(
+        id=uuid.uuid4(),
+        workspace_id=test_workspace.id,
+        user_id=test_user.id,
+        name="Anna",
+    )
+    session.add(payee)
+    await session.flush()
+
+    credit, debit = await _transfer_legs(session, home, test_user, test_workspace, today)
+    credit.payee_id = payee.id
+    debit.payee_id = payee.id
+    await session.commit()
+
+    async def summary() -> dict:
+        return await payee_service.get_payee_summary(
+            session, payee.id, test_workspace.id
+        )
+
+    before = await summary()
+    assert float(before["total_received"]) == pytest.approx(2000.0, abs=0.01)
+    assert float(before["total_spent"]) == pytest.approx(2000.0, abs=0.01)
+
+    await _mark(session, home, test_workspace, credit, debit)
+
+    after = await summary()
+    assert float(after["total_received"]) == 0.0
+    assert float(after["total_spent"]) == 0.0
+    # Still the payee's transactions, and still counted as such.
+    assert after["payee"].transaction_count == 2

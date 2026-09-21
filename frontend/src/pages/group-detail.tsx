@@ -33,6 +33,12 @@ import {
   type GroupMemberPayload,
   type GroupSettlementPayload,
 } from '@/lib/api'
+
+/** Marking a real transaction, as opposed to recording a contribution
+ *  by hand. Wrapped so the one mutation can tell the two apart. */
+type MarkContributionPayload = {
+  transaction: { transaction_id: string; member_id: string; notes?: string | null }
+}
 import { localDateString } from '@/lib/date-utils'
 import {
   catchUpMonths,
@@ -511,9 +517,17 @@ export default function GroupDetailPage() {
     enabled: settleOpen && settleTxMode === 'existing' && settleSide !== null,
   })
 
+  // A contribution backed by a real transaction goes through the marking
+  // endpoint, not through create: only that path knows that the other
+  // leg of the same transfer may already be a contribution, and joins it
+  // instead of making a second one for money that moved once. A
+  // hand-entered contribution with no transaction behind it still gets
+  // created outright.
   const settlementMutation = useMutation({
-    mutationFn: (payload: GroupSettlementPayload) =>
-      groupsApi.settlements.create(groupId, payload),
+    mutationFn: (payload: GroupSettlementPayload | MarkContributionPayload) =>
+      'transaction' in payload
+        ? groupsApi.settlements.markFromTransaction(groupId, payload.transaction)
+        : groupsApi.settlements.create(groupId, payload),
     onSuccess: () => {
       invalidateGroup()
       setSettleOpen(false)
@@ -558,7 +572,22 @@ export default function GroupDetailPage() {
   }
 
   const saveSettlement = () => {
-    if (!settleFrom || !settleTo || !settleAmount) return
+    if (!settleFrom || !settleTo) return
+    if (settleTxMode === 'existing' && settlePickedTx) {
+      // The endpoint reads the amount, the currency, the date and which
+      // side the transaction is on off the transaction itself — which is
+      // why those inputs are disabled in this mode. Only the other
+      // member and the note are ours to send.
+      settlementMutation.mutate({
+        transaction: {
+          transaction_id: settlePickedTx.id,
+          member_id: settleSide === 'receiver' ? settleFrom : settleTo,
+          notes: settleNotes.trim() || null,
+        },
+      })
+      return
+    }
+    if (!settleAmount) return
     const payload: GroupSettlementPayload = {
       from_member_id: settleFrom,
       to_member_id: settleTo,
@@ -569,16 +598,6 @@ export default function GroupDetailPage() {
     }
     if (settleTxMode === 'create' && settleAccountId) {
       payload.account_id = settleAccountId
-    } else if (settleTxMode === 'existing' && settlePickedTx) {
-      // A credit the viewer received is the receiver's side of the
-      // contribution, not the payer's; putting it in the payer column is
-      // what the old records did and what the API now only tolerates for
-      // history's sake.
-      if (settleSide === 'receiver') {
-        payload.receiver_transaction_id = settlePickedTx.id
-      } else {
-        payload.transaction_id = settlePickedTx.id
-      }
     }
     settlementMutation.mutate(payload)
   }

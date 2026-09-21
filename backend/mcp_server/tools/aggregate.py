@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.transaction import Transaction
 from app.models.category import Category
+from app.services._query_filters import is_contribution_link
 from mcp_server.auth import CallContext
 from mcp_server.registry import tool
 from mcp_server.tools._helpers import num, parse_date, parse_uuid_list, resolve_workspace_id
@@ -36,7 +37,7 @@ from mcp_server.tools._helpers import num, parse_date, parse_uuid_list, resolve_
             "tx_type": {"type": "string", "enum": ["expense", "income"], "description": "Filter to expenses or income only"},
             "description_contains": {"type": "string", "description": "Case-insensitive substring match against the transaction description — use this to scope to a merchant/keyword like 'uber', 'spotify', 'amigos do bem'."},
             "status": {"type": "string", "enum": ["posted", "pending", "all"], "default": "posted", "description": "Default 'posted' = only money that already moved. Use 'pending' for scheduled/recurring not yet settled, or 'all' to include both."},
-            "exclude_transfers": {"type": "boolean", "default": True},
+            "exclude_transfers": {"type": "boolean", "default": True, "description": "Leaves out both legs of a matched transfer and the bank rows a group contribution is made of — money moved between the user's own accounts or between group members, which is neither income nor spending."},
             "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 25, "description": "Max bucket rows in the result. Capped at 50."},
         },
         "additionalProperties": False,
@@ -137,7 +138,10 @@ async def aggregate(
         q = q.where(Transaction.type == "credit")
 
     if exclude_transfers:
-        q = q.where(Transaction.transfer_pair_id.is_(None))
+        # A contribution is money moved between members to carry a share,
+        # no more income or spending than a transfer between the user's
+        # own accounts. Same rule as every other total in the app.
+        q = q.where(Transaction.transfer_pair_id.is_(None), ~is_contribution_link())
 
     q = q.group_by(bucket_id).order_by(value_expr.desc().nulls_last()).limit(int(limit))
 
