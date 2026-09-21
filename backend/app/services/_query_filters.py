@@ -13,7 +13,36 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account
 from app.models.category import Category
+from app.models.group_settlement import GroupSettlement
 from app.models.transaction import Transaction
+
+
+def is_contribution_link():
+    """SQL filter: this row *is* the bank transaction a group contribution
+    is made of, on either side of it.
+
+    A contribution is never a copy of a transaction: the real bank row is
+    linked, from the payer side (`transaction_id`) or the receiver side
+    (`receiver_transaction_id`). A legacy row that links a credit in the
+    payer-side column is the receiver side read the other way round —
+    which changes nothing here, because both columns are searched.
+
+    The `IS NOT NULL` inside each subquery matters: `IN (NULL)` is unknown
+    rather than false, so without it the whole predicate would go unknown
+    as soon as one settlement left a side unlinked.
+    """
+    return or_(
+        Transaction.id.in_(
+            select(GroupSettlement.transaction_id).where(
+                GroupSettlement.transaction_id.is_not(None)
+            )
+        ),
+        Transaction.id.in_(
+            select(GroupSettlement.receiver_transaction_id).where(
+                GroupSettlement.receiver_transaction_id.is_not(None)
+            )
+        ),
+    )
 
 
 def is_confirmed():
@@ -94,6 +123,21 @@ def reporting_date_col(accounting_mode: str):
     return func.coalesce(Transaction.effective_bill_date, base)
 
 
+def reporting_date_of(transaction, accounting_mode: str) -> date:
+    """`reporting_date_col` for a row already in memory.
+
+    Same coalesce, same order, so a contribution dated from the
+    transaction it is made of lands in the period that transaction lands
+    in everywhere else.
+    """
+    base = (
+        transaction.effective_date
+        if accounting_mode == "accrual"
+        else transaction.date
+    )
+    return transaction.effective_bill_date or base or transaction.date
+
+
 def is_not_ignored():
     """SQL filter: the row is not one the user told us to disregard.
 
@@ -129,7 +173,12 @@ def counts_as_pnl():
       - transactions flagged `is_ignored=True` (user-marked as not to be reported),
       - transactions flagged `exclude_from_pnl=True` (kept in balance,
         omitted from income and expense calculations),
-      - transactions in categories flagged `is_ignored=True` (user-marked as not to be reported).
+      - transactions in categories flagged `is_ignored=True` (user-marked as not to be reported),
+      - the bank transaction a group contribution is made of, on either
+        side: the money one member moves to another to carry their part
+        of the common pot is neither income nor spending for either of
+        them, exactly as a paired transfer is neither. It still moves the
+        account balance and still shows in the transaction list.
 
     Does NOT exclude `source='opening_balance'` — callers that already
     filter those keep doing so; this helper only handles the transfer-like
@@ -137,6 +186,7 @@ def counts_as_pnl():
     """
     return and_(
         Transaction.transfer_pair_id.is_(None),
+        ~is_contribution_link(),
         Transaction.is_ignored.is_(False),
         Transaction.exclude_from_pnl.is_(False),
         # Settlement *debits* are repayments of debts that were already

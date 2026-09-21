@@ -652,6 +652,60 @@ describe('the group page as a common pot', () => {
     )
   })
 
+  it('links the credit that landed as the receiver side of a contribution', async () => {
+    // The household's real case: Anna transfers, the owner marks the
+    // credit on his own account. It is his receiving leg, so it must go
+    // in the receiver column — the payer column is where history put it,
+    // not where a new record belongs.
+    api.groups.settlements.create.mockResolvedValue({ id: 'contribution-2' })
+    api.transactions.list.mockResolvedValue({
+      items: [
+        {
+          id: 'tx-credit',
+          date: '2026-09-05',
+          description: 'Transfer from Anna',
+          amount: 300,
+          currency: 'USD',
+          type: 'credit',
+        },
+      ],
+      total: 1,
+    })
+    const { user } = await renderLoaded()
+
+    const periodCard = card(t('splitGroups.pot.transfersPeriod'))
+    await user.click(
+      within(periodCard).getByRole('button', {
+        name: t('splitGroups.pot.recordContribution'),
+      }),
+    )
+
+    const dialog = await screen.findByRole('dialog')
+    const txAction = within(dialog)
+      .getByRole('option', { name: t('splitGroups.txActionExisting') })
+      .closest('select')!
+    await user.selectOptions(txAction, 'existing')
+    // The receiver writes no fresh debit — the credit already landed —
+    // so that option is not offered to them.
+    expect(
+      within(dialog).queryByRole('option', { name: t('splitGroups.txActionCreate') }),
+    ).not.toBeInTheDocument()
+    // It is the credits that are searched, not the debits.
+    await waitFor(() =>
+      expect(api.transactions.list).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'credit' }),
+      ),
+    )
+
+    await user.click(await within(dialog).findByText(/Transfer from Anna/))
+    await user.click(within(dialog).getByRole('button', { name: t('common.save') }))
+
+    await waitFor(() => expect(api.groups.settlements.create).toHaveBeenCalled())
+    const [, payload] = api.groups.settlements.create.mock.calls.at(-1)!
+    expect(payload.receiver_transaction_id).toBe('tx-credit')
+    expect(payload.transaction_id).toBeUndefined()
+  })
+
   it('pages the transaction list on the server', async () => {
     const { user } = renderPage()
 

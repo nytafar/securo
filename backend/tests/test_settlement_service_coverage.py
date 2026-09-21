@@ -206,6 +206,7 @@ async def test_create_settlement_receiver_self_member_owner_fallback(session: As
         GroupSettlementCreate(
             from_member_id=friend.id, to_member_id=owner_self.id,
             amount=Decimal("8.00"), currency="USD", date=date.today(),
+            create_receiver_transaction=True,
         ),
     )
 

@@ -3,7 +3,7 @@ from datetime import date as _date, datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import Date, DateTime, ForeignKey, Numeric, String
+from sqlalchemy import Date, DateTime, ForeignKey, Index, Numeric, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -16,6 +16,21 @@ if TYPE_CHECKING:
 
 class GroupSettlement(Base):
     __tablename__ = "group_settlements"
+
+    # One transaction, one contribution. A unique index per link column
+    # stops the same bank row backing two settlements on the same side;
+    # the cross-column case (payer side here, receiver side there) is no
+    # single index and is checked in the service. NULL repeats freely in
+    # a unique index on both SQLite and PostgreSQL, so settlements with
+    # an unlinked side are unaffected.
+    __table_args__ = (
+        Index("uq_group_settlements_transaction_id", "transaction_id", unique=True),
+        Index(
+            "uq_group_settlements_receiver_transaction_id",
+            "receiver_transaction_id",
+            unique=True,
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     group_id: Mapped[uuid.UUID] = mapped_column(

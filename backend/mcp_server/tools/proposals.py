@@ -35,6 +35,7 @@ from app.schemas.recurring_transaction import (
     RecurringTransactionUpdate,
     WeekendAdjustment,
 )
+from app.schemas.group_settlement import MarkContributionFromTransaction
 from app.schemas.rule import RuleAction, RuleCondition, RuleCreate
 from app.schemas.transaction import TransactionCreate
 from app.schemas.transaction_split import TransactionSplitInput, TransactionSplitsInput
@@ -42,8 +43,10 @@ from app.services import (
     budget_service,
     category_service,
     goal_service,
+    group_service,
     recurring_transaction_service,
     rule_service,
+    settlement_service,
     transaction_service,
 )
 from mcp_server.auth import CallContext
@@ -1024,6 +1027,123 @@ async def propose_create_goal(
                 color=color or "#3B82F6",
             ),
         )
+        return {**preview, "applied": True, "id": str(created.id)}
+
+    return preview
+
+
+@tool(
+    name="propose_mark_contribution",
+    description=_PROPOSAL_PREFACE
+    + (
+        "Build a preview for marking an existing bank transaction as a "
+        "contribution to an expense-sharing group — money one member "
+        "moved to carry their part of the common pot, such as the "
+        "monthly transfer a partner makes. Nothing is copied: the real "
+        "transaction becomes the contribution, and its amount, currency, "
+        "date and side are all read off it. A debit is the payer's side "
+        "(the money left that account's owner) and a credit the "
+        "receiver's, so `member_id` is always the member on the OTHER "
+        "side — call `list_groups` for the ids. Refused when the "
+        "transaction is already part of a contribution or carries group "
+        "shares. Marked contributions leave income and spending for both "
+        "members while still moving the account balance."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "string", "format": "uuid"},
+            "transaction_id": {"type": "string", "format": "uuid"},
+            "member_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "The member on the other side of the transaction.",
+            },
+            "notes": {"type": "string"},
+            "apply": _APPLY_FIELD,
+        },
+        "required": ["group_id", "transaction_id", "member_id"],
+        "additionalProperties": False,
+    },
+    is_proposal=True,
+    tags=["propose", "groups"],
+)
+async def propose_mark_contribution(
+    *,
+    session: AsyncSession,
+    ctx: CallContext,
+    group_id: str,
+    transaction_id: str,
+    member_id: str,
+    notes: str | None = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    ws_id = await resolve_workspace_id(session, ctx)
+    gid, tx_id, mid = (
+        parse_uuid(group_id),
+        parse_uuid(transaction_id),
+        parse_uuid(member_id),
+    )
+    if gid is None or tx_id is None or mid is None:
+        return {"error": "group_id, transaction_id and member_id must be uuids"}
+
+    group = await group_service.get_group_visible(session, gid, ws_id, ctx.user_id)
+    if group is None:
+        return {"error": "group not found or not visible to this user"}
+
+    tx = (
+        await session.execute(
+            select(Transaction).where(
+                Transaction.id == tx_id, Transaction.workspace_id == ws_id
+            )
+        )
+    ).scalar_one_or_none()
+    if tx is None:
+        return {"error": "transaction not found"}
+
+    member = (
+        await session.execute(
+            select(GroupMember).where(GroupMember.id == mid, GroupMember.group_id == gid)
+        )
+    ).scalar_one_or_none()
+    if member is None:
+        return {"error": "the other member does not belong to the given group"}
+
+    preview = {
+        "kind": "mark_contribution",
+        "proposed": {
+            "group_id": str(gid),
+            "group_name": group.name,
+            "transaction_id": str(tx.id),
+            "description": tx.description,
+            "amount": num(tx.amount),
+            "currency": tx.currency,
+            "date": tx.date.isoformat() if tx.date else None,
+            "side": "payer" if tx.type == "debit" else "receiver",
+            "member_id": str(member.id),
+            "member_name": member.name,
+            "notes": notes,
+        },
+        "apply_endpoint": f"POST /api/groups/{gid}/settlements/from-transaction",
+    }
+
+    if _can_apply(ctx, apply):
+        try:
+            created = await settlement_service.mark_transaction_as_contribution(
+                session,
+                gid,
+                ws_id,
+                ctx.user_id,
+                MarkContributionFromTransaction(
+                    transaction_id=tx.id, member_id=member.id, notes=notes
+                ),
+            )
+        except PermissionError as exc:
+            return {**preview, "error": str(exc)}
+        except ValueError as exc:
+            return {**preview, "error": str(exc)}
+        if created is None:
+            return {**preview, "error": "group not found or not visible to this user"}
         return {**preview, "applied": True, "id": str(created.id)}
 
     return preview

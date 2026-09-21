@@ -831,7 +831,10 @@ export interface GroupSettlementPayload {
   amount: number
   currency: string
   date: string
+  // The payer's side: the transaction on the account the money left.
   transaction_id?: string | null
+  // The receiver's side: the transaction on the account it landed on.
+  receiver_transaction_id?: string | null
   notes?: string | null
   // When provided, the backend creates a debit transaction on this
   // account and links it via transaction_id. Mutually exclusive with

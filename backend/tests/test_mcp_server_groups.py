@@ -196,6 +196,7 @@ async def test_list_group_settlements_serializes_rows(session, test_user, monkey
         date=date(2026, 5, 1),
         notes="brunch",
         transaction_id=uuid.uuid4(),
+        receiver_transaction_id=None,
     )
     s2 = SimpleNamespace(
         id=uuid.uuid4(),
@@ -207,6 +208,7 @@ async def test_list_group_settlements_serializes_rows(session, test_user, monkey
         date=None,  # exercise the None-date branch
         notes=None,
         transaction_id=None,  # exercise the None-txn branch
+        receiver_transaction_id=None,
     )
 
     async def fake(s, gid, ws_id, uid):
@@ -224,6 +226,169 @@ async def test_list_group_settlements_serializes_rows(session, test_user, monkey
     assert first["date"] == "2026-05-01"
     assert first["notes"] == "brunch"
     assert first["transaction_id"] == str(s1.transaction_id)
+    # Both sides are exposed, so an agent can reconcile a contribution
+    # against the bank without a second call.
+    assert first["payer_transaction_id"] == str(s1.transaction_id)
+    assert first["receiver_transaction_id"] is None
     assert second["date"] is None
     assert second["transaction_id"] is None
+    assert second["payer_transaction_id"] is None
+    assert second["receiver_transaction_id"] is None
     assert second["amount"] == 10.0
+
+
+# ------------------------------------------------- propose_mark_contribution
+
+
+@pytest.mark.asyncio
+async def test_listed_contributions_show_a_legacy_credit_on_the_receiver_side(
+    session, test_user, test_workspace
+):
+    """Real rows, not fakes: the owner's own settlements link the credit
+    that landed on his account in the payer-side column."""
+    from datetime import date as _date
+    from app.models.group_settlement import GroupSettlement
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    session.add(
+        GroupSettlement(
+            id=uuid.uuid4(),
+            group_id=home["group"].id,
+            workspace_id=test_workspace.id,
+            from_member_id=home["partner"].id,
+            to_member_id=home["me"].id,
+            amount=Decimal("2000.00"),
+            currency="USD",
+            date=_date.today(),
+            transaction_id=credit.id,
+        )
+    )
+    await session.commit()
+
+    result = await groups_tool.list_group_settlements(
+        session=session, ctx=_ctx(test_user.id), group_id=str(home["group"].id)
+    )
+    (row,) = result["items"]
+    assert row["payer_transaction_id"] is None
+    assert row["receiver_transaction_id"] == str(credit.id)
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_previews_the_side_it_read(
+    session, test_user, test_workspace
+):
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        member_id=str(home["partner"].id),
+    )
+    assert result["kind"] == "mark_contribution"
+    assert result["proposed"]["side"] == "receiver"
+    assert result["proposed"]["amount"] == 2000.0
+    assert "applied" not in result
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_does_not_write_for_an_internal_caller(
+    session, test_user, test_workspace
+):
+    from sqlalchemy import select as _select
+
+    from app.models.group_settlement import GroupSettlement
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        member_id=str(home["partner"].id),
+        apply=True,
+    )
+    assert "applied" not in result
+    assert (await session.execute(_select(GroupSettlement.id))).first() is None
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_writes_for_an_external_caller_that_applies(
+    session, test_user, test_workspace
+):
+    from sqlalchemy import select as _select
+
+    from app.models.group_settlement import GroupSettlement
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        member_id=str(home["partner"].id),
+        apply=True,
+    )
+    assert result.get("applied") is True
+
+    row = (await session.execute(_select(GroupSettlement))).scalars().one()
+    assert row.receiver_transaction_id == credit.id
+    assert row.from_member_id == home["partner"].id
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_refuses_a_counterparty_outside_the_group(
+    session, test_user, test_workspace
+):
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        member_id=str(uuid.uuid4()),
+        apply=True,
+    )
+    assert "does not belong" in result["error"]

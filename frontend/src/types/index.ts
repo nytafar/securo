@@ -486,8 +486,16 @@ export interface GroupPeriodContribution {
   amount: number
   currency: string
   date: string
+  /** The two link columns as stored. */
   transaction_id: string | null
   receiver_transaction_id: string | null
+  /** The same two as the server reads them: a contribution recorded
+   *  before the receiver side existed links the receiver's credit in
+   *  the payer-side column and is reported on the side it happened. */
+  links?: {
+    payer_transaction_id: string | null
+    receiver_transaction_id: string | null
+  }
   notes: string | null
 }
 

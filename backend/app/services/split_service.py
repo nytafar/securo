@@ -124,6 +124,20 @@ async def replace_splits(
     if payload is None:
         return
 
+    # The other half of "one transaction, one contribution": a row that
+    # is already a contribution's bank transaction says what a member put
+    # into the pot, and cannot also say what the pot spent. Checked
+    # before the clear so a refused write leaves the existing splits
+    # alone. Clearing splits is always allowed — it is how a transaction
+    # is freed to become a contribution.
+    if payload.splits:
+        from app.services.settlement_service import is_contribution_link
+
+        if await is_contribution_link(session, transaction.id):
+            raise ValueError(
+                "A transaction linked to a contribution cannot be shared in a group"
+            )
+
     # Always start by clearing existing splits — replace semantics keep
     # the create/update paths trivially consistent.
     await session.execute(

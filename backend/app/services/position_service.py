@@ -297,6 +297,11 @@ async def _load_contributions(
         key=lambda r: (r.date, str(r.created_at), str(r.id)),
         reverse=True,
     )
+    from app.services.settlement_service import resolve_links
+
+    links = await resolve_links(
+        session, [(r.transaction_id, r.receiver_transaction_id) for r in rows]
+    )
     return [
         PeriodContribution(
             id=r.id,
@@ -307,9 +312,10 @@ async def _load_contributions(
             date=r.date,
             transaction_id=r.transaction_id,
             receiver_transaction_id=r.receiver_transaction_id,
+            links=link,
             notes=r.notes,
         )
-        for r in rows
+        for r, link in zip(rows, links)
     ]
 
 

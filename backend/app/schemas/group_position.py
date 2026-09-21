@@ -14,6 +14,8 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+from app.schemas.group_settlement import ContributionLinks
+
 
 class PositionMember(BaseModel):
     id: uuid.UUID
@@ -87,8 +89,13 @@ class PeriodContribution(BaseModel):
     amount: Decimal
     currency: str
     date: _Date
+    # The two link columns as stored.
     transaction_id: Optional[uuid.UUID] = None
     receiver_transaction_id: Optional[uuid.UUID] = None
+    # The same two, as read: a settlement recorded before the receiver
+    # side existed links the receiver's credit in the payer-side column,
+    # and is reported here on the side it really happened on.
+    links: ContributionLinks = ContributionLinks()
     notes: Optional[str] = None
 
 

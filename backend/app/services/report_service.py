@@ -612,6 +612,7 @@ async def get_income_expenses_report(
         forecast_transactions = await _get_forecast_transactions(
             session, workspace_id, max(m_start, start), m_end, account_ids,
             range_date_col=report_date,
+            exclude_contribution_links=True,
         )
         for tx in forecast_transactions:
             if not _counts_as_user_pnl_row(tx):
@@ -1003,6 +1004,7 @@ async def get_income_expenses_report(
         forecast_transactions = await _get_forecast_transactions(
             session, workspace_id, m_start, m_end, account_ids,
             range_date_col=report_date,
+            exclude_contribution_links=True,
         )
         for tx in forecast_transactions:
             if not _counts_as_user_pnl_row(tx):
@@ -1417,6 +1419,7 @@ async def get_cash_flow_report(
     pending_forecast = await _get_forecast_transactions(
         session, workspace_id, date.min, end + timedelta(days=1), account_ids,
         range_date_col=flow_date_col,
+        exclude_contribution_links=True,
     )
     for tx in pending_forecast:
         if tx.status != "pending" or not _counts_as_user_pnl_row(tx):

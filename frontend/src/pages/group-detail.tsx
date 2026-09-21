@@ -446,6 +446,19 @@ export default function GroupDetailPage() {
   const [settleTxSearch, setSettleTxSearch] = useState('')
   const [settleTxQuery, setSettleTxQuery] = useState('')
 
+  // Which side of the contribution the viewer is on. The payer's leg is
+  // a debit leaving their account and the receiver's a credit landing on
+  // it, so the side decides what to search for and which link column the
+  // picked transaction fills. Null when the viewer is on neither side —
+  // an owner recording a transfer between two other members.
+  const settleSide: 'payer' | 'receiver' | null = !viewerMemberId
+    ? null
+    : settleFrom === viewerMemberId
+      ? 'payer'
+      : settleTo === viewerMemberId
+        ? 'receiver'
+        : null
+
   // Accounts of the requesting user — needed only when the optional
   // "create transaction" toggle is enabled.
   const { data: accountsList } = useQuery({
@@ -461,19 +474,20 @@ export default function GroupDetailPage() {
     return () => clearTimeout(id)
   }, [settleTxSearch])
 
-  // The payer's debit transactions, searched server-side and capped —
-  // offered when linking an existing transaction instead of creating one.
+  // The viewer's own leg of the transfer, searched server-side and
+  // capped — offered when linking an existing transaction instead of
+  // creating one. Debits when they paid, credits when they were paid.
   const { data: settleTxOptions } = useQuery({
-    queryKey: ['settle-tx-options', settleTxQuery],
+    queryKey: ['settle-tx-options', settleTxQuery, settleSide],
     queryFn: () =>
       transactionsApi.list({
-        type: 'debit',
+        type: settleSide === 'receiver' ? 'credit' : 'debit',
         q: settleTxQuery || undefined,
         limit: 20,
         sort_by: 'date',
         sort_dir: 'desc',
       }),
-    enabled: settleOpen && settleTxMode === 'existing',
+    enabled: settleOpen && settleTxMode === 'existing' && settleSide !== null,
   })
 
   const settlementMutation = useMutation({
@@ -535,7 +549,15 @@ export default function GroupDetailPage() {
     if (settleTxMode === 'create' && settleAccountId) {
       payload.account_id = settleAccountId
     } else if (settleTxMode === 'existing' && settlePickedTx) {
-      payload.transaction_id = settlePickedTx.id
+      // A credit the viewer received is the receiver's side of the
+      // contribution, not the payer's; putting it in the payer column is
+      // what the old records did and what the API now only tolerates for
+      // history's sake.
+      if (settleSide === 'receiver') {
+        payload.receiver_transaction_id = settlePickedTx.id
+      } else {
+        payload.transaction_id = settlePickedTx.id
+      }
     }
     settlementMutation.mutate(payload)
   }
@@ -1309,8 +1331,7 @@ export default function GroupDetailPage() {
             <DialogTitle>{recordLabel}</DialogTitle>
           </DialogHeader>
           {(() => {
-            const myMemberId = viewerMemberId
-            const viewerIsPayer = !!myMemberId && settleFrom === myMemberId
+            const viewerIsPayer = settleSide === 'payer'
             return (
           <div className="space-y-4 min-w-0">
             <div className="space-y-2">
@@ -1320,8 +1341,8 @@ export default function GroupDetailPage() {
                 value={settleFrom}
                 onChange={(e) => {
                   setSettleFrom(e.target.value)
-                  // Reset the ledger-side options: only meaningful
-                  // when the viewer is the payer.
+                  // Reset the ledger-side options: which side the viewer
+                  // is on decides what can be linked.
                   setSettleTxMode('none')
                   setSettleAccountId('')
                   setSettlePickedTx(null)
@@ -1341,7 +1362,13 @@ export default function GroupDetailPage() {
               <select
                 className="w-full border border-border rounded-md px-3 py-2 text-sm bg-card"
                 value={settleTo}
-                onChange={(e) => setSettleTo(e.target.value)}
+                onChange={(e) => {
+                  setSettleTo(e.target.value)
+                  setSettleTxMode('none')
+                  setSettleAccountId('')
+                  setSettlePickedTx(null)
+                  setSettleTxSearch('')
+                }}
               >
                 <option value="">{t('splitGroups.selectMember')}</option>
                 {group.members.map((m) => (
@@ -1352,11 +1379,14 @@ export default function GroupDetailPage() {
               </select>
             </div>
             {/* Transaction action — placed right after the members so
-                the payer can decide upfront whether a real transaction
-                will back this record. When linking an existing
-                transaction, the amount/currency/date below mirror that
-                transaction and lock so the two records can't disagree. */}
-            {viewerIsPayer && (
+                whoever is on one side of this can decide upfront whether
+                a real transaction backs the record. When linking an
+                existing transaction, the amount/currency/date below
+                mirror that transaction and lock so the two records can't
+                disagree. The payer may also have a fresh debit written;
+                the receiver only ever links the credit that landed, so a
+                contribution is never a copy of money already imported. */}
+            {settleSide !== null && (
                 <div className="space-y-2">
                   <Label>{t('splitGroups.txAction')}</Label>
                   <select
@@ -1370,7 +1400,9 @@ export default function GroupDetailPage() {
                     }}
                   >
                     <option value="none">{t('splitGroups.txActionNone')}</option>
-                    <option value="create">{t('splitGroups.txActionCreate')}</option>
+                    {viewerIsPayer && (
+                      <option value="create">{t('splitGroups.txActionCreate')}</option>
+                    )}
                     <option value="existing">{t('splitGroups.txActionExisting')}</option>
                   </select>
                   {settleTxMode === 'create' && (
