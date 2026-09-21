@@ -1234,7 +1234,16 @@
       "rules": "Reglas",
       "queue": "Esperándote",
       "history": "Historial"
-    }
+    },
+    "shareInGroup": "Compartir en grupo",
+    "shareInGroupHint": "(cada coincidencia entra en el fondo común del grupo)",
+    "markAsContribution": "Marcar como aportación",
+    "markAsContributionHint": "(la propia transacción es la aportación)",
+    "selectGroup": "Seleccionar grupo...",
+    "contributionMember": "Otro miembro",
+    "contributionMemberHint": "El miembro del otro lado: para el dinero que llegó a tu cuenta, quien lo envió.",
+    "previewShared": "{{shared}} se compartirían en un grupo",
+    "previewContributions": "{{contributions}} pasarían a ser aportaciones"
   },
   "categories": {
     "title": "Categorías",

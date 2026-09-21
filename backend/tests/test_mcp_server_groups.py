@@ -680,3 +680,202 @@ async def test_an_attach_preview_offers_the_incoming_note_when_there_is_none(
     )
     assert preview["outcome"] == "attach"
     assert preview["proposed"]["notes"] == "May"
+
+
+# ───────────────── sharing a transaction, and rules that do it ──────────
+
+
+@pytest.mark.asyncio
+async def test_propose_share_transaction_previews_the_shares_without_writing(
+    session, test_user, test_workspace
+):
+    from sqlalchemy import select as _select
+
+    from app.models.transaction_split import TransactionSplit
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    groceries = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        "300.00",
+        description="SUPERMARKET",
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_share_transaction"].handler
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(groceries.id),
+        apply=True,
+    )
+    assert result["kind"] == "share_transaction"
+    assert sorted(s["share_amount"] for s in result["proposed"]["shares"]) == [
+        150.0,
+        150.0,
+    ]
+    assert "applied" not in result
+    assert (await session.execute(_select(TransactionSplit.id))).first() is None
+
+
+@pytest.mark.asyncio
+async def test_propose_share_transaction_writes_for_an_external_caller_that_applies(
+    session, test_user, test_workspace
+):
+    from sqlalchemy import select as _select
+
+    from app.models.transaction_split import TransactionSplit
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    groceries = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        "300.00",
+        description="SUPERMARKET",
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_share_transaction"].handler
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        group_id=str(home["group"].id),
+        transaction_id=str(groceries.id),
+        share_type="percent",
+        splits=[
+            {"group_member_id": str(home["me"].id), "share_pct": 60},
+            {"group_member_id": str(home["partner"].id), "share_pct": 40},
+        ],
+        apply=True,
+    )
+    assert result["applied"] is True
+    rows = (
+        await session.execute(
+            _select(TransactionSplit).where(
+                TransactionSplit.transaction_id == groceries.id
+            )
+        )
+    ).scalars().all()
+    assert sorted(r.share_amount for r in rows) == [Decimal("120.00"), Decimal("180.00")]
+
+
+@pytest.mark.asyncio
+async def test_propose_share_transaction_refuses_a_contribution(
+    session, test_user, test_workspace
+):
+    """Money a member put into the pot cannot also be money the pot
+    spent."""
+    from app.schemas.group_settlement import MarkContributionFromTransaction
+    from app.services import settlement_service
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        "2000.00",
+        type_="credit",
+    )
+    await session.commit()
+    await settlement_service.mark_transaction_as_contribution(
+        session,
+        home["group"].id,
+        test_workspace.id,
+        test_user.id,
+        MarkContributionFromTransaction(
+            transaction_id=credit.id, member_id=home["partner"].id
+        ),
+    )
+
+    handler = REGISTRY["propose_share_transaction"].handler
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        apply=True,
+    )
+    assert "cannot be shared" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_the_rule_tools_take_the_two_group_actions(
+    session, test_user, test_workspace
+):
+    """An agent can write the household's rules: the same actions the
+    editor writes, validated the same way, applied through the same
+    services."""
+    from sqlalchemy import select as _select
+
+    from app.models.transaction_split import TransactionSplit
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    groceries = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        "300.00",
+        description="SUPERMARKET",
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_create_rule"].handler
+    action = {
+        "op": "share_in_group",
+        "value": {
+            "group_id": str(home["group"].id),
+            "share_type": "equal",
+            "splits": [
+                {"group_member_id": str(home["me"].id)},
+                {"group_member_id": str(home["partner"].id)},
+            ],
+        },
+    }
+    conditions = [{"field": "description", "op": "contains", "value": "SUPERMARKET"}]
+
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        name="Groceries",
+        conditions=conditions,
+        actions=[action],
+    )
+    assert preview["preview"]["will_share"] == 1
+    assert (await session.execute(_select(TransactionSplit.id))).first() is None
+
+    applied = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        name="Groceries",
+        conditions=conditions,
+        actions=[action],
+        apply=True,
+    )
+    assert applied["applied"] is True
+    rows = (
+        await session.execute(
+            _select(TransactionSplit).where(
+                TransactionSplit.transaction_id == groceries.id
+            )
+        )
+    ).scalars().all()
+    assert sorted(r.share_amount for r in rows) == [Decimal("150.00"), Decimal("150.00")]

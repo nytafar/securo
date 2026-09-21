@@ -1246,7 +1246,16 @@
       "rules": "Правила",
       "queue": "Чекає на вас",
       "history": "Історія"
-    }
+    },
+    "shareInGroup": "Розділити у групі",
+    "shareInGroupHint": "(кожен збіг потрапляє до спільної скарбнички)",
+    "markAsContribution": "Позначити як внесок",
+    "markAsContributionHint": "(сама операція і є внеском)",
+    "selectGroup": "Виберіть групу...",
+    "contributionMember": "Інший учасник",
+    "contributionMemberHint": "Учасник з іншого боку: для грошей, що надійшли на ваш рахунок, — той, хто їх надіслав.",
+    "previewShared": "{{shared}} було б розділено у групі",
+    "previewContributions": "{{contributions}} стали б внесками"
   },
   "categories": {
     "title": "Категорії",

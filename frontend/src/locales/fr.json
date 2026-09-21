@@ -1234,7 +1234,16 @@
       "rules": "Règles",
       "queue": "En attente de vous",
       "history": "Historique"
-    }
+    },
+    "shareInGroup": "Partager dans le groupe",
+    "shareInGroupHint": "(chaque correspondance rejoint la cagnotte du groupe)",
+    "markAsContribution": "Marquer comme contribution",
+    "markAsContributionHint": "(la transaction elle-même est la contribution)",
+    "selectGroup": "Sélectionner un groupe...",
+    "contributionMember": "Autre membre",
+    "contributionMemberHint": "Le membre de l'autre côté : pour l'argent arrivé sur votre compte, celui qui l'a envoyé.",
+    "previewShared": "{{shared}} seraient partagées dans un groupe",
+    "previewContributions": "{{contributions}} deviendraient des contributions"
   },
   "categories": {
     "title": "Catégories",

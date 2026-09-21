@@ -1233,7 +1233,16 @@
       "rules": "Κανόνες",
       "queue": "Σε αναμονή",
       "history": "Ιστορικό"
-    }
+    },
+    "shareInGroup": "Μοίρασμα στην ομάδα",
+    "shareInGroupHint": "(κάθε αντιστοίχιση μπαίνει στο κοινό ταμείο)",
+    "markAsContribution": "Σήμανση ως εισφορά",
+    "markAsContributionHint": "(η ίδια η συναλλαγή είναι η εισφορά)",
+    "selectGroup": "Επιλέξτε ομάδα...",
+    "contributionMember": "Άλλο μέλος",
+    "contributionMemberHint": "Το μέλος από την άλλη πλευρά: για χρήματα που μπήκαν στον λογαριασμό σας, όποιος τα έστειλε.",
+    "previewShared": "{{shared}} θα μοιράζονταν σε ομάδα",
+    "previewContributions": "{{contributions}} θα γίνονταν εισφορές"
   },
   "categories": {
     "title": "Κατηγορίες",

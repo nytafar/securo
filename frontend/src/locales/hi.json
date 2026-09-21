@@ -1233,7 +1233,16 @@
       "rules": "नियम",
       "queue": "आपकी प्रतीक्षा में",
       "history": "इतिहास"
-    }
+    },
+    "shareInGroup": "समूह में बाँटें",
+    "shareInGroupHint": "(हर मिलान समूह की साझा राशि में जाता है)",
+    "markAsContribution": "योगदान के रूप में चिह्नित करें",
+    "markAsContributionHint": "(लेन-देन स्वयं ही योगदान है)",
+    "selectGroup": "समूह चुनें...",
+    "contributionMember": "दूसरा सदस्य",
+    "contributionMemberHint": "दूसरी ओर का सदस्य: आपके खाते में आए पैसे के लिए, जिसने भेजा।",
+    "previewShared": "{{shared}} समूह में बाँटी जाएँगी",
+    "previewContributions": "{{contributions}} योगदान बन जाएँगी"
   },
   "categories": {
     "title": "श्रेणियाँ",

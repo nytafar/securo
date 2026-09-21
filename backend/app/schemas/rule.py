@@ -1,7 +1,8 @@
 # backend/app/schemas/rule.py
 import datetime
 import uuid
-from typing import Any, Optional, Union
+from decimal import Decimal
+from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -60,8 +61,43 @@ RuleConditionNode = Union[RuleConditionGroup, RuleCondition]
 
 
 class RuleAction(BaseModel):
-    op: str      # set_category, set_payee, set_description, append_notes, ignore
-    value: Any   # entity UUID or text depending on action
+    op: str      # set_category, set_payee, set_description, append_notes, ignore,
+                 # share_in_group, mark_as_contribution
+    value: Any   # entity UUID, text, or an action object (see below)
+
+
+class RuleShareSplit(BaseModel):
+    """One member's place in a sharing rule's distribution."""
+
+    group_member_id: uuid.UUID
+    # Only read for share_type="percent"; equal needs nothing but the member.
+    share_pct: Optional[Decimal] = None
+
+
+class RuleShareAction(BaseModel):
+    """The `value` of a `share_in_group` action.
+
+    No exact amounts: a rule fires on transactions of every size, and an
+    amount that fits one of them fits no other. Equal and percent are the
+    distributions that generalize, which is also what bulk add-to-group
+    accepts.
+    """
+
+    group_id: uuid.UUID
+    share_type: Literal["equal", "percent"] = "equal"
+    splits: list[RuleShareSplit]
+
+
+class RuleContributionAction(BaseModel):
+    """The `value` of a `mark_as_contribution` action.
+
+    `member_id` is the member on the OTHER side of the transaction, as in
+    marking by hand: a debit makes the account's owner the payer and this
+    member the receiver, a credit the other way round.
+    """
+
+    group_id: uuid.UUID
+    member_id: uuid.UUID
 
 
 class RuleCreate(BaseModel):
@@ -157,6 +193,42 @@ class RulePreviewRequest(BaseModel):
     offset: int = Field(default=0, ge=0)
 
 
+class RulePreviewShareLine(BaseModel):
+    group_member_id: uuid.UUID
+    member_name: Optional[str] = None
+    # float for the same reason `RulePreviewItem.amount` is one: display
+    # data for the editor's table.
+    amount: float
+
+
+class RulePreviewShare(BaseModel):
+    """The shares a draft rule would write on one matched transaction."""
+
+    group_id: uuid.UUID
+    group_name: Optional[str] = None
+    share_type: str
+    shares: list[RulePreviewShareLine]
+
+
+class RulePreviewContribution(BaseModel):
+    """The contribution a draft rule would make of one matched transaction."""
+
+    group_id: uuid.UUID
+    group_name: Optional[str] = None
+    from_member_id: uuid.UUID
+    from_member_name: Optional[str] = None
+    to_member_id: uuid.UUID
+    to_member_name: Optional[str] = None
+    amount: float
+    currency: str
+    date: datetime.date
+    # "payer" or "receiver" — which side the transaction itself is.
+    side: str
+    # "create" writes a new contribution, "attach" hangs this transaction
+    # off the one the other leg of the same transfer already made.
+    outcome: str
+
+
 class RulePreviewItem(BaseModel):
     """One matched transaction plus the category the draft rule would leave it in."""
 
@@ -175,11 +247,27 @@ class RulePreviewItem(BaseModel):
     # False when the rule matches but leaves the transaction as it is — most
     # often because it already has a category and the draft does not overwrite.
     will_change: bool
+    # What the draft's group actions would do to this row, decided by the
+    # same services that would write them. Null when the rule plans none,
+    # or when the row is one they would pass over — in which case
+    # `skipped_effects` says why, in English, e.g. because the
+    # transaction already carries shares or is already a contribution.
+    planned_share: Optional[RulePreviewShare] = None
+    planned_contribution: Optional[RulePreviewContribution] = None
+    skipped_effects: list[str] = []
 
 
 class RulePreviewResponse(BaseModel):
     matched: int
     will_change: int
+    # How many of the matches the draft's group actions would really act
+    # on: rows that carry no shares yet for `will_share`, rows that are
+    # not a contribution and carry no shares for
+    # `will_mark_contribution`. Both are exact over every match, like
+    # `matched`, and both are 0 when the draft has no such action or
+    # would not apply at all.
+    will_share: int = 0
+    will_mark_contribution: int = 0
     # False when the draft's own flags mean saving it touches nothing now: an
     # inactive rule, or one not being applied to existing transactions. The
     # matches are still reported, so the conditions can be checked either way.

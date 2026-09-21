@@ -1234,7 +1234,16 @@
       "rules": "Regeln",
       "queue": "Wartet auf Sie",
       "history": "Verlauf"
-    }
+    },
+    "shareInGroup": "In Gruppe teilen",
+    "shareInGroupHint": "(jeder Treffer geht in die gemeinsame Kasse)",
+    "markAsContribution": "Als Beitrag markieren",
+    "markAsContributionHint": "(die Transaktion selbst ist der Beitrag)",
+    "selectGroup": "Gruppe auswählen...",
+    "contributionMember": "Anderes Mitglied",
+    "contributionMemberHint": "Das Mitglied auf der anderen Seite: bei Geld, das auf Ihrem Konto eingegangen ist, wer es gesendet hat.",
+    "previewShared": "{{shared}} würden in einer Gruppe geteilt",
+    "previewContributions": "{{contributions}} würden zu Beiträgen"
   },
   "categories": {
     "title": "Kategorien",

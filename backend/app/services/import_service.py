@@ -24,6 +24,7 @@ from app.services import reconciliation_service, recurring_match_service
 from app.services.credit_card_service import apply_effective_date
 from app.services.category_service import get_hidden_category_ids
 from app.services.rule_engine import apply_rule_actions, evaluate_conditions, merge_notes
+from app.services import rule_effects
 from app.services.rule_service import apply_rules_to_transaction, preview_rules_for_transaction
 from app.services.fx_rate_service import stamp_primary_amount
 from app.services.payee_service import get_or_create_payee
@@ -875,11 +876,16 @@ async def import_transactions(
             notes=getattr(txn_data, "notes", None),
         )
         apply_effective_date(incoming, account)
+        # What the rules plan for a group travels with the preview, so an
+        # upgraded placeholder gets the shares and the contribution the
+        # imported charge would have got.
+        planned_effects: list = []
         preview = await preview_rules_for_transaction(
             session,
             user_id,
             incoming,
             skip_category_rules=txn_data.force_uncategorized,
+            effects=planned_effects,
         )
         if preview.category_id is None and not txn_data.force_uncategorized:
             preview.category_id = csv_category_id
@@ -897,6 +903,10 @@ async def import_transactions(
             preview.description,
         )
         if placeholder and not placeholder.is_ignored:
+            # What the rules are about to leave on the placeholder, so a
+            # failing group effect can put it back without taking the
+            # charge's provenance with it.
+            before_rules = rule_effects.snapshot_rule_fields(placeholder)
             placeholder.source = source
             placeholder.external_id = txn_data.external_id
             placeholder.import_id = import_log.id
@@ -918,6 +928,18 @@ async def import_transactions(
             placeholder.notes = merge_notes(placeholder.notes, preview.notes)
             if preview.is_ignored:
                 placeholder.is_ignored = True
+            # The placeholder is the row that survives, so the planned
+            # shares and contribution land on it. Flushed first so that
+            # what the charge just recorded on it — its provenance above
+            # all — survives an effect that has to be rolled back.
+            await session.flush()
+            await rule_effects.apply_planned_effects(
+                session,
+                placeholder,
+                planned_effects,
+                user_id,
+                restore_to=before_rules,
+            )
             imported += 1
             continue
 

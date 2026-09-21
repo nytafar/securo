@@ -1183,6 +1183,144 @@ async def propose_mark_contribution(
     return preview
 
 
+@tool(
+    name="propose_share_transaction",
+    description=_PROPOSAL_PREFACE
+    + (
+        "Build a preview for sharing an existing transaction in an "
+        "expense-sharing group — putting it in the common pot, where "
+        "every member carries their part of it. The distribution is "
+        "`equal` between the members given, or `percent` with a "
+        "`share_pct` per member summing to 100; `exact` takes a "
+        "`share_amount` per member summing to the transaction's amount. "
+        "Call `list_groups` for the member ids. Refused for a "
+        "transaction that is already a contribution, since money put "
+        "into the pot cannot also be money the pot spent. Sharing a "
+        "transaction 100 % on the member who paid it is how a personal "
+        "purchase is taken out of the pot: it moves no position and "
+        "rules leave it alone afterwards."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "string", "format": "uuid"},
+            "transaction_id": {"type": "string", "format": "uuid"},
+            "share_type": {
+                "type": "string",
+                "enum": ["equal", "percent", "exact"],
+                "default": "equal",
+            },
+            "splits": {
+                "type": "array",
+                "description": (
+                    "One entry per member: {group_member_id, share_pct?, "
+                    "share_amount?}. Defaults to every member of the group, "
+                    "shared equally."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "group_member_id": {"type": "string", "format": "uuid"},
+                        "share_pct": {"type": "number"},
+                        "share_amount": {"type": "number"},
+                    },
+                    "required": ["group_member_id"],
+                    "additionalProperties": False,
+                },
+            },
+            "apply": _APPLY_FIELD,
+        },
+        "required": ["group_id", "transaction_id"],
+        "additionalProperties": False,
+    },
+    is_proposal=True,
+    tags=["propose", "groups"],
+)
+async def propose_share_transaction(
+    *,
+    session: AsyncSession,
+    ctx: CallContext,
+    group_id: str,
+    transaction_id: str,
+    share_type: str = "equal",
+    splits: list[dict[str, Any]] | None = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    from app.services import split_service
+
+    ws_id = await resolve_workspace_id(session, ctx)
+    gid, tx_id = parse_uuid(group_id), parse_uuid(transaction_id)
+    if gid is None or tx_id is None:
+        return {"error": "group_id and transaction_id must be uuids"}
+
+    group = await group_service.get_group_visible(session, gid, ws_id, ctx.user_id)
+    if group is None:
+        return {"error": "group not found or not visible to this user"}
+
+    tx = (
+        await session.execute(
+            select(Transaction).where(
+                Transaction.id == tx_id, Transaction.workspace_id == ws_id
+            )
+        )
+    ).scalar_one_or_none()
+    if tx is None:
+        return {"error": "transaction not found"}
+
+    members = (
+        await session.execute(
+            select(GroupMember).where(GroupMember.group_id == gid)
+        )
+    ).scalars().all()
+    if not members:
+        return {"error": "group has no members"}
+    names = {m.id: m.name for m in members}
+
+    entries = splits or [{"group_member_id": str(m.id)} for m in members]
+    try:
+        payload = TransactionSplitsInput.model_validate(
+            {"share_type": share_type, "splits": entries}
+        )
+        # Materializing here is what makes the preview honest: the same
+        # rounding the write would do, and the same refusal when the
+        # percentages or the amounts do not add up.
+        materialized = split_service._materialize(tx.amount, payload)
+    except (ValueError, TypeError) as exc:
+        return {"error": str(exc)}
+
+    preview = {
+        "kind": "share_transaction",
+        "proposed": {
+            "group_id": str(gid),
+            "group_name": group.name,
+            "transaction_id": str(tx.id),
+            "description": tx.description,
+            "amount": num(tx.amount),
+            "currency": tx.currency,
+            "share_type": share_type,
+            "shares": [
+                {
+                    "group_member_id": str(member_id),
+                    "member_name": names.get(member_id),
+                    "share_amount": num(amount),
+                }
+                for member_id, amount, _pct in materialized
+            ],
+        },
+        "apply_endpoint": f"PATCH /api/transactions/{tx.id}",
+    }
+
+    if not _can_apply(ctx, apply):
+        return preview
+
+    try:
+        await split_service.replace_splits(session, tx, payload, ctx.user_id)
+    except ValueError as exc:
+        return {**preview, "error": str(exc)}
+    await session.commit()
+    return {**preview, "applied": True, "id": str(tx.id)}
+
+
 def _today():
     from datetime import date as _d
 

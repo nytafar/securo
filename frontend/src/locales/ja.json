@@ -1233,7 +1233,16 @@
       "rules": "ルール",
       "queue": "要対応",
       "history": "履歴"
-    }
+    },
+    "shareInGroup": "グループで分担",
+    "shareInGroupHint": "(一致した取引はグループの共同財布に入ります)",
+    "markAsContribution": "拠出として記録",
+    "markAsContributionHint": "(取引そのものが拠出になります)",
+    "selectGroup": "グループを選択...",
+    "contributionMember": "相手のメンバー",
+    "contributionMemberHint": "取引の反対側のメンバー。自分の口座に入金された場合は、送金した人です。",
+    "previewShared": "{{shared}} 件がグループで分担されます",
+    "previewContributions": "{{contributions}} 件が拠出になります"
   },
   "categories": {
     "title": "カテゴリ",

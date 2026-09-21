@@ -612,9 +612,31 @@ export interface RuleConditionGroup {
 /** An entry of a rule's condition list: a leaf condition or one group. */
 export type RuleConditionNode = RuleCondition | RuleConditionGroup
 
+/** The `value` of a `share_in_group` action: which group, and how the
+ * transaction is divided between its members. No exact amounts — a rule
+ * fires on transactions of every size. */
+export interface RuleShareActionValue {
+  group_id: string
+  share_type: 'equal' | 'percent'
+  splits: { group_member_id: string; share_pct?: number | null }[]
+}
+
+/** The `value` of a `mark_as_contribution` action. `member_id` is the
+ * member on the OTHER side of the transaction: a credit that landed on my
+ * account is her contribution, so the member named is her. */
+export interface RuleContributionActionValue {
+  group_id: string
+  member_id: string
+}
+
+export type RuleActionValue =
+  | string
+  | RuleShareActionValue
+  | RuleContributionActionValue
+
 export interface RuleAction {
   op: string
-  value: string
+  value: RuleActionValue
 }
 
 export interface Rule {
@@ -666,11 +688,38 @@ export interface RulePreviewItem {
   new_category_id: string | null
   new_category_name: string | null
   will_change: boolean
+  /** The shares and the contribution the draft's group actions would
+   * write on this row, or null when it plans none — or when it would pass
+   * this row over, in which case `skipped_effects` says why. */
+  planned_share?: {
+    group_id: string
+    group_name: string | null
+    share_type: string
+    shares: { group_member_id: string; member_name: string | null; amount: number }[]
+  } | null
+  planned_contribution?: {
+    group_id: string
+    group_name: string | null
+    from_member_id: string
+    from_member_name: string | null
+    to_member_id: string
+    to_member_name: string | null
+    amount: number
+    currency: string
+    date: string
+    side: string
+    outcome: 'create' | 'attach'
+  } | null
+  skipped_effects?: string[]
 }
 
 export interface RulePreviewResponse {
   matched: number
   will_change: number
+  /** How many of the matches would really be shared in a group, and how
+   * many would become a contribution. Both exact over every match. */
+  will_share?: number
+  will_mark_contribution?: number
   /** False when the draft's flags mean saving it changes nothing right now —
    * an inactive rule, or one not being applied to existing transactions. */
   will_apply: boolean

@@ -1300,7 +1300,16 @@
       "rules": "Reguły",
       "queue": "Czeka na Ciebie",
       "history": "Historia"
-    }
+    },
+    "shareInGroup": "Podziel w grupie",
+    "shareInGroupHint": "(każde dopasowanie trafia do wspólnej puli)",
+    "markAsContribution": "Oznacz jako wpłatę",
+    "markAsContributionHint": "(sama transakcja jest wpłatą)",
+    "selectGroup": "Wybierz grupę...",
+    "contributionMember": "Drugi członek",
+    "contributionMemberHint": "Członek po drugiej stronie: przy pieniądzach, które wpłynęły na Twoje konto — ten, kto je wysłał.",
+    "previewShared": "{{shared}} zostałyby podzielone w grupie",
+    "previewContributions": "{{contributions}} stałyby się wpłatami"
   },
   "categories": {
     "title": "Kategorie",

@@ -1235,7 +1235,16 @@
       "rules": "Regels",
       "queue": "Wacht op jou",
       "history": "Geschiedenis"
-    }
+    },
+    "shareInGroup": "Delen in groep",
+    "shareInGroupHint": "(elke match gaat in de gezamenlijke pot)",
+    "markAsContribution": "Markeren als bijdrage",
+    "markAsContributionHint": "(de transactie zelf is de bijdrage)",
+    "selectGroup": "Groep selecteren...",
+    "contributionMember": "Ander lid",
+    "contributionMemberHint": "Het lid aan de andere kant: bij geld dat op je rekening binnenkwam, degene die het heeft gestuurd.",
+    "previewShared": "{{shared}} zouden in een groep gedeeld worden",
+    "previewContributions": "{{contributions}} zouden bijdragen worden"
   },
   "categories": {
     "title": "Categorieën",

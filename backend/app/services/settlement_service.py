@@ -888,6 +888,55 @@ async def plan_contribution_from_transaction(
     )
 
 
+async def write_contribution_plan(
+    session: AsyncSession,
+    group_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    plan: "ContributionPlan",
+    notes: Optional[str] = None,
+) -> GroupSettlement:
+    """Write what `plan_contribution_from_transaction` decided. Commits
+    nothing: the caller's database transaction owns the change.
+
+    Split out from `mark_transaction_as_contribution` so a rule can plan
+    an effect and have it persisted — and rolled back — with everything
+    else that rule did to the same transaction. Every decision and every
+    refusal still belongs to the planner, so a rule and a person marking
+    by hand cannot end up with different contributions.
+    """
+    if plan.existing_settlement_id is not None:
+        settlement = await session.get(GroupSettlement, plan.existing_settlement_id)
+        if settlement is None:
+            raise ValueError("The other leg's contribution is no longer there")
+        apply_leg(
+            settlement,
+            await resolved_links_of(session, settlement),
+            plan.side,
+            plan.transaction_id,
+        )
+        if notes and not settlement.notes:
+            settlement.notes = notes
+        return settlement
+
+    settlement = GroupSettlement(
+        group_id=group_id,
+        workspace_id=workspace_id,
+        from_member_id=plan.from_member_id,
+        to_member_id=plan.to_member_id,
+        amount=plan.amount,
+        currency=plan.currency,
+        date=plan.date,
+        notes=notes,
+        **{
+            "transaction_id"
+            if plan.side == "payer"
+            else "receiver_transaction_id": plan.transaction_id
+        },
+    )
+    session.add(settlement)
+    return settlement
+
+
 async def mark_transaction_as_contribution(
     session: AsyncSession,
     group_id: uuid.UUID,
@@ -912,35 +961,9 @@ async def mark_transaction_as_contribution(
     if plan is None:
         return None
 
-    if plan.existing_settlement_id is not None:
-        settlement = await session.get(GroupSettlement, plan.existing_settlement_id)
-        if settlement is None:
-            raise ValueError("The other leg's contribution is no longer there")
-        apply_leg(
-            settlement,
-            await resolved_links_of(session, settlement),
-            plan.side,
-            plan.transaction_id,
-        )
-        if data.notes and not settlement.notes:
-            settlement.notes = data.notes
-    else:
-        settlement = GroupSettlement(
-            group_id=group_id,
-            workspace_id=workspace_id,
-            from_member_id=plan.from_member_id,
-            to_member_id=plan.to_member_id,
-            amount=plan.amount,
-            currency=plan.currency,
-            date=plan.date,
-            notes=data.notes,
-            **{
-                "transaction_id"
-                if plan.side == "payer"
-                else "receiver_transaction_id": plan.transaction_id
-            },
-        )
-        session.add(settlement)
+    settlement = await write_contribution_plan(
+        session, group_id, workspace_id, plan, notes=data.notes
+    )
 
     await session.commit()
     await session.refresh(settlement)
