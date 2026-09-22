@@ -245,6 +245,7 @@ async def test_receiver_credit_created_when_to_member_is_linked_with_account(
             currency="USD",
             date=date.today(),
             account_id=payer_account.id,
+            create_receiver_transaction=True,
         ),
     )
     assert s is not None
@@ -295,6 +296,7 @@ async def test_receiver_credit_skipped_when_to_member_is_shadow(
             currency="USD",
             date=date.today(),
             account_id=payer_account.id,
+            create_receiver_transaction=True,
         ),
     )
     assert s is not None
@@ -345,6 +347,7 @@ async def test_receiver_credit_skipped_when_linked_user_has_no_cash_account(
             currency="USD",
             date=date.today(),
             account_id=payer_account.id,
+            create_receiver_transaction=True,
         ),
     )
     assert s is not None
@@ -389,6 +392,7 @@ async def test_receiver_credit_lands_on_owner_when_self_member_unlinked(
             amount=Decimal("20.00"),
             currency="USD",
             date=date.today(),
+            create_receiver_transaction=True,
         ),
     )
     assert s is not None

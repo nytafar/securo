@@ -242,11 +242,17 @@ async def get_group_positions(
 @tool(
     name="list_group_settlements",
     description=(
-        "List the recorded settlements (payments between members that "
-        "close out balances) for one group, newest first. Each row has "
-        "{from_member_id, to_member_id, amount, currency, date, notes}. "
-        "Pair with `get_group_balances` when the user asks 'quem já me "
-        "pagou?' or 'qual o histórico de acertos?'."
+        "List the recorded settlements — contributions, in a household "
+        "group: money a member moved to carry their part of the common "
+        "pot — for one group, newest first. Each row has "
+        "{from_member_id, to_member_id, amount, currency, date, notes} "
+        "plus both real bank transactions it is made of: "
+        "`payer_transaction_id` (the account the money left) and "
+        "`receiver_transaction_id` (the account it landed on), either of "
+        "which may be null when that side is not imported. Use them to "
+        "reconcile a contribution against the bank. Pair with "
+        "`get_group_balances` when the user asks 'quem já me pagou?' or "
+        "'qual o histórico de acertos?'."
     ),
     parameters={
         "type": "object",
@@ -273,6 +279,13 @@ async def list_group_settlements(
     if rows is None:
         return {"error": "group not found or not visible to this user"}
 
+    # `links` carries the legacy reading: a settlement recorded before
+    # the receiver side existed links the receiver's credit in the
+    # payer-side column, and is reported on the side it really happened
+    # on. The raw column stays visible as `transaction_id`.
+    links = await settlement_service.resolve_links(
+        session, [(s.transaction_id, s.receiver_transaction_id) for s in rows]
+    )
     items = [
         {
             "id": str(s.id),
@@ -284,7 +297,13 @@ async def list_group_settlements(
             "date": s.date.isoformat() if s.date else None,
             "notes": getattr(s, "notes", None),
             "transaction_id": str(s.transaction_id) if getattr(s, "transaction_id", None) else None,
+            "payer_transaction_id": (
+                str(link.payer_transaction_id) if link.payer_transaction_id else None
+            ),
+            "receiver_transaction_id": (
+                str(link.receiver_transaction_id) if link.receiver_transaction_id else None
+            ),
         }
-        for s in rows
+        for s, link in zip(rows, links)
     ]
     return {"items": items, "total": len(items)}

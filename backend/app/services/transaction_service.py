@@ -1798,10 +1798,17 @@ async def bulk_add_to_group(
     )
     txs = txs_result.scalars().all()
 
+    # A transaction that is already a contribution's bank row is skipped
+    # rather than refused: a bulk action over a page of rows should not
+    # fail wholesale because one of them is a contribution.
+    from app.services.settlement_service import linked_transaction_ids
+
+    linked = await linked_transaction_ids(session, [tx.id for tx in txs])
+
     updated = 0
     skipped = 0
     for tx in txs:
-        if tx.transfer_pair_id is not None or tx.splits:
+        if tx.transfer_pair_id is not None or tx.splits or tx.id in linked:
             skipped += 1
             continue
         await split_service.replace_splits(session, tx, payload, user_id)

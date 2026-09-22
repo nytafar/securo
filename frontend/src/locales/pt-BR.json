@@ -1234,7 +1234,16 @@
       "rules": "Regras",
       "queue": "Esperando você",
       "history": "Histórico"
-    }
+    },
+    "shareInGroup": "Dividir no grupo",
+    "shareInGroupHint": "(cada correspondência entra no caixa comum do grupo — uma transferência entre suas próprias contas também entra, então exclua essas nas condições)",
+    "markAsContribution": "Marcar como contribuição",
+    "markAsContributionHint": "(a própria transação é a contribuição)",
+    "selectGroup": "Selecionar grupo...",
+    "contributionMember": "Outro membro",
+    "contributionMemberHint": "O membro do outro lado: para o dinheiro que entrou na sua conta, quem enviou.",
+    "previewShared": "{{shared}} seriam divididas em um grupo",
+    "previewContributions": "{{contributions}} virariam contribuições"
   },
   "categories": {
     "title": "Categorias",

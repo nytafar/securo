@@ -260,7 +260,11 @@ async def test_linked_member_can_settle_own_debt(
 async def test_linked_member_cannot_settle_someone_elses_debt(
     session: AsyncSession, test_user, test_workspace
 ):
-    """A linked member CANNOT speak for another member."""
+    """A linked member CANNOT speak for two other members.
+
+    She may record what she is part of, on either side — paying or being
+    paid is her own first-hand knowledge. A settlement between two other
+    people is not."""
     other, other_ws = await _make_user_with_workspace(session, "viewer@example.com")
     group = await group_service.create_group(
         session, test_workspace.id, test_user.id, GroupCreate(name="Shared")
@@ -274,9 +278,29 @@ async def test_linked_member_cannot_settle_someone_elses_debt(
     b = await group_service.create_member(
         session, group.id, test_workspace.id,         GroupMemberCreate(name="B")
     )
+    c = await group_service.create_member(
+        session, group.id, test_workspace.id, GroupMemberCreate(name="C")
+    )
 
     assert a is not None
     assert b is not None
+    assert c is not None
+
+    # Receiving it herself is allowed.
+    received = await settlement_service.create_settlement(
+        session,
+        group.id,
+        other_ws.id,
+        other.id,
+        GroupSettlementCreate(
+            from_member_id=b.id,
+            to_member_id=a.id,
+            amount=Decimal("5.00"),
+            currency="USD",
+            date=date.today(),
+        ),
+    )
+    assert received is not None
 
     with pytest.raises(PermissionError):
         await settlement_service.create_settlement(
@@ -285,8 +309,8 @@ async def test_linked_member_cannot_settle_someone_elses_debt(
             other_ws.id,
             other.id,
             GroupSettlementCreate(
-                from_member_id=b.id,  # NOT the linked member's own id
-                to_member_id=a.id,
+                from_member_id=b.id,  # a settlement she is no part of
+                to_member_id=c.id,
                 amount=Decimal("5.00"),
                 currency="USD",
                 date=date.today(),

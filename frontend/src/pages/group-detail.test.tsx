@@ -26,7 +26,7 @@ const api = vi.hoisted(() => ({
     get: vi.fn(),
     period: vi.fn(),
     members: { create: vi.fn(), update: vi.fn(), delete: vi.fn() },
-    settlements: { create: vi.fn(), delete: vi.fn() },
+    settlements: { create: vi.fn(), markFromTransaction: vi.fn(), delete: vi.fn() },
   },
   accounts: { list: vi.fn() },
   transactions: { list: vi.fn() },
@@ -317,6 +317,7 @@ beforeEach(() => {
       params?.start === presetRange('lastMonth').start ? lastMonth : thisMonth,
   )
   api.accounts.list.mockResolvedValue([])
+  api.groups.settlements.markFromTransaction.mockResolvedValue({ id: 'contribution-3' })
   api.transactions.list.mockResolvedValue({ items: [], total: 0 })
   api.users.list.mockResolvedValue([])
 })
@@ -650,6 +651,127 @@ describe('the group page as a common pot', () => {
         currency: 'USD',
       }),
     )
+  })
+
+  it('marks the credit that landed rather than recording a second contribution', async () => {
+    // The household's real case: Anna transfers, the owner marks the
+    // credit on his own account. It goes through the marking endpoint,
+    // which reads the side off the transaction and joins the
+    // contribution Anna's own leg may already have made — recording it
+    // outright would move the pot twice for one transfer.
+    api.groups.settlements.create.mockResolvedValue({ id: 'contribution-2' })
+    // His account and hers, both in the one workspace the household
+    // shares — which is why the picker has to be filtered at all.
+    api.accounts.list.mockResolvedValue([
+      { id: 'account-mine', user_id: 'user-1', name: 'Mine', display_name: null },
+      { id: 'account-hers', user_id: 'user-2', name: 'Hers', display_name: null },
+    ])
+    api.transactions.list.mockResolvedValue({
+      items: [
+        {
+          id: 'tx-credit',
+          date: '2026-09-05',
+          description: 'Transfer from Anna',
+          amount: 300,
+          currency: 'USD',
+          type: 'credit',
+        },
+      ],
+      total: 1,
+    })
+    const { user } = await renderLoaded()
+
+    const periodCard = card(t('splitGroups.pot.transfersPeriod'))
+    await user.click(
+      within(periodCard).getByRole('button', {
+        name: t('splitGroups.pot.recordContribution'),
+      }),
+    )
+
+    const dialog = await screen.findByRole('dialog')
+    const txAction = within(dialog)
+      .getByRole('option', { name: t('splitGroups.txActionExisting') })
+      .closest('select')!
+    await user.selectOptions(txAction, 'existing')
+    // The receiver writes no fresh debit — the credit already landed —
+    // so that option is not offered to them.
+    expect(
+      within(dialog).queryByRole('option', { name: t('splitGroups.txActionCreate') }),
+    ).not.toBeInTheDocument()
+    // It is the credits that are searched, not the debits, and only the
+    // viewer's own accounts: a link the API accepts has to sit on the
+    // account of the member on that side.
+    await waitFor(() =>
+      expect(api.transactions.list).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'credit', account_ids: ['account-mine'] }),
+      ),
+    )
+
+    await user.click(await within(dialog).findByText(/Transfer from Anna/))
+    await user.click(within(dialog).getByRole('button', { name: t('common.save') }))
+
+    await waitFor(() =>
+      expect(api.groups.settlements.markFromTransaction).toHaveBeenCalled(),
+    )
+    const [groupArg, payload] =
+      api.groups.settlements.markFromTransaction.mock.calls.at(-1)!
+    expect(groupArg).toBe('group-1')
+    // The transaction is his receiving leg, so the member it names is
+    // the one on the other side: Anna.
+    expect(payload).toEqual({
+      transaction_id: 'tx-credit',
+      member_id: ANNA,
+      notes: null,
+    })
+    // And nothing was recorded outright.
+    expect(api.groups.settlements.create).not.toHaveBeenCalled()
+  })
+
+  it('never offers a linked member a pair the API would refuse', async () => {
+    // A linked member may record a contribution she is part of, on
+    // either side, and nothing between two other people. Moving one side
+    // away from her takes the other side to her, so the dialog cannot be
+    // walked into a 403.
+    const THIRD = 'member-third'
+    api.groups.get.mockResolvedValue({
+      ...group,
+      is_owner: false,
+      user_id: 'user-9',
+      members: [
+        ...group.members,
+        {
+          id: THIRD,
+          group_id: 'group-1',
+          name: 'Third',
+          linked_user_id: null,
+          email: null,
+          is_self: false,
+          created_at: '2026-01-03T00:00:00Z',
+        },
+      ],
+    })
+    api.groups.settlements.create.mockResolvedValue({ id: 'contribution-2' })
+    const { user } = await renderLoaded()
+
+    const periodCard = card(t('splitGroups.pot.transfersPeriod'))
+    await user.click(
+      within(periodCard).getByRole('button', {
+        name: t('splitGroups.pot.recordContribution'),
+      }),
+    )
+
+    // The viewer is user-1, linked to Me. The suggested transfer fills
+    // Anna → Me; moving the receiver to Third must put the viewer back
+    // on the paying side rather than leave her out of the pair.
+    const dialog = await screen.findByRole('dialog')
+    const selects = within(dialog).getAllByRole('combobox')
+    await user.selectOptions(selects[1], THIRD)
+    await user.click(within(dialog).getByRole('button', { name: t('common.save') }))
+
+    await waitFor(() => expect(api.groups.settlements.create).toHaveBeenCalled())
+    const [, payload] = api.groups.settlements.create.mock.calls.at(-1)!
+    expect(payload.to_member_id).toBe(THIRD)
+    expect(payload.from_member_id).toBe(ME)
   })
 
   it('pages the transaction list on the server', async () => {

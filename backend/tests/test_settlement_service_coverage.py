@@ -206,6 +206,7 @@ async def test_create_settlement_receiver_self_member_owner_fallback(session: As
         GroupSettlementCreate(
             from_member_id=friend.id, to_member_id=owner_self.id,
             amount=Decimal("8.00"), currency="USD", date=date.today(),
+            create_receiver_transaction=True,
         ),
     )
 
@@ -349,7 +350,8 @@ async def test_delete_settlement_group_not_visible(session: AsyncSession, test_u
 
 @pytest.mark.asyncio
 async def test_settlement_permission_for_linked_member(session: AsyncSession, test_user, test_workspace):
-    """A linked non-owner member may only settle when they are the payer."""
+    """A linked non-owner member may record what they are part of, on
+    either side, and nothing between two other people."""
     hashed = _bcrypt.hashpw(b"x", _bcrypt.gensalt()).decode()
     payer_user = User(
         id=uuid.uuid4(),
@@ -375,12 +377,17 @@ async def test_settlement_permission_for_linked_member(session: AsyncSession, te
         session, group.id, test_workspace.id,
         GroupMemberCreate(name="Payer", linked_user_id=payer_user.id),
     )
+    third = await group_service.create_member(
+        session, group.id, test_workspace.id, GroupMemberCreate(name="Third")
+    )
 
     assert me is not None
 
     assert payer is not None
 
-    # The linked payer can record a payment where they are the from_member.
+    assert third is not None
+
+    # The linked member can record a payment they made.
     s = await settlement_service.create_settlement(
         session, group.id, payer_ws.id, payer_user.id,
         GroupSettlementCreate(
@@ -391,12 +398,24 @@ async def test_settlement_permission_for_linked_member(session: AsyncSession, te
 
     assert s is not None
 
-    # But NOT one where someone else is the from_member.
-    with pytest.raises(PermissionError, match="you are the payer"):
+    # And one they received: being paid is as much their own business as
+    # paying is.
+    received = await settlement_service.create_settlement(
+        session, group.id, payer_ws.id, payer_user.id,
+        GroupSettlementCreate(
+            from_member_id=me.id, to_member_id=payer.id,
+            amount=Decimal("4.00"), currency="USD", date=date.today(),
+        ),
+    )
+
+    assert received is not None
+
+    # But NOT one between two other people.
+    with pytest.raises(PermissionError, match="you are part of"):
         await settlement_service.create_settlement(
             session, group.id, payer_ws.id, payer_user.id,
             GroupSettlementCreate(
-                from_member_id=me.id, to_member_id=payer.id,
+                from_member_id=me.id, to_member_id=third.id,
                 amount=Decimal("3.00"), currency="USD", date=date.today(),
             ),
         )
@@ -404,7 +423,7 @@ async def test_settlement_permission_for_linked_member(session: AsyncSession, te
 
 @pytest.mark.asyncio
 async def test_update_settlement_permission_denied(session: AsyncSession, test_user, test_workspace):
-    """A linked member can't edit a settlement they don't own."""
+    """A linked member can't edit a settlement they are no part of."""
     hashed = _bcrypt.hashpw(b"x", _bcrypt.gensalt()).decode()
     intruder = User(
         id=uuid.uuid4(),
@@ -430,12 +449,39 @@ async def test_update_settlement_permission_denied(session: AsyncSession, test_u
         session, group.id, test_workspace.id,
         GroupMemberCreate(name="Intruder", linked_user_id=intruder.id),
     )
+    c = await group_service.create_member(
+        session, group.id, test_workspace.id, GroupMemberCreate(name="Bystander")
+    )
 
     assert a is not None
 
     assert b is not None
-    # Owner creates a settlement from a -> b.
+
+    assert c is not None
+    # Owner creates a settlement from a -> c, which the intruder is no
+    # part of on either side.
     s = await settlement_service.create_settlement(
+        session, group.id, test_workspace.id, test_user.id,
+        GroupSettlementCreate(
+            from_member_id=a.id, to_member_id=c.id,
+            amount=Decimal("10.00"), currency="USD", date=date.today(),
+        ),
+    )
+
+    assert s is not None
+    with pytest.raises(PermissionError, match="settlements you are part of"):
+        await settlement_service.update_settlement(
+            session, group.id, s.id, intruder_ws.id, intruder.id,
+            GroupSettlementUpdate(amount=Decimal("99.00")),
+        )
+    # Nor delete it.
+    with pytest.raises(PermissionError, match="settlements you are part of"):
+        await settlement_service.delete_settlement(
+            session, group.id, s.id, intruder_ws.id, intruder.id
+        )
+
+    # The member on the receiving side may edit it, though.
+    received = await settlement_service.create_settlement(
         session, group.id, test_workspace.id, test_user.id,
         GroupSettlementCreate(
             from_member_id=a.id, to_member_id=b.id,
@@ -443,15 +489,10 @@ async def test_update_settlement_permission_denied(session: AsyncSession, test_u
         ),
     )
 
-    assert s is not None
-    # Intruder (linked to b, not the from_member) can't edit it.
-    with pytest.raises(PermissionError, match="settlements you created"):
-        await settlement_service.update_settlement(
-            session, group.id, s.id, intruder_ws.id, intruder.id,
-            GroupSettlementUpdate(amount=Decimal("99.00")),
-        )
-    # Nor delete it.
-    with pytest.raises(PermissionError, match="settlements you created"):
-        await settlement_service.delete_settlement(
-            session, group.id, s.id, intruder_ws.id, intruder.id
-        )
+    assert received is not None
+    edited = await settlement_service.update_settlement(
+        session, group.id, received.id, intruder_ws.id, intruder.id,
+        GroupSettlementUpdate(amount=Decimal("11.00")),
+    )
+    assert edited is not None
+    assert edited.amount == Decimal("11.00")

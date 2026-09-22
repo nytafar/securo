@@ -196,6 +196,7 @@ async def test_list_group_settlements_serializes_rows(session, test_user, monkey
         date=date(2026, 5, 1),
         notes="brunch",
         transaction_id=uuid.uuid4(),
+        receiver_transaction_id=None,
     )
     s2 = SimpleNamespace(
         id=uuid.uuid4(),
@@ -207,6 +208,7 @@ async def test_list_group_settlements_serializes_rows(session, test_user, monkey
         date=None,  # exercise the None-date branch
         notes=None,
         transaction_id=None,  # exercise the None-txn branch
+        receiver_transaction_id=None,
     )
 
     async def fake(s, gid, ws_id, uid):
@@ -224,6 +226,709 @@ async def test_list_group_settlements_serializes_rows(session, test_user, monkey
     assert first["date"] == "2026-05-01"
     assert first["notes"] == "brunch"
     assert first["transaction_id"] == str(s1.transaction_id)
+    # Both sides are exposed, so an agent can reconcile a contribution
+    # against the bank without a second call.
+    assert first["payer_transaction_id"] == str(s1.transaction_id)
+    assert first["receiver_transaction_id"] is None
     assert second["date"] is None
     assert second["transaction_id"] is None
+    assert second["payer_transaction_id"] is None
+    assert second["receiver_transaction_id"] is None
     assert second["amount"] == 10.0
+
+
+# ------------------------------------------------- propose_mark_contribution
+
+
+@pytest.mark.asyncio
+async def test_listed_contributions_show_a_legacy_credit_on_the_receiver_side(
+    session, test_user, test_workspace
+):
+    """Real rows, not fakes: the owner's own settlements link the credit
+    that landed on his account in the payer-side column."""
+    from datetime import date as _date
+    from app.models.group_settlement import GroupSettlement
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    session.add(
+        GroupSettlement(
+            id=uuid.uuid4(),
+            group_id=home["group"].id,
+            workspace_id=test_workspace.id,
+            from_member_id=home["partner"].id,
+            to_member_id=home["me"].id,
+            amount=Decimal("2000.00"),
+            currency="USD",
+            date=_date.today(),
+            transaction_id=credit.id,
+        )
+    )
+    await session.commit()
+
+    result = await groups_tool.list_group_settlements(
+        session=session, ctx=_ctx(test_user.id), group_id=str(home["group"].id)
+    )
+    (row,) = result["items"]
+    assert row["payer_transaction_id"] is None
+    assert row["receiver_transaction_id"] == str(credit.id)
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_previews_the_side_it_read(
+    session, test_user, test_workspace
+):
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        member_id=str(home["partner"].id),
+    )
+    assert result["kind"] == "mark_contribution"
+    assert result["proposed"]["side"] == "receiver"
+    assert result["proposed"]["amount"] == 2000.0
+    assert "applied" not in result
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_does_not_write_for_an_internal_caller(
+    session, test_user, test_workspace
+):
+    from sqlalchemy import select as _select
+
+    from app.models.group_settlement import GroupSettlement
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        member_id=str(home["partner"].id),
+        apply=True,
+    )
+    assert "applied" not in result
+    assert (await session.execute(_select(GroupSettlement.id))).first() is None
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_writes_for_an_external_caller_that_applies(
+    session, test_user, test_workspace
+):
+    from sqlalchemy import select as _select
+
+    from app.models.group_settlement import GroupSettlement
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        member_id=str(home["partner"].id),
+        apply=True,
+    )
+    assert result.get("applied") is True
+
+    row = (await session.execute(_select(GroupSettlement))).scalars().one()
+    assert row.receiver_transaction_id == credit.id
+    assert row.from_member_id == home["partner"].id
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_refuses_a_counterparty_outside_the_group(
+    session, test_user, test_workspace
+):
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        member_id=str(uuid.uuid4()),
+        apply=True,
+    )
+    assert "must belong to the group" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_refuses_in_the_preview_what_apply_would_refuse(
+    session, test_user, test_workspace
+):
+    """The tool's description promises it turns down a transaction that
+    is already a contribution or carries shares. A preview that promised
+    otherwise would send the user to an Apply that fails."""
+    from app.schemas.transaction_split import (
+        TransactionSplitInput,
+        TransactionSplitsInput,
+    )
+    from app.services import settlement_service, split_service
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    already = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00", type_="credit"
+    )
+    shared = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "300.00", type_="credit"
+    )
+    await split_service.replace_splits(
+        session,
+        shared,
+        TransactionSplitsInput(
+            share_type="equal",
+            splits=[
+                TransactionSplitInput(group_member_id=home["me"].id),
+                TransactionSplitInput(group_member_id=home["partner"].id),
+            ],
+        ),
+        test_user.id,
+    )
+    await session.commit()
+
+    from app.schemas.group_settlement import MarkContributionFromTransaction
+
+    await settlement_service.mark_transaction_as_contribution(
+        session,
+        home["group"].id,
+        test_workspace.id,
+        test_user.id,
+        MarkContributionFromTransaction(
+            transaction_id=already.id, member_id=home["partner"].id
+        ),
+    )
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    ctx = _Ctx(user_id=test_user.id, external=False)
+
+    linked = await handler(
+        session=session,
+        ctx=ctx,
+        group_id=str(home["group"].id),
+        transaction_id=str(already.id),
+        member_id=str(home["partner"].id),
+    )
+    assert "already linked" in linked["error"]
+    assert "proposed" not in linked
+
+    carries_shares = await handler(
+        session=session,
+        ctx=ctx,
+        group_id=str(home["group"].id),
+        transaction_id=str(shared.id),
+        member_id=str(home["partner"].id),
+    )
+    assert "shared in a group" in carries_shares["error"]
+    assert "proposed" not in carries_shares
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_shows_the_date_that_will_be_stored(
+    session, test_user, test_workspace
+):
+    """A card row is bucketed by its bill date, and that is the date the
+    contribution carries — not the transaction's own."""
+    from datetime import date as _date
+
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        "2000.00",
+        type_="credit",
+        when=_date(2026, 5, 20),
+    )
+    credit.effective_bill_date = _date(2026, 6, 10)
+    await session.commit()
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        member_id=str(home["partner"].id),
+    )
+    assert preview["proposed"]["date"] == "2026-06-10"
+    assert preview["outcome"] == "create"
+
+    applied = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        member_id=str(home["partner"].id),
+        apply=True,
+    )
+    assert applied.get("applied") is True
+
+    from app.models.group_settlement import GroupSettlement as _Settlement
+    from sqlalchemy import select as _select
+
+    row = (await session.execute(_select(_Settlement))).scalars().one()
+    assert row.date == _date(2026, 6, 10)
+
+
+@pytest.mark.asyncio
+async def test_propose_mark_contribution_says_when_it_will_attach_to_the_other_leg(
+    session, test_user, test_workspace
+):
+    from datetime import date as _date
+
+    from app.schemas.group_settlement import MarkContributionFromTransaction
+    from app.services import settlement_service
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    when = _date(2026, 5, 20)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=when,
+    )
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    await session.commit()
+
+    first = await settlement_service.mark_transaction_as_contribution(
+        session,
+        home["group"].id,
+        test_workspace.id,
+        test_user.id,
+        MarkContributionFromTransaction(
+            transaction_id=credit.id, member_id=home["partner"].id
+        ),
+    )
+    assert first is not None
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(debit.id),
+        member_id=str(home["me"].id),
+    )
+    assert preview["outcome"] == "attach"
+    assert preview["existing_settlement_id"] == str(first.id)
+    assert preview["proposed"]["side"] == "payer"
+
+
+@pytest.mark.asyncio
+async def test_an_attach_preview_shows_the_date_and_notes_that_will_stand(
+    session, test_user, test_workspace
+):
+    """Attaching keeps the contribution's own date and fills its notes
+    only when it has none. A preview showing the incoming values would
+    promise an edit the Apply does not make."""
+    from datetime import date as _date
+
+    from app.schemas.group_settlement import MarkContributionFromTransaction
+    from app.services import settlement_service
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=_date(2026, 5, 20),
+    )
+    # One day later, and inside the window, so the two are one transfer.
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=_date(2026, 5, 21),
+    )
+    await session.commit()
+
+    first = await settlement_service.mark_transaction_as_contribution(
+        session,
+        home["group"].id,
+        test_workspace.id,
+        test_user.id,
+        MarkContributionFromTransaction(
+            transaction_id=credit.id, member_id=home["partner"].id, notes="May"
+        ),
+    )
+    assert first is not None
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(debit.id),
+        member_id=str(home["me"].id),
+        notes="a different note",
+    )
+    assert preview["outcome"] == "attach"
+    assert preview["proposed"]["date"] == "2026-05-20"
+    assert preview["proposed"]["notes"] == "May"
+
+    applied = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        group_id=str(home["group"].id),
+        transaction_id=str(debit.id),
+        member_id=str(home["me"].id),
+        notes="a different note",
+        apply=True,
+    )
+    assert applied.get("applied") is True
+
+    await session.refresh(first)
+    assert first.date == _date(2026, 5, 20)
+    assert first.notes == "May"
+
+
+@pytest.mark.asyncio
+async def test_an_attach_preview_offers_the_incoming_note_when_there_is_none(
+    session, test_user, test_workspace
+):
+    from datetime import date as _date
+
+    from app.schemas.group_settlement import MarkContributionFromTransaction
+    from app.services import settlement_service
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    when = _date(2026, 5, 20)
+    credit = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, "2000.00",
+        type_="credit", when=when,
+    )
+    debit = await _tx(
+        session, home["partner_user"].id, test_workspace.id, home["hers"].id, "2000.00",
+        when=when,
+    )
+    await session.commit()
+
+    await settlement_service.mark_transaction_as_contribution(
+        session,
+        home["group"].id,
+        test_workspace.id,
+        test_user.id,
+        MarkContributionFromTransaction(
+            transaction_id=credit.id, member_id=home["partner"].id
+        ),
+    )
+
+    handler = REGISTRY["propose_mark_contribution"].handler
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(debit.id),
+        member_id=str(home["me"].id),
+        notes="May",
+    )
+    assert preview["outcome"] == "attach"
+    assert preview["proposed"]["notes"] == "May"
+
+
+# ───────────────── sharing a transaction, and rules that do it ──────────
+
+
+@pytest.mark.asyncio
+async def test_propose_share_transaction_previews_the_shares_without_writing(
+    session, test_user, test_workspace
+):
+    from sqlalchemy import select as _select
+
+    from app.models.transaction_split import TransactionSplit
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    groceries = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        "300.00",
+        description="SUPERMARKET",
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_share_transaction"].handler
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(groceries.id),
+        apply=True,
+    )
+    assert result["kind"] == "share_transaction"
+    assert sorted(s["share_amount"] for s in result["proposed"]["shares"]) == [
+        150.0,
+        150.0,
+    ]
+    assert "applied" not in result
+    assert (await session.execute(_select(TransactionSplit.id))).first() is None
+
+
+@pytest.mark.asyncio
+async def test_propose_share_transaction_writes_for_an_external_caller_that_applies(
+    session, test_user, test_workspace
+):
+    from sqlalchemy import select as _select
+
+    from app.models.transaction_split import TransactionSplit
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    groceries = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        "300.00",
+        description="SUPERMARKET",
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_share_transaction"].handler
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        group_id=str(home["group"].id),
+        transaction_id=str(groceries.id),
+        share_type="percent",
+        splits=[
+            {"group_member_id": str(home["me"].id), "share_pct": 60},
+            {"group_member_id": str(home["partner"].id), "share_pct": 40},
+        ],
+        apply=True,
+    )
+    assert result["applied"] is True
+    rows = (
+        await session.execute(
+            _select(TransactionSplit).where(
+                TransactionSplit.transaction_id == groceries.id
+            )
+        )
+    ).scalars().all()
+    assert sorted(r.share_amount for r in rows) == [Decimal("120.00"), Decimal("180.00")]
+
+
+@pytest.mark.asyncio
+async def test_propose_share_transaction_refuses_a_contribution(
+    session, test_user, test_workspace
+):
+    """Money a member put into the pot cannot also be money the pot
+    spent."""
+    from app.schemas.group_settlement import MarkContributionFromTransaction
+    from app.services import settlement_service
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    credit = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        "2000.00",
+        type_="credit",
+    )
+    await session.commit()
+    await settlement_service.mark_transaction_as_contribution(
+        session,
+        home["group"].id,
+        test_workspace.id,
+        test_user.id,
+        MarkContributionFromTransaction(
+            transaction_id=credit.id, member_id=home["partner"].id
+        ),
+    )
+
+    handler = REGISTRY["propose_share_transaction"].handler
+    # The preview refuses it too: a proposal that promised shares the
+    # Apply button then turned down would be worse than none.
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+    )
+    assert "cannot be shared" in preview["error"]
+    assert "proposed" not in preview
+
+    result = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        group_id=str(home["group"].id),
+        transaction_id=str(credit.id),
+        apply=True,
+    )
+    assert "cannot be shared" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_propose_share_transaction_refuses_a_member_of_another_group(
+    session, test_user, test_workspace
+):
+    from app.schemas.group import GroupCreate, GroupMemberCreate
+    from app.services import group_service
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    other = await group_service.create_group(
+        session, test_workspace.id, test_user.id, GroupCreate(name="Trip")
+    )
+    stranger = await group_service.create_member(
+        session, other.id, test_workspace.id, GroupMemberCreate(name="Someone")
+    )
+    assert stranger is not None
+    groceries = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        "300.00",
+        description="SUPERMARKET",
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_share_transaction"].handler
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        group_id=str(home["group"].id),
+        transaction_id=str(groceries.id),
+        splits=[
+            {"group_member_id": str(home["me"].id)},
+            {"group_member_id": str(stranger.id)},
+        ],
+    )
+    assert preview["error"] == "One or more split members not found"
+
+
+@pytest.mark.asyncio
+async def test_the_rule_tools_take_the_two_group_actions(
+    session, test_user, test_workspace
+):
+    """An agent can write the household's rules: the same actions the
+    editor writes, validated the same way, applied through the same
+    services."""
+    from sqlalchemy import select as _select
+
+    from app.models.transaction_split import TransactionSplit
+    from mcp_server.auth import CallContext as _Ctx
+    from mcp_server.registry import REGISTRY
+    from tests.test_contributions import _household, _tx
+
+    home = await _household(session, test_user, test_workspace)
+    groceries = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        "300.00",
+        description="SUPERMARKET",
+    )
+    await session.commit()
+
+    handler = REGISTRY["propose_create_rule"].handler
+    action = {
+        "op": "share_in_group",
+        "value": {
+            "group_id": str(home["group"].id),
+            "share_type": "equal",
+            "splits": [
+                {"group_member_id": str(home["me"].id)},
+                {"group_member_id": str(home["partner"].id)},
+            ],
+        },
+    }
+    conditions = [{"field": "description", "op": "contains", "value": "SUPERMARKET"}]
+
+    preview = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=False),
+        name="Groceries",
+        conditions=conditions,
+        actions=[action],
+    )
+    assert preview["preview"]["will_share"] == 1
+    assert (await session.execute(_select(TransactionSplit.id))).first() is None
+
+    applied = await handler(
+        session=session,
+        ctx=_Ctx(user_id=test_user.id, external=True),
+        name="Groceries",
+        conditions=conditions,
+        actions=[action],
+        apply=True,
+    )
+    assert applied["applied"] is True
+    rows = (
+        await session.execute(
+            _select(TransactionSplit).where(
+                TransactionSplit.transaction_id == groceries.id
+            )
+        )
+    ).scalars().all()
+    assert sorted(r.share_amount for r in rows) == [Decimal("150.00"), Decimal("150.00")]

@@ -1246,7 +1246,16 @@
       "rules": "Правила",
       "queue": "Ждёт вас",
       "history": "История"
-    }
+    },
+    "shareInGroup": "Разделить в группе",
+    "shareInGroupHint": "(каждое совпадение попадает в общую копилку — перевод между своими счетами тоже, поэтому исключите их в условиях)",
+    "markAsContribution": "Отметить как взнос",
+    "markAsContributionHint": "(сама операция и есть взнос)",
+    "selectGroup": "Выберите группу...",
+    "contributionMember": "Другой участник",
+    "contributionMemberHint": "Участник с другой стороны: для денег, поступивших на ваш счёт, — тот, кто их отправил.",
+    "previewShared": "{{shared}} были бы разделены в группе",
+    "previewContributions": "{{contributions}} стали бы взносами"
   },
   "categories": {
     "title": "Категории",

@@ -20,7 +20,20 @@ from mcp_server.tools.proposals import _APPLY_FIELD, _PROPOSAL_PREFACE, _can_app
 _RULE_CAPABILITIES = (
     " Conditions combine with AND/OR and filter description, payee, notes, "
     "amount, type, account_id, payee_id, or date. Actions can set category, "
-    "payee, or description, append notes, or ignore the transaction."
+    "payee, or description, append notes, or ignore the transaction. Two "
+    "more actions work on an expense-sharing group and take an object as "
+    "their value: "
+    '{"op": "share_in_group", "value": {"group_id": "<uuid>", '
+    '"share_type": "equal" | "percent", "splits": [{"group_member_id": '
+    '"<uuid>", "share_pct": 50}]}} shares every matching transaction in '
+    "that group — it never touches one that already carries shares, so a "
+    "distribution set by hand and a transaction taken out of the pot both "
+    "survive; and "
+    '{"op": "mark_as_contribution", "value": {"group_id": "<uuid>", '
+    '"member_id": "<uuid>"}} marks it as a contribution, where member_id '
+    "is the member on the OTHER side of the transaction. Call list_groups "
+    "for the ids. Both are idempotent: running the rules again leaves one "
+    "set of shares and one contribution."
 )
 
 
@@ -108,6 +121,7 @@ async def preview_rule(
         overwrite_existing_categories=draft.overwrite_existing_categories,
         limit=draft.limit,
         offset=draft.offset,
+        user_id=ctx.user_id,
     )
     return result.model_dump(mode="json")
 
@@ -161,6 +175,7 @@ async def propose_create_rule(
         is_active=draft.is_active,
         apply_to_existing=draft.apply_to_existing,
         overwrite_existing_categories=draft.overwrite_existing_categories,
+        user_id=ctx.user_id,
     )
     proposal = {
         "kind": "create_rule",
@@ -259,6 +274,7 @@ async def propose_update_rule(
         is_active=update.is_active if update.is_active is not None else current.is_active,
         apply_to_existing=should_apply,
         overwrite_existing_categories=update.overwrite_existing_categories,
+        user_id=ctx.user_id,
     )
     proposal = {
         "kind": "update_rule",

@@ -831,7 +831,10 @@ export interface GroupSettlementPayload {
   amount: number
   currency: string
   date: string
+  // The payer's side: the transaction on the account the money left.
   transaction_id?: string | null
+  // The receiver's side: the transaction on the account it landed on.
+  receiver_transaction_id?: string | null
   notes?: string | null
   // When provided, the backend creates a debit transaction on this
   // account and links it via transaction_id. Mutually exclusive with
@@ -884,6 +887,20 @@ export const groups = {
     },
     create: async (groupId: string, payload: GroupSettlementPayload): Promise<GroupSettlement> => {
       const { data } = await api.post(`/groups/${groupId}/settlements`, payload)
+      return data
+    },
+    // Mark a real transaction as a contribution. Amount, currency, date
+    // and which side the transaction is on all come from the transaction
+    // itself, and when the other leg of the same transfer is already a
+    // contribution this one joins it instead of becoming a second.
+    markFromTransaction: async (
+      groupId: string,
+      payload: { transaction_id: string; member_id: string; notes?: string | null },
+    ): Promise<GroupSettlement> => {
+      const { data } = await api.post(
+        `/groups/${groupId}/settlements/from-transaction`,
+        payload,
+      )
       return data
     },
     update: async (groupId: string, settlementId: string, payload: Partial<GroupSettlementPayload>): Promise<GroupSettlement> => {

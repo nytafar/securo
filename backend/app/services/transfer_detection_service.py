@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.transaction import Transaction
+from app.services.settlement_service import attach_paired_leg
 
 
 async def detect_transfer_pairs(
@@ -118,6 +119,10 @@ async def detect_transfer_pairs(
             paired_credit_ids.add(best_match.id)
             paired_debit_ids.add(debit.id)
             pairs_created += 1
+            # Both members' accounts imported: the two legs are one
+            # event, so if either is already a contribution's bank row
+            # the other joins it instead of hanging loose.
+            await attach_paired_leg(session, debit, best_match)
 
     return pairs_created
 

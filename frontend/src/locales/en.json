@@ -1233,7 +1233,16 @@
       "rules": "Rules",
       "queue": "Waiting for you",
       "history": "History"
-    }
+    },
+    "shareInGroup": "Share in group",
+    "shareInGroupHint": "(every match joins the group's pot — a transfer between your own accounts joins it too, so keep those out with the conditions)",
+    "markAsContribution": "Mark as contribution",
+    "markAsContributionHint": "(the transaction itself is the contribution)",
+    "selectGroup": "Select group...",
+    "contributionMember": "Other member",
+    "contributionMemberHint": "The member on the other side: for money that arrived on your account, whoever sent it.",
+    "previewShared": "{{shared}} would be shared in a group",
+    "previewContributions": "{{contributions}} would become contributions"
   },
   "categories": {
     "title": "Categories",

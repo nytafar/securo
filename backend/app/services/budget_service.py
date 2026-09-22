@@ -336,6 +336,7 @@ async def get_budget_vs_actual(
     forecast_transactions = await _get_forecast_transactions(
         session, workspace_id, month_start, month_end,
         range_date_col=report_date,
+        exclude_contribution_links=True,
     )
     for tx in forecast_transactions:
         if tx.type != "debit" or not tx.category_id or not _counts_as_user_pnl_row(tx):
@@ -417,6 +418,7 @@ async def get_budget_vs_actual(
     prev_forecast_transactions = await _get_forecast_transactions(
         session, workspace_id, prev_month_start, prev_month_end,
         range_date_col=report_date,
+        exclude_contribution_links=True,
     )
     for tx in prev_forecast_transactions:
         if tx.type != "debit" or not tx.category_id or not _counts_as_user_pnl_row(tx):

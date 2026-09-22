@@ -10,6 +10,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from app.models.transaction import Transaction
 
+# The actions that write somewhere other than the transaction: shares in
+# a group, and a contribution made of the transaction itself. They plan;
+# `rule_effects` writes.
+GROUP_ACTION_OPS = ("share_in_group", "mark_as_contribution")
+
 
 def _strip_accents(text: str) -> str:
     """Remove diacritics (accents), preserving case."""
@@ -192,6 +197,9 @@ def apply_rule_actions(
     *,
     skip_description: bool = False,
     hidden_category_ids: Collection[uuid.UUID] | None = None,
+    effects: list | None = None,
+    rule_id: uuid.UUID | None = None,
+    rule_author_id: uuid.UUID | None = None,
 ) -> bool:
     """Apply actions in-place and return the updated category-set flag.
 
@@ -200,6 +208,13 @@ def apply_rule_actions(
     actions and drops only the categorization. The transaction is left
     uncategorized rather than filed under a category the pickers no longer
     offer.
+
+    Two actions change nothing on the transaction itself: sharing it in a
+    group and marking it as a contribution are rows in other tables. They
+    are *planned* here — appended to `effects` as plain data, carrying
+    the rule they came from and its author — and written by whoever owns
+    the database transaction. This function stays what it has always
+    been: pure, and safe to run against a detached preview.
     """
     for action in actions:
         op = action.get("op")
@@ -242,5 +257,14 @@ def apply_rule_actions(
 
         elif op == "ignore":
             tx.is_ignored = True
+
+        elif op in GROUP_ACTION_OPS:
+            if effects is None:
+                continue
+            from app.services.rule_effects import plan_from_action
+
+            planned = plan_from_action(op, value, rule_id, rule_author_id)
+            if planned is not None:
+                effects.append(planned)
 
     return category_already_set

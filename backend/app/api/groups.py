@@ -25,6 +25,7 @@ from app.schemas.group_settlement import (
     GroupSettlementCreate,
     GroupSettlementRead,
     GroupSettlementUpdate,
+    MarkContributionFromTransaction,
 )
 from app.schemas.transaction import TransactionRead
 from app.services import (
@@ -279,6 +280,33 @@ async def create_settlement(
 ):
     try:
         settlement = await settlement_service.create_settlement(
+            session, group_id, ctx.workspace.id, ctx.user_id, data
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    if settlement is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
+    return settlement
+
+
+@router.post(
+    "/{group_id}/settlements/from-transaction",
+    response_model=GroupSettlementRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def mark_transaction_as_contribution(
+    group_id: uuid.UUID,
+    data: MarkContributionFromTransaction,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Mark an existing transaction as a contribution from or to the
+    named member. Amount, currency, date and which side the transaction
+    is on come from the transaction itself; no transaction is created."""
+    try:
+        settlement = await settlement_service.mark_transaction_as_contribution(
             session, group_id, ctx.workspace.id, ctx.user_id, data
         )
     except PermissionError as e:

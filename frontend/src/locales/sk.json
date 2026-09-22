@@ -1321,7 +1321,16 @@
       "rules": "Pravidlá",
       "queue": "Čaká na vás",
       "history": "História"
-    }
+    },
+    "shareInGroup": "Rozdeliť v skupine",
+    "shareInGroupHint": "(každá zhoda ide do spoločnej pokladnice — aj prevod medzi vlastnými účtami, preto ich vylúčte v podmienkach)",
+    "markAsContribution": "Označiť ako príspevok",
+    "markAsContributionHint": "(samotná transakcia je príspevok)",
+    "selectGroup": "Vyberte skupinu...",
+    "contributionMember": "Druhý člen",
+    "contributionMemberHint": "Člen na druhej strane: pri peniazoch, ktoré prišli na váš účet, ten, kto ich poslal.",
+    "previewShared": "{{shared}} by sa rozdelili v skupine",
+    "previewContributions": "{{contributions}} by sa stali príspevkami"
   },
   "categories": {
     "title": "Kategórie",

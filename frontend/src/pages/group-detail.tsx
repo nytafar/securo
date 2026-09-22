@@ -33,6 +33,12 @@ import {
   type GroupMemberPayload,
   type GroupSettlementPayload,
 } from '@/lib/api'
+
+/** Marking a real transaction, as opposed to recording a contribution
+ *  by hand. Wrapped so the one mutation can tell the two apart. */
+type MarkContributionPayload = {
+  transaction: { transaction_id: string; member_id: string; notes?: string | null }
+}
 import { localDateString } from '@/lib/date-utils'
 import {
   catchUpMonths,
@@ -446,13 +452,46 @@ export default function GroupDetailPage() {
   const [settleTxSearch, setSettleTxSearch] = useState('')
   const [settleTxQuery, setSettleTxQuery] = useState('')
 
-  // Accounts of the requesting user — needed only when the optional
-  // "create transaction" toggle is enabled.
+  // Which side of the contribution the viewer is on. The payer's leg is
+  // a debit leaving their account and the receiver's a credit landing on
+  // it, so the side decides what to search for and which link column the
+  // picked transaction fills. Null when the viewer is on neither side —
+  // an owner recording a transfer between two other members.
+  const settleSide: 'payer' | 'receiver' | null = !viewerMemberId
+    ? null
+    : settleFrom === viewerMemberId
+      ? 'payer'
+      : settleTo === viewerMemberId
+        ? 'receiver'
+        : null
+
+  // Accounts of the workspace — needed for the optional "create
+  // transaction" toggle, and to keep the transaction picker to the
+  // viewer's own rows.
   const { data: accountsList } = useQuery({
     queryKey: ['accounts'],
     queryFn: () => accountsApi.list(),
     enabled: settleOpen,
   })
+
+  // Both members of a household keep their accounts in one workspace, so
+  // an unfiltered picker offers the other member's rows too — and the
+  // API refuses those, because a link has to sit on the account of the
+  // member on that side. Offer only what it accepts.
+  const ownAccountIds = useMemo(
+    () => (accountsList ?? []).filter((a) => a.user_id === user?.id).map((a) => a.id),
+    [accountsList, user?.id],
+  )
+
+  // A linked member may record a contribution she is part of, on either
+  // side, and nothing between two other people. Moving one side away
+  // from her takes the other side to her, so the dialog cannot be walked
+  // into a pair the API turns down.
+  const keepViewerInThePair = (side: 'from' | 'to', value: string) => {
+    if (isOwner || !viewerMemberId || value === viewerMemberId) return
+    if (side === 'from') setSettleTo(viewerMemberId)
+    else setSettleFrom(viewerMemberId)
+  }
 
   // Debounce the transaction search so we don't hit the API on every
   // keystroke (mirrors the transactions page pattern).
@@ -461,24 +500,34 @@ export default function GroupDetailPage() {
     return () => clearTimeout(id)
   }, [settleTxSearch])
 
-  // The payer's debit transactions, searched server-side and capped —
-  // offered when linking an existing transaction instead of creating one.
+  // The viewer's own leg of the transfer, searched server-side and
+  // capped — offered when linking an existing transaction instead of
+  // creating one. Debits when they paid, credits when they were paid.
   const { data: settleTxOptions } = useQuery({
-    queryKey: ['settle-tx-options', settleTxQuery],
+    queryKey: ['settle-tx-options', settleTxQuery, settleSide, ownAccountIds],
     queryFn: () =>
       transactionsApi.list({
-        type: 'debit',
+        type: settleSide === 'receiver' ? 'credit' : 'debit',
+        account_ids: ownAccountIds.length > 0 ? ownAccountIds : undefined,
         q: settleTxQuery || undefined,
         limit: 20,
         sort_by: 'date',
         sort_dir: 'desc',
       }),
-    enabled: settleOpen && settleTxMode === 'existing',
+    enabled: settleOpen && settleTxMode === 'existing' && settleSide !== null,
   })
 
+  // A contribution backed by a real transaction goes through the marking
+  // endpoint, not through create: only that path knows that the other
+  // leg of the same transfer may already be a contribution, and joins it
+  // instead of making a second one for money that moved once. A
+  // hand-entered contribution with no transaction behind it still gets
+  // created outright.
   const settlementMutation = useMutation({
-    mutationFn: (payload: GroupSettlementPayload) =>
-      groupsApi.settlements.create(groupId, payload),
+    mutationFn: (payload: GroupSettlementPayload | MarkContributionPayload) =>
+      'transaction' in payload
+        ? groupsApi.settlements.markFromTransaction(groupId, payload.transaction)
+        : groupsApi.settlements.create(groupId, payload),
     onSuccess: () => {
       invalidateGroup()
       setSettleOpen(false)
@@ -523,7 +572,22 @@ export default function GroupDetailPage() {
   }
 
   const saveSettlement = () => {
-    if (!settleFrom || !settleTo || !settleAmount) return
+    if (!settleFrom || !settleTo) return
+    if (settleTxMode === 'existing' && settlePickedTx) {
+      // The endpoint reads the amount, the currency, the date and which
+      // side the transaction is on off the transaction itself — which is
+      // why those inputs are disabled in this mode. Only the other
+      // member and the note are ours to send.
+      settlementMutation.mutate({
+        transaction: {
+          transaction_id: settlePickedTx.id,
+          member_id: settleSide === 'receiver' ? settleFrom : settleTo,
+          notes: settleNotes.trim() || null,
+        },
+      })
+      return
+    }
+    if (!settleAmount) return
     const payload: GroupSettlementPayload = {
       from_member_id: settleFrom,
       to_member_id: settleTo,
@@ -534,8 +598,6 @@ export default function GroupDetailPage() {
     }
     if (settleTxMode === 'create' && settleAccountId) {
       payload.account_id = settleAccountId
-    } else if (settleTxMode === 'existing' && settlePickedTx) {
-      payload.transaction_id = settlePickedTx.id
     }
     settlementMutation.mutate(payload)
   }
@@ -1309,8 +1371,7 @@ export default function GroupDetailPage() {
             <DialogTitle>{recordLabel}</DialogTitle>
           </DialogHeader>
           {(() => {
-            const myMemberId = viewerMemberId
-            const viewerIsPayer = !!myMemberId && settleFrom === myMemberId
+            const viewerIsPayer = settleSide === 'payer'
             return (
           <div className="space-y-4 min-w-0">
             <div className="space-y-2">
@@ -1320,8 +1381,9 @@ export default function GroupDetailPage() {
                 value={settleFrom}
                 onChange={(e) => {
                   setSettleFrom(e.target.value)
-                  // Reset the ledger-side options: only meaningful
-                  // when the viewer is the payer.
+                  keepViewerInThePair('from', e.target.value)
+                  // Reset the ledger-side options: which side the viewer
+                  // is on decides what can be linked.
                   setSettleTxMode('none')
                   setSettleAccountId('')
                   setSettlePickedTx(null)
@@ -1341,7 +1403,14 @@ export default function GroupDetailPage() {
               <select
                 className="w-full border border-border rounded-md px-3 py-2 text-sm bg-card"
                 value={settleTo}
-                onChange={(e) => setSettleTo(e.target.value)}
+                onChange={(e) => {
+                  setSettleTo(e.target.value)
+                  keepViewerInThePair('to', e.target.value)
+                  setSettleTxMode('none')
+                  setSettleAccountId('')
+                  setSettlePickedTx(null)
+                  setSettleTxSearch('')
+                }}
               >
                 <option value="">{t('splitGroups.selectMember')}</option>
                 {group.members.map((m) => (
@@ -1352,11 +1421,14 @@ export default function GroupDetailPage() {
               </select>
             </div>
             {/* Transaction action — placed right after the members so
-                the payer can decide upfront whether a real transaction
-                will back this record. When linking an existing
-                transaction, the amount/currency/date below mirror that
-                transaction and lock so the two records can't disagree. */}
-            {viewerIsPayer && (
+                whoever is on one side of this can decide upfront whether
+                a real transaction backs the record. When linking an
+                existing transaction, the amount/currency/date below
+                mirror that transaction and lock so the two records can't
+                disagree. The payer may also have a fresh debit written;
+                the receiver only ever links the credit that landed, so a
+                contribution is never a copy of money already imported. */}
+            {settleSide !== null && (
                 <div className="space-y-2">
                   <Label>{t('splitGroups.txAction')}</Label>
                   <select
@@ -1370,7 +1442,9 @@ export default function GroupDetailPage() {
                     }}
                   >
                     <option value="none">{t('splitGroups.txActionNone')}</option>
-                    <option value="create">{t('splitGroups.txActionCreate')}</option>
+                    {viewerIsPayer && (
+                      <option value="create">{t('splitGroups.txActionCreate')}</option>
+                    )}
                     <option value="existing">{t('splitGroups.txActionExisting')}</option>
                   </select>
                   {settleTxMode === 'create' && (

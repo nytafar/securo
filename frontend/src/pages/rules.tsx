@@ -29,6 +29,7 @@ import { ReconciliationHistory } from '@/components/reconciliation-history'
 import { Segmented } from '@/components/invoice-ui'
 import { reconciliation as reconciliationApi } from '@/lib/api'
 import { findCategoryReference, getRuleCategoryName } from '@/lib/category-reference-utils'
+import { actionText } from '@/lib/rule-form-utils'
 
 function SectionCard({ children }: { children: React.ReactNode }) {
   return (
@@ -130,19 +131,24 @@ function conditionSummary(conditions: RuleConditionNode[], conditionsOp: string,
 
 function actionSummary(actions: RuleAction[], categories: Category[], payeesList: Payee[], t: (key: string) => string): string {
   return actions.map(a => {
+    const text = actionText(a)
     if (a.op === 'set_category') {
-      const cat = findCategoryReference(categories, a.value)
+      const cat = findCategoryReference(categories, text)
       return cat ? `→ ${cat.name}` : `→ ${t('transactions.category')}`
     }
     if (a.op === 'set_payee') {
-      const p = payeesList.find(p => p.id === a.value)
+      const p = payeesList.find(p => p.id === text)
       return p ? `→ ${t('payees.payee')}: ${p.name}` : `→ ${t('payees.payee')}`
     }
     if (a.op === 'set_description') {
-      return `→ ${t('rules.fieldDescription')}: ${a.value}`
+      return `→ ${t('rules.fieldDescription')}: ${text}`
     }
-    if (a.op === 'append_notes') return `→ ${t('rules.fieldNotes')}: ${a.value}`
+    if (a.op === 'append_notes') return `→ ${t('rules.fieldNotes')}: ${text}`
     if (a.op === 'ignore') return `→ ${t('rules.ignoreAction')}`
+    // The two group actions name a group and its members; the row has no
+    // room for that, and the dialog shows it in full.
+    if (a.op === 'share_in_group') return `→ ${t('rules.shareInGroup')}`
+    if (a.op === 'mark_as_contribution') return `→ ${t('rules.markAsContribution')}`
     return a.op
   }).join('  ') || t('rules.noActions')
 }
@@ -153,6 +159,8 @@ const ACTION_FILTERS = [
   { value: 'set_payee', label: 'rules.setPayee' },
   { value: 'append_notes', label: 'rules.appendNotes' },
   { value: 'ignore', label: 'rules.ignoreAction' },
+  { value: 'share_in_group', label: 'rules.shareInGroup' },
+  { value: 'mark_as_contribution', label: 'rules.markAsContribution' },
 ] as const
 
 const FILTER_CONTROL_CLASS = 'h-7 rounded-md border border-border bg-background px-2 text-xs text-foreground focus:outline-none focus-visible:ring-ring/30 focus-visible:ring-[2px]'

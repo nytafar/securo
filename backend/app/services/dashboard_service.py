@@ -16,6 +16,7 @@ from app.models.recurring_transaction import RecurringTransaction
 from app.schemas.dashboard import DashboardSummary, SpendingByCategory, MonthlyTrend, ProjectedTransaction, DailyBalance, BalanceHistory
 from app.services._query_filters import (
     counts_as_user_pnl,
+    is_contribution_link,
     owner_split_offset_by_category,
     owner_split_offset_pnl,
     reporting_date_col,
@@ -156,6 +157,7 @@ async def _get_forecast_transactions(
     range_end: date,
     account_ids: Optional[list[uuid.UUID]] = None,
     range_date_col=None,
+    exclude_contribution_links: bool = False,
 ) -> list[Transaction]:
     """Return real rows that belong to the forecast, not the current balance.
 
@@ -163,6 +165,12 @@ async def _get_forecast_transactions(
     today is also forecast: this is how future installments and generate-ahead
     recurring rows follow the same rule as bank pending rows without needing a
     source-specific branch at every consumer.
+
+    `exclude_contribution_links` drops the bank rows group contributions
+    are made of, for the callers that go on to build a P/L figure: the
+    same rule `counts_as_pnl` applies to booked rows, applied here rather
+    than in the in-memory predicate because the balance walks share this
+    loader and a contribution still moves an account balance.
     """
     if account_ids is not None and len(account_ids) == 0:
         return []
@@ -192,6 +200,8 @@ async def _get_forecast_transactions(
     )
     if account_ids:
         stmt = stmt.where(Transaction.account_id.in_(account_ids))
+    if exclude_contribution_links:
+        stmt = stmt.where(~is_contribution_link())
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -398,6 +408,7 @@ async def get_summary(
     forecast_transactions = await _get_forecast_transactions(
         session, workspace_id, month_start, month_end, account_ids,
         range_date_col=report_date,
+        exclude_contribution_links=True,
     )
     for proj in projections:
         if proj["type"] == "credit":
@@ -874,6 +885,7 @@ async def get_spending_by_category(
     forecast_transactions = await _get_forecast_transactions(
         session, workspace_id, month_start, month_end, account_ids,
         range_date_col=report_date,
+        exclude_contribution_links=True,
     )
     for tx in forecast_transactions:
         if tx.type != "debit" or tx.is_ignored:
@@ -982,6 +994,7 @@ async def get_monthly_trend(
     forecast_transactions = await _get_forecast_transactions(
         session, workspace_id, forecast_start, forecast_end, account_ids,
         range_date_col=report_date,
+        exclude_contribution_links=True,
     )
     for tx in forecast_transactions:
         if not _counts_as_user_pnl_row(tx):

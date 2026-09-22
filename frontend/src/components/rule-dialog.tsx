@@ -1,9 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useInfiniteQuery } from '@tanstack/react-query'
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { getAccountName, sortAccountsByDisplayName } from '@/lib/account-utils'
-import { isInvalidDescriptionAction, parseRulePriority, previewableActions } from '@/lib/rule-form-utils'
-import { rules as rulesApi } from '@/lib/api'
+import {
+  actionText,
+  contributionValue,
+  isGroupAction,
+  isInvalidDescriptionAction,
+  parseRulePriority,
+  previewableActions,
+  shareValue,
+} from '@/lib/rule-form-utils'
+import { groups as groupsApi, rules as rulesApi } from '@/lib/api'
 import { formatCurrency } from '@/lib/format'
 import { useDisplayLocale, useDateLocale } from '@/hooks/use-display-locale'
 import { usePrivacyMode } from '@/hooks/use-privacy-mode'
@@ -24,11 +32,13 @@ import { flattenConditions, isConditionGroup } from '@/lib/rule-conditions'
 import type {
   Category,
   CategoryGroup,
+  Group,
   Payee,
   Rule,
   RuleCondition,
   RuleConditionNode,
   RuleAction,
+  RuleActionValue,
 } from '@/types'
 
 const CONDITION_FIELDS = [
@@ -321,6 +331,17 @@ function RulePreviewPanel({
             <div className="space-y-2">
               <p className="text-xs text-muted-foreground">
                 {t('rules.previewSummary', { matched: data.matched, changed: data.will_change })}
+                {/* A rule whose only action is a group one changes no
+                    field, so "0 would change" would read as "nothing
+                    happens". These say what it really does. */}
+                {!!data.will_share && (
+                  <> · {t('rules.previewShared', { shared: data.will_share })}</>
+                )}
+                {!!data.will_mark_contribution && (
+                  <> · {t('rules.previewContributions', {
+                    contributions: data.will_mark_contribution,
+                  })}</>
+                )}
                 {!data.will_apply && (
                   <> · <span className="font-medium text-amber-600 dark:text-amber-400">
                     {isActive ? t('rules.previewNotAppliedToExisting') : t('rules.previewInactive')}
@@ -397,6 +418,162 @@ function RulePreviewPanel({
                 </button>
               )}
             </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** The group picker and the distribution for the two actions that work on
+ * a group's common pot.
+ *
+ * Sharing takes the same equal/percent distribution the bulk
+ * add-to-group dialog takes, because those are the two that generalize
+ * across transactions of different sizes. Marking a contribution takes
+ * one member: the one on the *other* side of the transaction, exactly as
+ * marking by hand does.
+ */
+function GroupActionFields({
+  action, groups, onChange,
+}: {
+  action: RuleAction
+  groups: Group[]
+  onChange: (value: RuleActionValue) => void
+}) {
+  const { t } = useTranslation()
+  const isShare = action.op === 'share_in_group'
+  const share = shareValue(action)
+  const contribution = contributionValue(action)
+  const groupId = isShare ? share.group_id : contribution.group_id
+
+  const { data: group } = useQuery({
+    queryKey: ['groups', groupId],
+    queryFn: () => groupsApi.get(groupId),
+    enabled: !!groupId,
+  })
+  const members = group?.members ?? []
+
+  const selected = new Set(share.splits.map(s => s.group_member_id))
+  const percentSum = share.splits.reduce((sum, s) => sum + (s.share_pct ?? 0), 0)
+
+  function pickGroup(nextGroupId: string) {
+    // The members belong to the old group, so they go with it.
+    onChange(
+      isShare
+        ? { group_id: nextGroupId, share_type: share.share_type, splits: [] }
+        : { group_id: nextGroupId, member_id: '' }
+    )
+  }
+
+  function toggleMember(memberId: string, on: boolean) {
+    onChange({
+      ...share,
+      splits: on
+        ? [...share.splits, { group_member_id: memberId }]
+        : share.splits.filter(s => s.group_member_id !== memberId),
+    })
+  }
+
+  function setPercent(memberId: string, percent: string) {
+    onChange({
+      ...share,
+      splits: share.splits.map(s => (
+        s.group_member_id === memberId
+          ? { ...s, share_pct: percent === '' ? null : Number(percent) }
+          : s
+      )),
+    })
+  }
+
+  return (
+    <div className="space-y-2 rounded-lg border border-border bg-muted/40 p-2">
+      <div className="grid gap-2 sm:grid-cols-2">
+        <select
+          className={`${SELECT_CLASS} w-full`}
+          value={groupId}
+          onChange={(e) => pickGroup(e.target.value)}
+          aria-label={t('splitGroups.group')}
+        >
+          <option value="">{t('rules.selectGroup')}</option>
+          {groups.map(g => (
+            <option key={g.id} value={g.id}>{g.name}</option>
+          ))}
+        </select>
+        {isShare ? (
+          <select
+            className={`${SELECT_CLASS} w-full`}
+            value={share.share_type}
+            onChange={(e) => onChange({
+              ...share,
+              share_type: e.target.value as 'equal' | 'percent',
+            })}
+            aria-label={t('splitGroups.shareType')}
+          >
+            <option value="equal">{t('splitGroups.shareEqual')}</option>
+            <option value="percent">{t('splitGroups.sharePercent')}</option>
+          </select>
+        ) : (
+          <select
+            className={`${SELECT_CLASS} w-full`}
+            value={contribution.member_id}
+            onChange={(e) => onChange({ ...contribution, member_id: e.target.value })}
+            aria-label={t('rules.contributionMember')}
+            disabled={!groupId}
+          >
+            <option value="">{t('splitGroups.selectMember')}</option>
+            {members.map(m => (
+              <option key={m.id} value={m.id}>{m.name}</option>
+            ))}
+          </select>
+        )}
+      </div>
+
+      {!isShare && (
+        <p className="text-xs text-muted-foreground">{t('rules.contributionMemberHint')}</p>
+      )}
+
+      {isShare && groupId && (
+        <div className="space-y-1.5">
+          <Label className="text-xs">{t('splitGroups.members')}</Label>
+          {members.map(m => {
+            const row = share.splits.find(s => s.group_member_id === m.id)
+            return (
+              <div key={m.id} className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={selected.has(m.id)}
+                  onChange={(e) => toggleMember(m.id, e.target.checked)}
+                  className="h-4 w-4 rounded border-border accent-primary"
+                  aria-label={m.name}
+                />
+                <span className="min-w-0 flex-1 truncate text-sm">{m.name}</span>
+                {share.share_type === 'percent' && row && (
+                  <div className="flex items-center gap-1">
+                    <Input
+                      type="number"
+                      step="0.01"
+                      className="h-8 w-20 text-sm"
+                      value={row.share_pct ?? ''}
+                      onChange={(e) => setPercent(m.id, e.target.value)}
+                      aria-label={`${m.name} %`}
+                    />
+                    <span className="text-xs text-muted-foreground">%</span>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+          {share.share_type === 'percent' && share.splits.length > 0 && (
+            <p className={cn(
+              'text-xs',
+              Math.abs(percentSum - 100) < 0.005 ? 'text-emerald-600' : 'text-amber-600',
+            )}>
+              {t('splitGroups.percentSum', { total: percentSum.toFixed(2) })}
+            </p>
+          )}
+          {share.share_type === 'equal' && share.splits.length > 0 && (
+            <p className="text-xs text-muted-foreground">{t('splitGroups.equalHint')}</p>
           )}
         </div>
       )}
@@ -505,11 +682,19 @@ export function RuleDialog({
     }))
   }
 
-  function updateAction(i: number, field: keyof RuleAction, val: string) {
+  function updateAction(i: number, field: keyof RuleAction, val: RuleActionValue) {
     setActions(prev => prev.map((a, idx) => {
       if (idx !== i) return a
       const next = { ...a, [field]: val }
-      if (field === 'op') next.value = ''
+      // Changing what an action does drops the value it carried: a
+      // category id is nothing to a group action, and the other way round.
+      if (field === 'op') {
+        next.value = val === 'share_in_group'
+          ? { group_id: '', share_type: 'equal', splits: [] }
+          : val === 'mark_as_contribution'
+            ? { group_id: '', member_id: '' }
+            : ''
+      }
       return next
     }))
   }
@@ -526,6 +711,19 @@ export function RuleDialog({
   // its actions to the whole ledger. The API rejects these too.
   const hasBlankCondition = flattenConditions(conditions).some(c => String(c.value ?? '').trim() === '')
   const hasInvalidDescriptionAction = actions.some(isInvalidDescriptionAction)
+
+  // Only fetched once a group action is on screen: a rule about a
+  // category has no business asking the server for the user's groups.
+  const needsGroups = actions.some(isGroupAction)
+  const { data: groupList } = useQuery({
+    queryKey: ['groups'],
+    queryFn: () => groupsApi.list(false),
+    enabled: open && needsGroups,
+  })
+  const availableGroups = useMemo(
+    () => (groupList ?? []).filter(g => !g.is_archived),
+    [groupList],
+  )
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -679,20 +877,28 @@ export function RuleDialog({
                         <option value="set_payee">{t('rules.setPayee')}</option>
                         <option value="append_notes">{t('rules.appendNotes')}</option>
                         <option value="ignore">{t('rules.ignoreAction')}</option>
+                        <option value="share_in_group">{t('rules.shareInGroup')}</option>
+                        <option value="mark_as_contribution">{t('rules.markAsContribution')}</option>
                       </select>
-                      {action.op === 'ignore' ? (
+                      {isGroupAction(action) ? (
+                        <span className="min-w-0 text-sm italic text-muted-foreground sm:w-0 sm:flex-1">
+                          {action.op === 'share_in_group'
+                            ? t('rules.shareInGroupHint')
+                            : t('rules.markAsContributionHint')}
+                        </span>
+                      ) : action.op === 'ignore' ? (
                         <span className="min-w-0 text-sm italic text-muted-foreground sm:w-0 sm:flex-1">
                           {t('rules.ignoreActionHint')}
                         </span>
                       ) : action.op === 'set_category' ? (
                         <div className="w-full min-w-0 sm:w-0 sm:flex-1">
                           <CategorySelect
-                            value={action.value}
+                            value={actionText(action)}
                             onChange={(val) => updateAction(i, 'value', val)}
                             categories={categories}
                             groups={categoryGroups}
                             currentCategory={currentCategories.find(
-                              (category) => category.id === action.value
+                              (category) => category.id === actionText(action)
                             )}
                             placeholder={t('rules.selectCategory')}
                             className={`${SELECT_CLASS} w-full`}
@@ -701,7 +907,7 @@ export function RuleDialog({
                       ) : action.op === 'set_payee' ? (
                         <select
                           className={`${SELECT_CLASS} w-full min-w-0 sm:w-0 sm:flex-1`}
-                          value={action.value}
+                          value={actionText(action)}
                           onChange={(e) => updateAction(i, 'value', e.target.value)}
                           required
                         >
@@ -713,7 +919,7 @@ export function RuleDialog({
                       ) : (
                         <Input
                           className="h-8 w-full min-w-0 text-sm aria-invalid:border-input aria-invalid:ring-0 dark:aria-invalid:ring-0 sm:w-0 sm:flex-1"
-                          value={action.value}
+                          value={actionText(action)}
                           onChange={(e) => updateAction(i, 'value', e.target.value)}
                           placeholder={
                             action.op === 'set_description'
@@ -734,6 +940,13 @@ export function RuleDialog({
                         <X size={13} />
                       </button>
                     </div>
+                    {isGroupAction(action) && (
+                      <GroupActionFields
+                        action={action}
+                        groups={availableGroups}
+                        onChange={(value) => updateAction(i, 'value', value)}
+                      />
+                    )}
                     {invalidDescription && (
                       <p id={`action-${i}-description-error`} className="text-xs text-rose-500">
                         {t('rules.invalidDescriptionValue')}

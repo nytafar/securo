@@ -35,6 +35,7 @@ from app.schemas.recurring_transaction import (
     RecurringTransactionUpdate,
     WeekendAdjustment,
 )
+from app.schemas.group_settlement import MarkContributionFromTransaction
 from app.schemas.rule import RuleAction, RuleCondition, RuleCreate
 from app.schemas.transaction import TransactionCreate
 from app.schemas.transaction_split import TransactionSplitInput, TransactionSplitsInput
@@ -42,8 +43,10 @@ from app.services import (
     budget_service,
     category_service,
     goal_service,
+    group_service,
     recurring_transaction_service,
     rule_service,
+    settlement_service,
     transaction_service,
 )
 from mcp_server.auth import CallContext
@@ -1027,6 +1030,314 @@ async def propose_create_goal(
         return {**preview, "applied": True, "id": str(created.id)}
 
     return preview
+
+
+@tool(
+    name="propose_mark_contribution",
+    description=_PROPOSAL_PREFACE
+    + (
+        "Build a preview for marking an existing bank transaction as a "
+        "contribution to an expense-sharing group — money one member "
+        "moved to carry their part of the common pot, such as the "
+        "monthly transfer a partner makes. Nothing is copied: the real "
+        "transaction becomes the contribution, and its amount, currency, "
+        "date and side are all read off it. A debit is the payer's side "
+        "(the money left that account's owner) and a credit the "
+        "receiver's, so `member_id` is always the member on the OTHER "
+        "side — call `list_groups` for the ids. Refused when the "
+        "transaction is already part of a contribution or carries group "
+        "shares. Marked contributions leave income and spending for both "
+        "members while still moving the account balance."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "string", "format": "uuid"},
+            "transaction_id": {"type": "string", "format": "uuid"},
+            "member_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "The member on the other side of the transaction.",
+            },
+            "notes": {"type": "string"},
+            "apply": _APPLY_FIELD,
+        },
+        "required": ["group_id", "transaction_id", "member_id"],
+        "additionalProperties": False,
+    },
+    is_proposal=True,
+    tags=["propose", "groups"],
+)
+async def propose_mark_contribution(
+    *,
+    session: AsyncSession,
+    ctx: CallContext,
+    group_id: str,
+    transaction_id: str,
+    member_id: str,
+    notes: str | None = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    ws_id = await resolve_workspace_id(session, ctx)
+    gid, tx_id, mid = (
+        parse_uuid(group_id),
+        parse_uuid(transaction_id),
+        parse_uuid(member_id),
+    )
+    if gid is None or tx_id is None or mid is None:
+        return {"error": "group_id, transaction_id and member_id must be uuids"}
+
+    group = await group_service.get_group_visible(session, gid, ws_id, ctx.user_id)
+    if group is None:
+        return {"error": "group not found or not visible to this user"}
+
+    tx = (
+        await session.execute(
+            select(Transaction).where(
+                Transaction.id == tx_id, Transaction.workspace_id == ws_id
+            )
+        )
+    ).scalar_one_or_none()
+    if tx is None:
+        return {"error": "transaction not found"}
+
+    payload = MarkContributionFromTransaction(
+        transaction_id=tx_id, member_id=mid, notes=notes
+    )
+
+    # The preview runs exactly the decisions and refusals the write runs,
+    # so a proposal cannot promise something the user's Apply would turn
+    # down, and cannot name a date or a side the write would not store.
+    try:
+        plan = await settlement_service.plan_contribution_from_transaction(
+            session, gid, ws_id, ctx.user_id, payload
+        )
+    except PermissionError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if plan is None:
+        return {"error": "group not found or not visible to this user"}
+
+    names = {
+        row.id: row.name
+        for row in (
+            await session.execute(
+                select(GroupMember.id, GroupMember.name).where(
+                    GroupMember.id.in_([plan.from_member_id, plan.to_member_id])
+                )
+            )
+        ).all()
+    }
+
+    preview = {
+        "kind": "mark_contribution",
+        "proposed": {
+            "group_id": str(gid),
+            "group_name": group.name,
+            "transaction_id": str(tx.id),
+            "description": tx.description,
+            "amount": num(plan.amount),
+            "currency": plan.currency,
+            # The date the contribution will carry. Creating takes the
+            # date the rest of the app buckets this transaction by, which
+            # is not always the transaction's own; attaching keeps the
+            # date the contribution already has.
+            "date": (plan.existing_date or plan.date).isoformat(),
+            "side": plan.side,
+            "from_member_id": str(plan.from_member_id),
+            "from_member_name": names.get(plan.from_member_id),
+            "to_member_id": str(plan.to_member_id),
+            "to_member_name": names.get(plan.to_member_id),
+            "member_id": str(plan.member_id),
+            "member_name": names.get(
+                plan.to_member_id if plan.side == "payer" else plan.from_member_id
+            ),
+            # Attaching fills the notes only when the contribution has
+            # none, so this is what it will read afterwards either way.
+            "notes": plan.existing_notes if plan.existing_settlement_id else notes,
+        },
+        # "create" writes a new contribution; "attach" hangs this
+        # transaction off the one the other leg of the same transfer
+        # already made, so one transfer stays one contribution.
+        "outcome": "attach" if plan.existing_settlement_id else "create",
+        "existing_settlement_id": (
+            str(plan.existing_settlement_id) if plan.existing_settlement_id else None
+        ),
+        "apply_endpoint": f"POST /api/groups/{gid}/settlements/from-transaction",
+    }
+
+    if _can_apply(ctx, apply):
+        try:
+            created = await settlement_service.mark_transaction_as_contribution(
+                session, gid, ws_id, ctx.user_id, payload
+            )
+        except PermissionError as exc:
+            return {**preview, "error": str(exc)}
+        except ValueError as exc:
+            return {**preview, "error": str(exc)}
+        if created is None:
+            return {**preview, "error": "group not found or not visible to this user"}
+        return {**preview, "applied": True, "id": str(created.id)}
+
+    return preview
+
+
+@tool(
+    name="propose_share_transaction",
+    description=_PROPOSAL_PREFACE
+    + (
+        "Build a preview for sharing an existing transaction in an "
+        "expense-sharing group — putting it in the common pot, where "
+        "every member carries their part of it. The distribution is "
+        "`equal` between the members given, or `percent` with a "
+        "`share_pct` per member summing to 100; `exact` takes a "
+        "`share_amount` per member summing to the transaction's amount. "
+        "Call `list_groups` for the member ids. Refused for a "
+        "transaction that is already a contribution, since money put "
+        "into the pot cannot also be money the pot spent. Sharing a "
+        "transaction 100 % on the member who paid it is how a personal "
+        "purchase is taken out of the pot: it moves no position and "
+        "rules leave it alone afterwards."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "string", "format": "uuid"},
+            "transaction_id": {"type": "string", "format": "uuid"},
+            "share_type": {
+                "type": "string",
+                "enum": ["equal", "percent", "exact"],
+                "default": "equal",
+            },
+            "splits": {
+                "type": "array",
+                "description": (
+                    "One entry per member: {group_member_id, share_pct?, "
+                    "share_amount?}. Defaults to every member of the group, "
+                    "shared equally."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "group_member_id": {"type": "string", "format": "uuid"},
+                        "share_pct": {"type": "number"},
+                        "share_amount": {"type": "number"},
+                    },
+                    "required": ["group_member_id"],
+                    "additionalProperties": False,
+                },
+            },
+            "apply": _APPLY_FIELD,
+        },
+        "required": ["group_id", "transaction_id"],
+        "additionalProperties": False,
+    },
+    is_proposal=True,
+    tags=["propose", "groups"],
+)
+async def propose_share_transaction(
+    *,
+    session: AsyncSession,
+    ctx: CallContext,
+    group_id: str,
+    transaction_id: str,
+    share_type: str = "equal",
+    splits: list[dict[str, Any]] | None = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    from app.services import split_service
+
+    ws_id = await resolve_workspace_id(session, ctx)
+    gid, tx_id = parse_uuid(group_id), parse_uuid(transaction_id)
+    if gid is None or tx_id is None:
+        return {"error": "group_id and transaction_id must be uuids"}
+
+    group = await group_service.get_group_visible(session, gid, ws_id, ctx.user_id)
+    if group is None:
+        return {"error": "group not found or not visible to this user"}
+
+    tx = (
+        await session.execute(
+            select(Transaction).where(
+                Transaction.id == tx_id, Transaction.workspace_id == ws_id
+            )
+        )
+    ).scalar_one_or_none()
+    if tx is None:
+        return {"error": "transaction not found"}
+
+    members = (
+        await session.execute(
+            select(GroupMember).where(GroupMember.group_id == gid)
+        )
+    ).scalars().all()
+    if not members:
+        return {"error": "group has no members"}
+    names = {m.id: m.name for m in members}
+
+    # Every refusal the write would make, made here as well: a preview
+    # that promised shares the Apply button then turned down would be
+    # worse than no preview.
+    if await settlement_service.is_contribution_link(session, tx.id):
+        return {
+            "error": (
+                "A transaction linked to a contribution cannot be shared in a group"
+            )
+        }
+
+    entries = splits or [{"group_member_id": str(m.id)} for m in members]
+    try:
+        payload = TransactionSplitsInput.model_validate(
+            {"share_type": share_type, "splits": entries}
+        )
+        # Materializing here is what makes the preview honest: the same
+        # rounding the write would do, and the same refusal when the
+        # percentages or the amounts do not add up.
+        materialized = split_service._materialize(tx.amount, payload)
+    except (ValueError, TypeError) as exc:
+        return {"error": str(exc)}
+
+    member_ids = {m.id for m in members}
+    strangers = [
+        entry.group_member_id
+        for entry in payload.splits
+        if entry.group_member_id not in member_ids
+    ]
+    if strangers:
+        return {"error": "One or more split members not found"}
+
+    preview = {
+        "kind": "share_transaction",
+        "proposed": {
+            "group_id": str(gid),
+            "group_name": group.name,
+            "transaction_id": str(tx.id),
+            "description": tx.description,
+            "amount": num(tx.amount),
+            "currency": tx.currency,
+            "share_type": share_type,
+            "shares": [
+                {
+                    "group_member_id": str(member_id),
+                    "member_name": names.get(member_id),
+                    "share_amount": num(amount),
+                }
+                for member_id, amount, _pct in materialized
+            ],
+        },
+        "apply_endpoint": f"PATCH /api/transactions/{tx.id}",
+    }
+
+    if not _can_apply(ctx, apply):
+        return preview
+
+    try:
+        await split_service.replace_splits(session, tx, payload, ctx.user_id)
+    except ValueError as exc:
+        return {**preview, "error": str(exc)}
+    await session.commit()
+    return {**preview, "applied": True, "id": str(tx.id)}
 
 
 def _today():

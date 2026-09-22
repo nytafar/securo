@@ -8,20 +8,26 @@ from sqlalchemy.orm import load_only
 
 from app.models.rule import Rule
 from app.models.category import Category
+from app.models.group import Group, GroupMember
 from app.models.payee import Payee
 from app.models.transaction import Transaction
+from app.models.transaction_split import TransactionSplit
 
 from app.schemas.rule import (
     RuleCreate,
     RuleExportPayload,
     RuleImportResponse,
+    RulePreviewContribution,
     RulePreviewItem,
     RulePreviewResponse,
+    RulePreviewShare,
+    RulePreviewShareLine,
     RuleUpdate,
 )
 
 from app.services.category_service import get_hidden_category_ids
 
+from app.services import rule_effects, rule_engine
 from app.services.rule_engine import (
     apply_rule_actions,
     compile_rule_regex,
@@ -45,6 +51,7 @@ _ALLOWED_CONDITION_OPS = {
 }
 _ALLOWED_ACTION_OPS = {
     "set_category", "set_payee", "set_description", "append_notes", "ignore",
+    "share_in_group", "mark_as_contribution",
 }
 
 
@@ -74,7 +81,10 @@ async def _validate_rule_definition(
     workspace_id: uuid.UUID,
     conditions: list,
     actions: list,
+    author_id: Optional[uuid.UUID] = None,
 ) -> None:
+    """`author_id` is the rule's own author: a group action is written as
+    them, so the group has to be one they own or are a member of."""
     for condition in _flatten_conditions(conditions):
         field = _rule_item_value(condition, "field")
         op = _rule_item_value(condition, "op")
@@ -119,6 +129,10 @@ async def _validate_rule_definition(
                 raise ValueError("Description cannot be blank")
             if len(value.strip()) > 500:
                 raise ValueError("Description cannot exceed 500 characters")
+        elif op in rule_engine.GROUP_ACTION_OPS:
+            await rule_effects.validate_action(
+                session, workspace_id, op, value, author_id
+            )
 
 
 # ─── Universal rules (work for any language/country) ───
@@ -988,6 +1002,7 @@ async def import_rules(
                 workspace_id,
                 [condition.model_dump() for condition in incoming.conditions],
                 resolved_actions,
+                author_id=user_id,
             )
         except ValueError:
             skipped += 1
@@ -1033,7 +1048,9 @@ async def create_rule(
     if data.name in existing_names:
         raise DuplicateRuleError(f"A rule named '{data.name}' already exists")
 
-    await _validate_rule_definition(session, workspace_id, data.conditions, data.actions)
+    await _validate_rule_definition(
+        session, workspace_id, data.conditions, data.actions, author_id=user_id
+    )
 
     rule = Rule(
         user_id=user_id,
@@ -1078,6 +1095,9 @@ async def update_rule(
         workspace_id,
         update_data.get("conditions", rule.conditions or []),
         update_data.get("actions", rule.actions or []),
+        # The rule's own author, not whoever is editing it: the author is
+        # who its effects are written as.
+        author_id=rule.user_id,
     )
 
     for key, value in update_data.items():
@@ -1174,14 +1194,21 @@ async def preview_rules_for_transaction(
     user_id: uuid.UUID,
     transaction: Transaction,
     skip_category_rules: bool = False,
+    effects: Optional[list] = None,
 ) -> Transaction:
-    """Apply active rules to a detached preview and return it without persistence."""
+    """Apply active rules to a detached preview and return it without persistence.
+
+    Pass `effects` to collect the group effects the rules plan — shares and
+    contributions — so the caller can carry them onto whichever row ends up
+    surviving. Nothing is written either way.
+    """
     preview = _rule_preview(transaction)
     await apply_rules_to_transaction(
         session,
         user_id,
         preview,
         skip_category_rules=skip_category_rules,
+        effects=effects,
     )
     return preview
 
@@ -1189,6 +1216,7 @@ async def preview_rules_for_transaction(
 async def apply_rules_to_transaction(
     session: AsyncSession, user_id: uuid.UUID, transaction: Transaction,
     skip_category_rules: bool = False,
+    effects: Optional[list] = None,
 ) -> None:
     """Apply all active rules to a transaction, modifying it in-place. Commits nothing.
 
@@ -1196,6 +1224,13 @@ async def apply_rules_to_transaction(
     haven't been migrated to pass workspace_id directly; rules are scoped by
     workspace via the transaction's own workspace_id when available, falling
     back to the legacy user filter so historical rows still match.
+
+    Group actions — sharing in a group, marking a contribution — are not
+    fields on the transaction. Hand in an `effects` list and they are
+    planned into it for you to persist; leave it out and they are
+    persisted here, inside the caller's database transaction, which is
+    what a detached preview must not do and what every other caller
+    wants.
     """
     rule_filter = Rule.user_id == user_id
     if getattr(transaction, "workspace_id", None) is not None:
@@ -1214,6 +1249,8 @@ async def apply_rules_to_transaction(
         else set()
     )
 
+    planned: list = [] if effects is None else effects
+    before_rules = rule_effects.snapshot_rule_fields(transaction)
     for rule in rules:
         conditions = rule.conditions or []
         actions = rule.actions or []
@@ -1223,23 +1260,28 @@ async def apply_rules_to_transaction(
                 transaction,
                 category_set,
                 hidden_category_ids=hidden_categories,
+                effects=planned,
+                rule_id=rule.id,
+                rule_author_id=rule.user_id,
             )
+
+    if effects is None and planned:
+        await rule_effects.apply_planned_effects(
+            session, transaction, planned, user_id, restore_to=before_rules
+        )
 
 
 def _rule_effect_state(tx: Transaction) -> tuple:
-    """Everything rule actions can write, for a before/after comparison.
+    """Everything rule actions can write on the transaction itself, for a
+    before/after comparison.
 
     Mirrors the tuple `apply_single_rule` compares, so a preview counts a
-    transaction as changed exactly when saving the rule would change it.
+    transaction as changed exactly when saving the rule would change it,
+    and shares its field list with the snapshot a failing group effect is
+    restored from.
     """
-    return (
-        tx.category_id,
-        tx.payee_id,
-        tx.description,
-        tx.original_description,
-        tx.description_is_rule_managed,
-        tx.notes,
-        tx.is_ignored,
+    return tuple(
+        getattr(tx, field_name) for field_name in rule_effects.RULE_MANAGED_FIELDS
     )
 
 
@@ -1254,6 +1296,7 @@ async def preview_rule(
     overwrite_existing_categories: bool = False,
     limit: int = 20,
     offset: int = 0,
+    user_id: Optional[uuid.UUID] = None,
 ) -> RulePreviewResponse:
     """Report which existing transactions an unsaved rule would match.
 
@@ -1271,9 +1314,20 @@ async def preview_rule(
     With either off, the matches are still listed — they are what the
     conditions select, which is worth seeing — but nothing is reported as
     changing, because saving would change nothing.
+
+    Group actions are reported too, and nothing is written for them
+    either: `will_share` and `will_mark_contribution` count every match
+    the rule would really act on, and each row in the window carries the
+    shares or the contribution it would get — planned by the same
+    services that would write them, so the preview cannot promise what
+    the save would refuse. `user_id` is the viewer; without one, a
+    contribution's details are left out of the window while the counts
+    still stand.
     """
     will_apply = is_active and apply_to_existing
-    await _validate_rule_definition(session, workspace_id, conditions, actions or [])
+    await _validate_rule_definition(
+        session, workspace_id, conditions, actions or [], author_id=user_id
+    )
 
     # Every transaction is evaluated in Python, so only the columns the engine
     # reads and `_rule_preview` copies are worth fetching — notably not
@@ -1305,6 +1359,11 @@ async def preview_rule(
     matched = 0
     changed = 0
     sample: list[RulePreviewItem] = []
+    # Every match the group actions would act on, and the rows the window
+    # shows, so the details can be planned in one pass afterwards rather
+    # than a round of queries per transaction inside the loop.
+    planned_by_tx: dict[uuid.UUID, list] = {}
+    window_txs: dict[uuid.UUID, Transaction] = {}
 
     for tx in transactions:
         matches = evaluate_conditions(conditions_op, conditions or [], tx)
@@ -1321,6 +1380,7 @@ async def preview_rule(
         # simply mirrors what the transaction already has.
         draft = _rule_preview(tx)
         will_change = False
+        planned: list = []
         if will_apply:
             before = _rule_effect_state(draft)
             apply_rule_actions(
@@ -1329,13 +1389,17 @@ async def preview_rule(
                 category_already_set=tx.category_id is not None
                 and not overwrite_existing_categories,
                 skip_description=_has_manual_description(tx),
+                effects=planned,
             )
             will_change = _rule_effect_state(draft) != before
             if will_change:
                 changed += 1
+        if planned:
+            planned_by_tx[tx.id] = planned
         # `matched` has just counted this row, so `matched - 1` is its index
         # in the match list the window is cut from.
         if offset <= matched - 1 < offset + limit:
+            window_txs[tx.id] = tx
             sample.append(
                 RulePreviewItem(
                     id=tx.id,
@@ -1352,13 +1416,209 @@ async def preview_rule(
                 )
             )
 
+    will_share, will_mark = await _preview_group_effects(
+        session,
+        workspace_id,
+        planned_by_tx,
+        window_txs,
+        sample,
+        user_id,
+    )
+
     return RulePreviewResponse(
         matched=matched,
         will_change=changed,
         will_apply=will_apply,
+        will_share=will_share,
+        will_mark_contribution=will_mark,
         sample=sample,
         offset=offset,
     )
+
+
+async def _preview_group_effects(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    planned_by_tx: dict[uuid.UUID, list],
+    window_txs: dict[uuid.UUID, Transaction],
+    sample: list[RulePreviewItem],
+    user_id: Optional[uuid.UUID],
+) -> tuple[int, int]:
+    """Count the shares and contributions a draft would really write, and
+    describe the ones inside the window. Writes nothing.
+
+    The counts use the two guards that decide idempotence — a row that
+    already carries shares is not shared again, and a row that is already
+    a contribution is neither shared nor marked — because those are what
+    a second run of the same rule runs into. The window's rows go through
+    the marking planner itself, which is where the rest of the reasons
+    live.
+    """
+    from app.services._query_filters import contribution_linked_ids
+    from app.services.rule_effects import PlannedContribution, PlannedShare
+
+    if not planned_by_tx:
+        return 0, 0
+
+    ids = list(planned_by_tx)
+    shared_rows = await session.execute(
+        select(TransactionSplit.transaction_id)
+        .where(TransactionSplit.transaction_id.in_(ids))
+        .distinct()
+    )
+    shared_ids = {row[0] for row in shared_rows.all()}
+    linked_ids = await contribution_linked_ids(session, ids)
+
+    group_ids = {
+        effect.group_id for effects in planned_by_tx.values() for effect in effects
+    }
+    group_names = {
+        row.id: row.name
+        for row in (
+            await session.execute(
+                select(Group.id, Group.name).where(Group.id.in_(list(group_ids)))
+            )
+        ).all()
+    }
+    member_names = {
+        row.id: row.name
+        for row in (
+            await session.execute(
+                select(GroupMember.id, GroupMember.name).where(
+                    GroupMember.group_id.in_(list(group_ids))
+                )
+            )
+        ).all()
+    }
+
+    will_share = 0
+    will_mark = 0
+    items = {item.id: item for item in sample}
+
+    for tx_id, effects in planned_by_tx.items():
+        item = items.get(tx_id)
+        already_shared = tx_id in shared_ids
+        already_linked = tx_id in linked_ids
+        for effect in effects:
+            if isinstance(effect, PlannedShare):
+                if already_shared:
+                    if item:
+                        item.skipped_effects.append(
+                            "This transaction already carries shares"
+                        )
+                    continue
+                if already_linked:
+                    if item:
+                        item.skipped_effects.append(
+                            "This transaction is a contribution, so it cannot "
+                            "also be shared"
+                        )
+                    continue
+                will_share += 1
+                if item and tx_id in window_txs:
+                    item.planned_share = _preview_share(
+                        effect, window_txs[tx_id], group_names, member_names
+                    )
+            elif isinstance(effect, PlannedContribution):
+                if already_linked or already_shared:
+                    if item:
+                        item.skipped_effects.append(
+                            "This transaction is already a contribution"
+                            if already_linked
+                            else "A transaction that is shared in a group cannot "
+                            "also be a contribution"
+                        )
+                    continue
+                if item is not None and user_id is not None:
+                    # A row in the window is planned in full, so what it
+                    # says and what it is counted as cannot disagree.
+                    if await _preview_contribution(
+                        session,
+                        effect,
+                        window_txs[tx_id],
+                        workspace_id,
+                        user_id,
+                        item,
+                        group_names,
+                        member_names,
+                    ):
+                        will_mark += 1
+                else:
+                    will_mark += 1
+
+    return will_share, will_mark
+
+
+def _preview_share(
+    effect,
+    tx: Transaction,
+    group_names: dict,
+    member_names: dict,
+) -> RulePreviewShare:
+    from app.services.split_service import _materialize
+
+    return RulePreviewShare(
+        group_id=effect.group_id,
+        group_name=group_names.get(effect.group_id),
+        share_type=effect.share_type,
+        shares=[
+            RulePreviewShareLine(
+                group_member_id=member_id,
+                member_name=member_names.get(member_id),
+                amount=float(amount),
+            )
+            for member_id, amount, _pct in _materialize(tx.amount, effect.payload())
+        ],
+    )
+
+
+async def _preview_contribution(
+    session: AsyncSession,
+    effect,
+    tx: Transaction,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    item: RulePreviewItem,
+    group_names: dict,
+    member_names: dict,
+) -> bool:
+    """Describe the contribution this row would become. True when there
+    would be one; the reason why not is left on the item when there
+    would not."""
+    from app.schemas.group_settlement import MarkContributionFromTransaction
+    from app.services import settlement_service
+
+    try:
+        plan = await settlement_service.plan_contribution_from_transaction(
+            session,
+            effect.group_id,
+            workspace_id,
+            user_id,
+            MarkContributionFromTransaction(
+                transaction_id=tx.id, member_id=effect.member_id
+            ),
+        )
+    except (ValueError, PermissionError) as exc:
+        item.skipped_effects.append(str(exc))
+        return False
+    if plan is None:
+        item.skipped_effects.append("Group not found or not visible to this user")
+        return False
+
+    item.planned_contribution = RulePreviewContribution(
+        group_id=effect.group_id,
+        group_name=group_names.get(effect.group_id),
+        from_member_id=plan.from_member_id,
+        from_member_name=member_names.get(plan.from_member_id),
+        to_member_id=plan.to_member_id,
+        to_member_name=member_names.get(plan.to_member_id),
+        amount=float(plan.amount),
+        currency=plan.currency,
+        date=plan.existing_date or plan.date,
+        side=plan.side,
+        outcome="attach" if plan.existing_settlement_id else "create",
+    )
+    return True
 
 
 async def apply_single_rule(
@@ -1404,15 +1664,8 @@ async def apply_single_rule(
         if not matches:
             continue
 
-        before = (
-            tx.category_id,
-            tx.payee_id,
-            tx.description,
-            tx.original_description,
-            tx.description_is_rule_managed,
-            tx.notes,
-            tx.is_ignored,
-        )
+        before = _rule_effect_state(tx)
+        planned: list = []
         apply_rule_actions(
             actions,
             tx,
@@ -1420,17 +1673,18 @@ async def apply_single_rule(
             and not overwrite_existing_categories,
             skip_description=_has_manual_description(tx),
             hidden_category_ids=hidden_categories,
+            effects=planned,
+            rule_id=rule.id,
+            rule_author_id=rule.user_id,
         )
-        after = (
-            tx.category_id,
-            tx.payee_id,
-            tx.description,
-            tx.original_description,
-            tx.description_is_rule_managed,
-            tx.notes,
-            tx.is_ignored,
+        report = await rule_effects.apply_planned_effects(
+            session,
+            tx,
+            planned,
+            rule.user_id,
+            restore_to=dict(zip(rule_effects.RULE_MANAGED_FIELDS, before)),
         )
-        if before != after:
+        if _rule_effect_state(tx) != before or report.wrote_anything:
             count += 1
 
     await session.commit()
@@ -1458,21 +1712,15 @@ async def apply_all_rules(session: AsyncSession, workspace_id: uuid.UUID) -> int
     count = 0
     for tx in transactions:
         preserve_manual_description = _has_manual_description(tx)
-        before = (
-            tx.category_id,
-            tx.payee_id,
-            tx.description,
-            tx.original_description,
-            tx.description_is_rule_managed,
-            tx.notes,
-            tx.is_ignored,
-        )
+        before = _rule_effect_state(tx)
         if tx.description_is_rule_managed:
             if tx.original_description is not None:
                 tx.description = tx.original_description
             tx.description_is_rule_managed = False
         matched = False
         category_set = False
+        planned: list = []
+        acting_user_id = None
         for rule in rules:
             conditions = rule.conditions or []
             actions = rule.actions or []
@@ -1481,23 +1729,39 @@ async def apply_all_rules(session: AsyncSession, workspace_id: uuid.UUID) -> int
                     tx.category_id = None
                     tx.notes = None
                     matched = True
+                if acting_user_id is None:
+                    acting_user_id = rule.user_id
                 category_set = apply_rule_actions(
                     actions,
                     tx,
                     category_set,
                     skip_description=preserve_manual_description,
                     hidden_category_ids=hidden_categories,
+                    effects=planned,
+                    rule_id=rule.id,
+                    rule_author_id=rule.user_id,
                 )
 
-        after = (
-            tx.category_id,
-            tx.payee_id,
-            tx.description,
-            tx.original_description,
-            tx.description_is_rule_managed,
-            tx.notes,
-            tx.is_ignored,
-        )
+        # Shares and contributions are not reset the way a category is:
+        # the reset exists so rules can be reapplied from scratch, and
+        # throwing away a distribution set by hand — or a contribution
+        # made of a real bank row — is not reapplying a rule, it is
+        # losing a fact. Sharing by rule therefore skips a transaction
+        # that already carries shares here too.
+        #
+        # Each effect is written as the author of the rule that planned
+        # it, so a run that matches two people's rules attributes each to
+        # its own; `acting_user_id` is only the fallback.
+        if planned and acting_user_id is not None:
+            await rule_effects.apply_planned_effects(
+                session,
+                tx,
+                planned,
+                acting_user_id,
+                restore_to=dict(zip(rule_effects.RULE_MANAGED_FIELDS, before)),
+            )
+
+        after = _rule_effect_state(tx)
         if matched or before != after:
             count += 1
 

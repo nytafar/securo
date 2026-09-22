@@ -1234,7 +1234,16 @@
       "rules": "Regole",
       "queue": "In attesa di te",
       "history": "Cronologia"
-    }
+    },
+    "shareInGroup": "Dividi nel gruppo",
+    "shareInGroupHint": "(ogni corrispondenza entra nella cassa comune del gruppo — anche un giroconto tra i tuoi conti, quindi escludili nelle condizioni)",
+    "markAsContribution": "Segna come contributo",
+    "markAsContributionHint": "(la transazione stessa è il contributo)",
+    "selectGroup": "Seleziona gruppo...",
+    "contributionMember": "Altro membro",
+    "contributionMemberHint": "Il membro dall'altro lato: per il denaro arrivato sul tuo conto, chi lo ha inviato.",
+    "previewShared": "{{shared}} verrebbero divise in un gruppo",
+    "previewContributions": "{{contributions}} diventerebbero contributi"
   },
   "categories": {
     "title": "Categorie",
