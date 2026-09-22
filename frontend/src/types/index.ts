@@ -352,7 +352,16 @@ export type TransactionEditPayload = Omit<Partial<Transaction>, 'splits'> & {
   splits?: TransactionSplitsInput | null
 }
 
-export type GroupKind = 'social' | 'cost_center' | 'project' | 'client' | 'other'
+// `household` is a common pot read over periods: the group page opens on
+// the current month and calls its transfers contributions. The other
+// kinds open on the running position and call them settlements.
+export type GroupKind =
+  | 'social'
+  | 'household'
+  | 'cost_center'
+  | 'project'
+  | 'client'
+  | 'other'
 
 export interface Group {
   id: string
@@ -408,6 +417,126 @@ export interface GroupBalances {
   self_member_id: string | null
   default_currency: string
   lines: GroupBalanceLine[]
+}
+
+/* The group's common pot over a half-open range [start, end). Every
+ * figure on the group page comes from here, already aggregated over the
+ * whole period — never from the page of transactions below it. Amounts
+ * arrive as JSON numbers; a debit counts positive and shared income
+ * negative, so a positive position means the member should still put
+ * money into the pot and a negative one that the pot owes them. */
+
+export interface GroupPeriodMember {
+  id: string
+  name: string
+  /** The member standing for the group's owner; the same for every viewer. */
+  is_owner_member: boolean
+}
+
+export interface GroupMemberPosition {
+  member_id: string
+  currency: string
+  paid: number
+  share: number
+  contributions_made: number
+  contributions_received: number
+  period_position: number
+  /** The running position just before the period starts. */
+  backlog: number
+  running_position: number
+  /** Display only: never added up across currencies for a transfer. */
+  period_position_in_default_currency: number
+  running_position_in_default_currency: number
+}
+
+export interface GroupSuggestedTransfer {
+  from_member_id: string
+  to_member_id: string
+  currency: string
+  amount: number
+}
+
+export interface GroupMemberShare {
+  member_id: string
+  amount: number
+}
+
+export interface GroupCategoryLine {
+  category_id: string | null
+  category_name: string | null
+  currency: string
+  /** A magnitude: the cost in `costs`, the income in `shared_income`. */
+  total: number
+  shares: GroupMemberShare[]
+}
+
+export interface GroupPeriodTotal {
+  currency: string
+  costs: number
+  shared_income: number
+  /** costs − shared_income, netted on the server. */
+  net: number
+  shares: GroupMemberShare[]
+}
+
+export interface GroupPeriodContribution {
+  id: string
+  from_member_id: string
+  to_member_id: string
+  amount: number
+  currency: string
+  date: string
+  transaction_id: string | null
+  receiver_transaction_id: string | null
+  notes: string | null
+}
+
+export interface GroupPeriodTransaction {
+  id: string
+  /** The reporting date that decides the period. */
+  date: string
+  booked_date: string
+  description: string
+  type: string
+  amount: number
+  currency: string
+  category_id: string | null
+  category_name: string | null
+  account_id: string
+  account_name: string | null
+  payer_member_id: string | null
+  payer_assumed: boolean
+  /** Signed sum of the shares: what the payer is credited with. */
+  shared_total: number
+  shares: GroupMemberShare[]
+}
+
+export interface GroupPeriodTransactionPage {
+  items: GroupPeriodTransaction[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface GroupPeriod {
+  group_id: string
+  kind: GroupKind
+  default_currency: string
+  start: string | null
+  end: string | null
+  owner_member_id: string | null
+  members: GroupPeriodMember[]
+  positions: GroupMemberPosition[]
+  /** Settles the period alone. */
+  transfers_period: GroupSuggestedTransfer[]
+  /** Settles the period and the backlog. */
+  transfers_running: GroupSuggestedTransfer[]
+  costs: GroupCategoryLine[]
+  shared_income: GroupCategoryLine[]
+  totals: GroupPeriodTotal[]
+  contributions: GroupPeriodContribution[]
+  payer_assumed_transactions: GroupPeriodTransaction[]
+  transactions: GroupPeriodTransactionPage
 }
 
 /** A fiscal document belonging to a payee. `kind` mirrors the backend's

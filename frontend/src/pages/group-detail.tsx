@@ -1,29 +1,30 @@
+/**
+ * The group page as a common pot.
+ *
+ * Every figure here comes from `GET /api/groups/{id}/period`, which
+ * aggregates over the whole period on the server. Nothing is added up
+ * from the transaction rows the page happens to have loaded: that is
+ * what made the old totals, trend and category breakdown wrong once a
+ * group had more than the twenty transactions they were computed from.
+ */
 import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useDisplayLocale, useDateLocale } from '@/hooks/use-display-locale'
 import { getAccountName, sortAccountsByDisplayName } from '@/lib/account-utils'
 import { useNavigate, useParams } from 'react-router-dom'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
+  AlertTriangle,
   ArrowLeft,
   ArrowRight,
-  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Link2,
   Receipt,
-  TrendingDown,
-  TrendingUp,
   Trash2,
   UserPlus,
-  Wallet,
 } from 'lucide-react'
-import {
-  Bar,
-  BarChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-} from 'recharts'
 
 import {
   groups as groupsApi,
@@ -33,6 +34,21 @@ import {
   type GroupSettlementPayload,
 } from '@/lib/api'
 import { localDateString } from '@/lib/date-utils'
+import {
+  catchUpMonths,
+  exclusiveEnd,
+  inclusiveEnd,
+  keepInOrder,
+  monthLabel,
+  monthOf,
+  monthRange,
+  presetRange,
+  shiftMonth,
+  PERIOD_PRESETS,
+  type CalendarMonth,
+  type PeriodPreset,
+  type PeriodRange,
+} from '@/lib/group-period'
 import { MemberForm } from '@/components/member-form'
 import { useAuth } from '@/contexts/auth-context'
 import { useWorkspace } from '@/contexts/workspace-context'
@@ -47,11 +63,23 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { CategoryIcon } from '@/components/category-icon'
 import { DatePickerInput } from '@/components/ui/date-picker-input'
 import { PageHeader } from '@/components/page-header'
-import type { GroupMember, GroupSettlement, Transaction } from '@/types'
+import type {
+  GroupMember,
+  GroupMemberShare,
+  GroupSuggestedTransfer,
+  Transaction,
+} from '@/types'
 import { formatCurrency } from '@/lib/format'
+
+/** The transaction list is paged on the server; the figures above it are not. */
+const PAGE_SIZE = 25
+
+/** What the period picker is set to. A month is its own mode: the month
+ *  picker holds which one, and the year, all time and custom ranges sit
+ *  beside it. */
+type RangeMode = 'month' | 'thisYear' | 'allTime' | 'custom'
 
 function SectionCard({ children }: { children: React.ReactNode }) {
   return (
@@ -83,72 +111,68 @@ function SectionHeader({
   )
 }
 
-interface KpiBreakdownItem {
-  name: string
-  amountText: string
+function shareOf(shares: GroupMemberShare[], memberId: string): number {
+  return Number(shares.find((s) => s.member_id === memberId)?.amount ?? 0)
 }
 
-function KpiCard({
-  label,
-  value,
-  icon: Icon,
-  tone,
-  breakdown,
+/** A suggested transfer reads in the direction money moves, so a backlog
+ *  in a member's favour shows as the others paying them. */
+function TransferList({
+  transfers,
+  loaded,
+  nameOf,
+  locale,
+  emptyLabel,
+  actionLabel,
+  onPick,
 }: {
-  label: string
-  value: string
-  icon: React.ComponentType<{ size?: number; className?: string }>
-  tone?: 'positive' | 'negative' | 'neutral'
-  breakdown?: KpiBreakdownItem[]
+  transfers: GroupSuggestedTransfer[]
+  /** False until a period has actually been read: an empty list is only
+   *  "nothing to move" once we know the period is empty. */
+  loaded: boolean
+  nameOf: (memberId: string | null) => string
+  locale: string
+  emptyLabel: string
+  actionLabel?: string
+  onPick?: (transfer: GroupSuggestedTransfer) => void
 }) {
-  const [open, setOpen] = useState(false)
-  const toneClass =
-    tone === 'positive'
-      ? 'text-emerald-600'
-      : tone === 'negative'
-        ? 'text-rose-500'
-        : 'text-foreground'
-  const hasBreakdown = !!breakdown && breakdown.length > 0
+  if (!loaded) {
+    return (
+      <div className="p-4 space-y-2">
+        <Skeleton className="h-8 w-full" />
+      </div>
+    )
+  }
+  if (transfers.length === 0) {
+    return (
+      <div className="text-center py-6 text-muted-foreground text-sm">{emptyLabel}</div>
+    )
+  }
   return (
-    <div className="bg-card rounded-xl border border-border shadow-sm p-3 sm:p-4">
-      <button
-        type="button"
-        className={`w-full text-left ${hasBreakdown ? 'cursor-pointer' : 'cursor-default'}`}
-        onClick={() => hasBreakdown && setOpen((o) => !o)}
-        disabled={!hasBreakdown}
-        aria-expanded={open}
-      >
-        <div className="flex items-center justify-between">
-          <p className="text-[10px] sm:text-xs font-medium text-muted-foreground uppercase tracking-wide">
-            {label}
-          </p>
-          <div className="flex items-center gap-1 text-muted-foreground">
-            {hasBreakdown && (
-              <ChevronDown
-                size={14}
-                className={`transition-transform ${open ? 'rotate-180' : ''}`}
-              />
-            )}
-            <Icon size={14} />
+    <ul className="divide-y divide-border">
+      {transfers.map((transfer, index) => (
+        <li
+          key={`${transfer.from_member_id}-${transfer.to_member_id}-${transfer.currency}-${index}`}
+          className="flex items-center justify-between gap-3 px-4 py-3"
+        >
+          <div className="text-sm flex items-center gap-1.5 min-w-0">
+            <span className="font-medium truncate">{nameOf(transfer.from_member_id)}</span>
+            <ArrowRight size={12} className="text-muted-foreground shrink-0" />
+            <span className="font-medium truncate">{nameOf(transfer.to_member_id)}</span>
           </div>
-        </div>
-        <p className={`text-base sm:text-2xl font-bold tabular-nums mt-1 ${toneClass}`}>
-          {value}
-        </p>
-      </button>
-      {open && hasBreakdown && (
-        <ul className="mt-2 pt-2 border-t border-border space-y-1 text-xs text-muted-foreground">
-          {breakdown!.map((b, i) => (
-            <li key={i} className="flex justify-between gap-2">
-              <span className="truncate">{b.name}</span>
-              <span className="tabular-nums whitespace-nowrap text-foreground">
-                {b.amountText}
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
+          <div className="flex items-center gap-3">
+            <span className="text-sm font-semibold tabular-nums whitespace-nowrap">
+              {formatCurrency(Number(transfer.amount), transfer.currency, locale)}
+            </span>
+            {actionLabel && onPick && (
+              <Button variant="outline" size="sm" onClick={() => onPick(transfer)}>
+                {actionLabel}
+              </Button>
+            )}
+          </div>
+        </li>
+      ))}
+    </ul>
   )
 }
 
@@ -171,34 +195,153 @@ export default function GroupDetailPage() {
 
   // Linked members get a read-only view of the group.
   const isOwner = group?.is_owner ?? false
-  // The member that represents the current viewer (when linked).
-  const viewerMember = useMemo(
-    () => group?.members.find((m) => user && m.linked_user_id === user.id),
-    [group?.members, user],
-  )
-  // The "self" member is the owner-payer of the group's transactions.
-  const ownerMember = useMemo(
-    () => group?.members.find((m) => m.is_self),
-    [group?.members],
-  )
+  // A household is read period by period and calls its transfers
+  // contributions; every other kind opens on the running position and
+  // calls them settlements.
+  const isHousehold = group?.kind === 'household'
 
-  const { data: balances } = useQuery({
-    queryKey: ['groups', groupId, 'balances'],
-    queryFn: () => groupsApi.balances(groupId),
-    enabled: !!groupId,
+  // ── The period ───────────────────────────────────────────────
+  // A month is a mode of its own, so the month picker holds the choice
+  // and "This month" and "Last month" are two of its positions rather
+  // than a second way of saying the same thing.
+  const [mode, setMode] = useState<RangeMode | null>(null)
+  const [month, setMonth] = useState<CalendarMonth>(() => monthOf())
+  const [customStart, setCustomStart] = useState('')
+  // What the picker shows: the last day inside the range, not the
+  // exclusive `end` the API takes.
+  const [customEnd, setCustomEnd] = useState('')
+  const [page, setPage] = useState(1)
+
+  const activeMode: RangeMode = mode ?? (isHousehold ? 'month' : 'allTime')
+  const range: PeriodRange = useMemo(() => {
+    if (activeMode === 'month') return monthRange(month)
+    if (activeMode === 'custom') {
+      return { start: customStart || null, end: exclusiveEnd(customEnd) }
+    }
+    return presetRange(activeMode)
+  }, [activeMode, month, customStart, customEnd])
+
+  // Every way of changing the range goes through here, so page 2 of the
+  // old period never survives into the new one.
+  const changeRange = (change: () => void) => {
+    change()
+    setPage(1)
+  }
+
+  const {
+    data: period,
+    isError: periodFailed,
+    refetch: refetchPeriod,
+  } = useQuery({
+    queryKey: ['groups', groupId, 'period', range.start, range.end, page],
+    queryFn: () =>
+      groupsApi.period(groupId, {
+        start: range.start,
+        end: range.end,
+        page,
+        page_size: PAGE_SIZE,
+      }),
+    // Waits for the group, so the first request already uses the range
+    // the group's kind opens on.
+    enabled: !!groupId && !!group,
+    // Keep the figures on screen while the next period or page loads.
+    // Without this, paging the transaction list blanks the transfers and
+    // the positions, which reads as "nothing to move".
+    placeholderData: keepPreviousData,
   })
 
-  const { data: settlements } = useQuery({
-    queryKey: ['groups', groupId, 'settlements'],
-    queryFn: () => groupsApi.settlements.list(groupId),
-    enabled: !!groupId,
-  })
+  // A failed request must never look like a quiet period, so the
+  // sections are replaced rather than left showing their empty states.
+  const showFigures = !!period && !periodFailed
 
-  const { data: groupTxs } = useQuery({
-    queryKey: ['groups', groupId, 'transactions'],
-    queryFn: () => groupsApi.transactions(groupId, 20),
-    enabled: !!groupId,
-  })
+  const openCustomRange = () => {
+    // Seed the custom pickers from whatever is on screen, so switching
+    // to Custom never blanks the page.
+    if (!customStart && range.start) setCustomStart(range.start)
+    if (!customEnd && range.end) setCustomEnd(inclusiveEnd(range.end))
+    setMode('custom')
+  }
+
+  // One of the five buttons. The two month ones move the month picker.
+  const pickPreset = (preset: PeriodPreset) =>
+    changeRange(() => {
+      if (preset === 'thisMonth' || preset === 'lastMonth') {
+        setMode('month')
+        setMonth(preset === 'thisMonth' ? monthOf() : shiftMonth(monthOf(), -1))
+      } else if (preset === 'custom') {
+        openCustomRange()
+      } else {
+        setMode(preset)
+      }
+    })
+
+  const pickMonth = (value: CalendarMonth) =>
+    changeRange(() => {
+      setMode('month')
+      setMonth(value)
+    })
+
+  /** True when a button stands for what is on screen. */
+  const presetIsActive = (preset: PeriodPreset) => {
+    if (preset === 'thisMonth') return activeMode === 'month' && month === monthOf()
+    if (preset === 'lastMonth') {
+      return activeMode === 'month' && month === shiftMonth(monthOf(), -1)
+    }
+    return activeMode === preset
+  }
+
+  // The last two years, newest first, plus wherever the arrows have
+  // taken the reader.
+  const monthOptions = useMemo(() => {
+    const options = new Set<CalendarMonth>([month])
+    for (let back = 0; back < 24; back++) options.add(shiftMonth(monthOf(), -back))
+    return [...options].sort().reverse()
+  }, [month])
+
+  // The range stays in order whatever the user picks, so `start > end`
+  // and the 400 it earns never happen.
+  const pickRange = (value: string, moved: 'start' | 'end') =>
+    changeRange(() => {
+      const ordered = keepInOrder(
+        moved === 'start' ? value : customStart,
+        moved === 'end' ? value : customEnd,
+        moved,
+      )
+      setCustomStart(ordered.start)
+      setCustomEnd(ordered.lastDay)
+    })
+
+  const periodMembers = useMemo(() => period?.members ?? [], [period])
+
+  // ── Names and lookups ────────────────────────────────────────
+  // Figures are keyed by the members the period response lists; the
+  // group payload is only for managing them.
+  const nameOf = useMemo(() => {
+    const names = new Map<string, string>()
+    for (const m of group?.members ?? []) names.set(m.id, m.name)
+    for (const m of periodMembers) names.set(m.id, m.name)
+    return (memberId: string | null) => (memberId && names.get(memberId)) || '—'
+  }, [group?.members, periodMembers])
+
+  const ownerMemberId = period?.owner_member_id ?? null
+  // The member that stands for whoever is looking: their linked member,
+  // or — for the group's owner, whose own member is often unlinked — the
+  // owner's member the period response resolved. Never the rewritten
+  // `is_self`, which depends on the viewer.
+  const viewerMemberId = useMemo(() => {
+    const linked = group?.members.find((m) => user && m.linked_user_id === user.id)
+    if (linked) return linked.id
+    return isOwner ? ownerMemberId : null
+  }, [group?.members, user, isOwner, ownerMemberId])
+
+  // One block per currency: positions are never added across currencies.
+  const currencies = useMemo(() => {
+    const seen: string[] = []
+    for (const position of period?.positions ?? []) {
+      if (!seen.includes(position.currency)) seen.push(position.currency)
+    }
+    return seen
+  }, [period])
 
   // ── Member management ────────────────────────────────────────
   const [memberDialogOpen, setMemberDialogOpen] = useState(false)
@@ -210,14 +353,18 @@ export default function GroupDetailPage() {
   // is_self is auto-inferred (true iff the linked user is the viewer).
   const [memberLinkedUserId, setMemberLinkedUserId] = useState<string | null>(null)
 
+  const invalidateGroup = () => {
+    // Prefix match: the group, its period and everything else under it.
+    queryClient.invalidateQueries({ queryKey: ['groups', groupId] })
+  }
+
   const memberMutation = useMutation({
     mutationFn: (payload: GroupMemberPayload) =>
       editingMember
         ? groupsApi.members.update(groupId, editingMember.id, payload)
         : groupsApi.members.create(groupId, payload),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['groups', groupId] })
-      queryClient.invalidateQueries({ queryKey: ['groups', groupId, 'balances'] })
+      invalidateGroup()
       setMemberDialogOpen(false)
       setEditingMember(null)
       toast.success(editingMember ? t('splitGroups.memberUpdated') : t('splitGroups.memberAdded'))
@@ -234,8 +381,7 @@ export default function GroupDetailPage() {
   const deleteMemberMutation = useMutation({
     mutationFn: (memberId: string) => groupsApi.members.delete(groupId, memberId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['groups', groupId] })
-      queryClient.invalidateQueries({ queryKey: ['groups', groupId, 'balances'] })
+      invalidateGroup()
       setMemberDialogOpen(false)
       setEditingMember(null)
       toast.success(t('splitGroups.memberDeleted'))
@@ -280,8 +426,7 @@ export default function GroupDetailPage() {
     })
   }
 
-
-  // ── Settle-up ────────────────────────────────────────────────
+  // ── Recording a contribution (a settlement in other kinds) ────
   const [settleOpen, setSettleOpen] = useState(false)
   const [settleFrom, setSettleFrom] = useState('')
   const [settleTo, setSettleTo] = useState('')
@@ -290,7 +435,7 @@ export default function GroupDetailPage() {
   const [settleNotes, setSettleNotes] = useState('')
   const [settleCurrency, setSettleCurrency] = useState('USD')
   // Optional ledger integration for the payer: 'none' records the
-  // settlement only, 'create' makes a fresh debit, 'existing' links a
+  // contribution only, 'create' makes a fresh debit, 'existing' links a
   // transaction the payer already has.
   const [settleTxMode, setSettleTxMode] = useState<'none' | 'create' | 'existing'>('none')
   const [settleAccountId, setSettleAccountId] = useState('')
@@ -335,8 +480,7 @@ export default function GroupDetailPage() {
     mutationFn: (payload: GroupSettlementPayload) =>
       groupsApi.settlements.create(groupId, payload),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['groups', groupId, 'settlements'] })
-      queryClient.invalidateQueries({ queryKey: ['groups', groupId, 'balances'] })
+      invalidateGroup()
       setSettleOpen(false)
       toast.success(t('splitGroups.settled'))
     },
@@ -352,10 +496,7 @@ export default function GroupDetailPage() {
   const deleteSettlementMutation = useMutation({
     mutationFn: (settlementId: string) =>
       groupsApi.settlements.delete(groupId, settlementId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['groups', groupId, 'settlements'] })
-      queryClient.invalidateQueries({ queryKey: ['groups', groupId, 'balances'] })
-    },
+    onSuccess: invalidateGroup,
   })
 
   const openSettleUp = (
@@ -369,9 +510,9 @@ export default function GroupDetailPage() {
     setSettleAmount(amount != null ? amount.toFixed(2) : '')
     setSettleDate(localDateString())
     setSettleNotes('')
-    // Use the line's currency when settling a specific debt, falling
-    // back to the group's default for free-form settlements. This
-    // matters when the same group has cross-currency debts.
+    // Use the suggested transfer's currency, falling back to the group's
+    // default for a free-form entry. This matters when the same group
+    // carries positions in more than one currency.
     setSettleCurrency(currency ?? group?.default_currency ?? 'USD')
     setSettleTxMode('none')
     setSettleAccountId('')
@@ -399,152 +540,33 @@ export default function GroupDetailPage() {
     settlementMutation.mutate(payload)
   }
 
-  // Lookup helpers
-  const memberById = useMemo(() => {
-    const map = new Map<string, GroupMember>()
-    for (const m of group?.members ?? []) map.set(m.id, m)
-    return map
-  }, [group?.members])
+  // ── The catch-up calculator ──────────────────────────────────
+  const [catchUpInput, setCatchUpInput] = useState('')
 
-  const memberName_ = (memberId: string) => memberById.get(memberId)?.name ?? '—'
-
-  // ── KPIs ─────────────────────────────────────────────────────
-  const groupCurrency = group?.default_currency ?? 'USD'
-
-  // Sum cross-currency rows in the group's primary terms — using
-  // amount_primary when available, otherwise the native amount. Without
-  // this, EUR rows would silently add as USD (a €100 hotel would count
-  // as $100, throwing off the KPI vs. spending-by-category breakdown).
-  const totalMoved = useMemo(() => {
-    if (!groupTxs) return 0
-    return groupTxs.reduce(
-      (sum, tx) => sum + Number(tx.amount_primary ?? tx.amount),
-      0,
-    )
-  }, [groupTxs])
-
-  // KPIs roll up across currencies using each line's
-  // amount_in_default_currency (FX-converted server-side). Filtering by
-  // a single currency would otherwise hide debts in another currency
-  // — e.g. a EUR-only line wouldn't show up for a USD-default group.
-  const owedToViewer = useMemo(() => {
-    if (!balances) return 0
-    if (isOwner) {
-      return balances.lines
-        .filter((l) => l.amount > 0)
-        .reduce((s, l) => s + Number(l.amount_in_default_currency), 0)
-    }
-    if (!viewerMember) return 0
-    return balances.lines
-      .filter((l) => l.member_id === viewerMember.id && l.amount < 0)
-      .reduce((s, l) => s + Math.abs(Number(l.amount_in_default_currency)), 0)
-  }, [balances, isOwner, viewerMember])
-
-  const viewerOwes = useMemo(() => {
-    if (!balances) return 0
-    if (isOwner) {
-      return Math.abs(
-        balances.lines
-          .filter((l) => l.amount < 0)
-          .reduce((s, l) => s + Number(l.amount_in_default_currency), 0),
-      )
-    }
-    if (!viewerMember) return 0
-    return balances.lines
-      .filter((l) => l.member_id === viewerMember.id && l.amount > 0)
-      .reduce((s, l) => s + Number(l.amount_in_default_currency), 0)
-  }, [balances, isOwner, viewerMember])
-
-  // Per-line breakdown for the two debt KPIs. Each row shows the other
-  // party's name and the amount in its native currency — so a EUR line
-  // stays "€100" instead of being lossy-rolled into the USD KPI total.
-  const memberNameById = useMemo(() => {
-    const map = new Map<string, string>()
-    for (const m of group?.members ?? []) map.set(m.id, m.name)
-    return map
-  }, [group?.members])
-
-  const owedToViewerBreakdown = useMemo<KpiBreakdownItem[]>(() => {
-    if (!balances) return []
-    if (isOwner) {
-      return balances.lines
-        .filter((l) => l.amount > 0)
-        .map((l) => ({
-          name: memberNameById.get(l.member_id) ?? '—',
-          amountText: formatCurrency(Number(l.amount), l.currency, locale),
-        }))
-    }
-    if (!viewerMember || !ownerMember) return []
-    return balances.lines
-      .filter((l) => l.member_id === viewerMember.id && l.amount < 0)
-      .map((l) => ({
-        name: ownerMember.name,
-        amountText: formatCurrency(Math.abs(Number(l.amount)), l.currency, locale),
-      }))
-  }, [balances, isOwner, viewerMember, ownerMember, memberNameById, locale])
-
-  const viewerOwesBreakdown = useMemo<KpiBreakdownItem[]>(() => {
-    if (!balances) return []
-    if (isOwner) {
-      return balances.lines
-        .filter((l) => l.amount < 0)
-        .map((l) => ({
-          name: memberNameById.get(l.member_id) ?? '—',
-          amountText: formatCurrency(Math.abs(Number(l.amount)), l.currency, locale),
-        }))
-    }
-    if (!viewerMember || !ownerMember) return []
-    return balances.lines
-      .filter((l) => l.member_id === viewerMember.id && l.amount > 0)
-      .map((l) => ({
-        name: ownerMember.name,
-        amountText: formatCurrency(Number(l.amount), l.currency, locale),
-      }))
-  }, [balances, isOwner, viewerMember, ownerMember, memberNameById, locale])
-
-  const monthlyData = useMemo(() => {
-    if (!groupTxs || groupTxs.length === 0) return []
-    const byMonth = new Map<string, number>()
-    for (const tx of groupTxs) {
-      const m = tx.date.slice(0, 7)
-      byMonth.set(m, (byMonth.get(m) ?? 0) + Number(tx.amount_primary ?? tx.amount))
-    }
-    return Array.from(byMonth.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([month, total]) => ({
-        month: new Date(month + '-01').toLocaleString(dateLocale, { month: 'short' }),
-        total: Number(total.toFixed(2)),
-      }))
-  }, [groupTxs, dateLocale])
-
-  // Group spending broken down by category — for the stacked horizontal
-  // bar. We sum debits only (income/credits aren't "spending"). When a
-  // tx has amount_primary we use that so cross-currency rows are
-  // comparable; otherwise fall back to the native amount, which is fine
-  // for single-currency groups.
-  const categoryBreakdown = useMemo(() => {
-    if (!groupTxs || groupTxs.length === 0) return [] as { id: string; name: string; color: string; total: number }[]
-    const map = new Map<string, { id: string; name: string; color: string; total: number }>()
-    for (const tx of groupTxs) {
-      if (tx.type !== 'debit') continue
-      const id = tx.category?.id ?? 'uncategorized'
-      const name = tx.category?.name ?? t('splitGroups.uncategorized')
-      const color = tx.category?.color ?? '#6B7280'
-      const value = Number(tx.amount_primary ?? tx.amount)
-      const existing = map.get(id)
-      if (existing) {
-        existing.total += value
-      } else {
-        map.set(id, { id, name, color, total: value })
+  // The member carrying the largest backlog: with two members that is
+  // the one the catch-up is for. Nothing here is stored.
+  const backlogLine = useMemo(() => {
+    let largest: { memberId: string; amount: number; currency: string } | null = null
+    for (const position of period?.positions ?? []) {
+      const amount = Number(position.backlog)
+      if (amount > 0 && (!largest || amount > largest.amount)) {
+        largest = { memberId: position.member_id, amount, currency: position.currency }
       }
     }
-    return Array.from(map.values()).sort((a, b) => b.total - a.total)
-  }, [groupTxs, t])
+    return largest
+  }, [period])
 
-  const categoryBreakdownTotal = useMemo(
-    () => categoryBreakdown.reduce((s, c) => s + c.total, 0),
-    [categoryBreakdown],
-  )
+  const catchUpAmount = Number.parseFloat(catchUpInput)
+  const months = backlogLine
+    ? catchUpMonths(backlogLine.amount, Number.isFinite(catchUpAmount) ? catchUpAmount : 0)
+    : null
+
+  const recordLabel = isHousehold
+    ? t('splitGroups.pot.recordContribution')
+    : t('splitGroups.recordSettlement')
+  const transferActionLabel = isHousehold
+    ? t('splitGroups.pot.recordContribution')
+    : t('splitGroups.settleUp')
 
   if (loadingGroup) {
     return (
@@ -558,6 +580,69 @@ export default function GroupDetailPage() {
   if (!group) {
     return <div className="text-muted-foreground">{t('splitGroups.notFound')}</div>
   }
+
+  const transfersPeriodCard = (
+    <SectionCard>
+      <SectionHeader
+        title={t('splitGroups.pot.transfersPeriod')}
+        description={t('splitGroups.pot.transfersPeriodHint')}
+      />
+      <TransferList
+        transfers={period?.transfers_period ?? []}
+        loaded={showFigures}
+        nameOf={nameOf}
+        locale={locale}
+        emptyLabel={t('splitGroups.pot.nothingToMove')}
+        actionLabel={canWrite ? transferActionLabel : undefined}
+        onPick={
+          canWrite
+            ? (transfer) =>
+                openSettleUp(
+                  transfer.from_member_id,
+                  transfer.to_member_id,
+                  Number(transfer.amount),
+                  transfer.currency,
+                )
+            : undefined
+        }
+      />
+    </SectionCard>
+  )
+
+  const transfersRunningCard = (
+    <SectionCard>
+      <SectionHeader
+        title={t('splitGroups.pot.transfersRunning')}
+        description={t('splitGroups.pot.transfersRunningHint')}
+      />
+      <TransferList
+        transfers={period?.transfers_running ?? []}
+        loaded={showFigures}
+        nameOf={nameOf}
+        locale={locale}
+        emptyLabel={t('splitGroups.pot.nothingToMove')}
+        actionLabel={canWrite ? transferActionLabel : undefined}
+        onPick={
+          canWrite
+            ? (transfer) =>
+                openSettleUp(
+                  transfer.from_member_id,
+                  transfer.to_member_id,
+                  Number(transfer.amount),
+                  transfer.currency,
+                )
+            : undefined
+        }
+      />
+    </SectionCard>
+  )
+
+  const hasBreakdown =
+    (period?.costs.length ?? 0) > 0 || (period?.shared_income.length ?? 0) > 0
+  const transactionPages = Math.max(
+    1,
+    Math.ceil((period?.transactions.total ?? 0) / (period?.transactions.page_size ?? PAGE_SIZE)),
+  )
 
   return (
     <div className="space-y-4">
@@ -579,108 +664,545 @@ export default function GroupDetailPage() {
         }
       />
 
-      {/* KPI row */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4">
-        <KpiCard
-          label={t('splitGroups.kpiTotalMoved')}
-          value={formatCurrency(totalMoved, groupCurrency, locale)}
-          icon={Wallet}
-        />
-        <KpiCard
-          label={t(isOwner ? 'splitGroups.kpiOwedToYou' : 'splitGroups.kpiOwedToYouAsMember')}
-          value={formatCurrency(owedToViewer, groupCurrency, locale)}
-          icon={TrendingUp}
-          tone={owedToViewer > 0 ? 'positive' : 'neutral'}
-          breakdown={owedToViewerBreakdown}
-        />
-        <KpiCard
-          label={t('splitGroups.kpiYouOwe')}
-          value={formatCurrency(viewerOwes, groupCurrency, locale)}
-          icon={TrendingDown}
-          tone={viewerOwes > 0 ? 'negative' : 'neutral'}
-          breakdown={viewerOwesBreakdown}
-        />
+      {/* Period picker — every section below follows it. */}
+      <SectionCard>
+        <div className="px-4 sm:px-5 py-3 flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide mr-1">
+            {t('splitGroups.pot.periodLabel')}
+          </span>
+          {/* The month picker. "This month" and "Last month" below move
+              it rather than compete with it, so whichever month is on
+              screen is always the one named here. */}
+          <div
+            className={`flex items-center gap-1 rounded-md border px-1 py-0.5 ${
+              activeMode === 'month' ? 'border-primary' : 'border-border'
+            }`}
+          >
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0"
+              aria-label={t('splitGroups.pot.previousMonth')}
+              onClick={() => pickMonth(shiftMonth(month, -1))}
+            >
+              <ChevronLeft size={14} />
+            </Button>
+            <select
+              className="h-7 bg-transparent text-sm font-medium focus:outline-none cursor-pointer"
+              aria-label={t('splitGroups.pot.monthLabel')}
+              value={month}
+              onChange={(e) => pickMonth(e.target.value)}
+            >
+              {monthOptions.map((option) => (
+                <option key={option} value={option}>
+                  {monthLabel(option, dateLocale)}
+                </option>
+              ))}
+            </select>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0"
+              aria-label={t('splitGroups.pot.nextMonth')}
+              onClick={() => pickMonth(shiftMonth(month, 1))}
+            >
+              <ChevronRight size={14} />
+            </Button>
+          </div>
+          {PERIOD_PRESETS.map((option) => (
+            <Button
+              key={option}
+              size="sm"
+              variant={presetIsActive(option) ? 'default' : 'outline'}
+              className="h-8"
+              aria-pressed={presetIsActive(option)}
+              onClick={() => pickPreset(option)}
+            >
+              {t(`splitGroups.pot.${option}`)}
+            </Button>
+          ))}
+          {activeMode === 'custom' && (
+            <div className="flex flex-wrap items-end gap-2 w-full sm:w-auto">
+              <div className="space-y-1">
+                <Label className="text-xs">{t('splitGroups.pot.rangeStart')}</Label>
+                <DatePickerInput
+                  value={customStart}
+                  onChange={(value) => pickRange(value, 'start')}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs">{t('splitGroups.pot.rangeEnd')}</Label>
+                <DatePickerInput
+                  value={customEnd}
+                  onChange={(value) => pickRange(value, 'end')}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      </SectionCard>
+
+      {periodFailed && (
+        <SectionCard>
+          <div className="px-4 py-6 flex flex-col items-center gap-3 text-center">
+            <AlertTriangle size={20} className="text-rose-500" />
+            <p className="text-sm text-foreground">{t('splitGroups.pot.loadFailed')}</p>
+            <Button variant="outline" size="sm" onClick={() => refetchPeriod()}>
+              {t('common.retry')}
+            </Button>
+          </div>
+        </SectionCard>
+      )}
+
+      {!periodFailed && (
+        <>
+      {/* Who moves what: the period alone, and with the backlog. A
+          household reads the period first; other kinds the running one. */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4">
+        {isHousehold ? transfersPeriodCard : transfersRunningCard}
+        {isHousehold ? transfersRunningCard : transfersPeriodCard}
       </div>
 
-      {/* Spending trend (compact) */}
-      {monthlyData.length > 1 && (
-        <SectionCard>
-          <SectionHeader
-            title={t('splitGroups.spendingTrend')}
-            description={t('splitGroups.spendingTrendHint')}
-          />
-          <div className="px-2 py-3">
-            <ResponsiveContainer width="100%" height={120}>
-              <BarChart data={monthlyData}>
-                <XAxis
-                  dataKey="month"
-                  tick={{ fontSize: 11 }}
-                  axisLine={false}
-                  tickLine={false}
-                />
-                <Tooltip
-                  cursor={{ fill: 'var(--muted)' }}
-                  contentStyle={{
-                    fontSize: 12,
-                    borderRadius: 8,
-                    border: '1px solid var(--border)',
-                    background: 'var(--card)',
-                  }}
-                  formatter={(v) => formatCurrency(Number(v ?? 0), groupCurrency, locale)}
-                />
-                <Bar dataKey="total" fill={group.color} radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
+      {/* Costs by category, with shared income on its own lines and the
+          net total straight from the server. */}
+      <SectionCard>
+        <SectionHeader title={t('splitGroups.pot.costs')} />
+        {!showFigures ? (
+          <div className="p-4 space-y-2">
+            <Skeleton className="h-8 w-full" />
+            <Skeleton className="h-8 w-full" />
           </div>
-        </SectionCard>
-      )}
+        ) : !hasBreakdown ? (
+          <div className="text-center py-8 text-muted-foreground text-sm">
+            {t('splitGroups.pot.noCosts')}
+          </div>
+        ) : (
+          currencies.map((currency) => {
+            const costs = (period?.costs ?? []).filter((line) => line.currency === currency)
+            const income = (period?.shared_income ?? []).filter(
+              (line) => line.currency === currency,
+            )
+            const total = (period?.totals ?? []).find((line) => line.currency === currency)
+            if (costs.length === 0 && income.length === 0) return null
+            return (
+              <div key={currency} className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-xs text-muted-foreground border-b border-border">
+                      <th className="text-left font-medium px-4 py-2">
+                        {t('splitGroups.pot.category')}
+                      </th>
+                      <th className="text-right font-medium px-4 py-2 whitespace-nowrap">
+                        {t('splitGroups.pot.groupTotal')}
+                      </th>
+                      {periodMembers.map((member) => (
+                        <th
+                          key={member.id}
+                          className="text-right font-medium px-4 py-2 whitespace-nowrap"
+                        >
+                          {member.name}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border">
+                    {costs.map((line) => (
+                      <tr key={`cost-${line.category_id ?? 'none'}`}>
+                        <td className="px-4 py-2">
+                          {line.category_name ?? t('splitGroups.uncategorized')}
+                        </td>
+                        <td className="px-4 py-2 text-right tabular-nums">
+                          {formatCurrency(Number(line.total), currency, locale)}
+                        </td>
+                        {periodMembers.map((member) => (
+                          <td
+                            key={member.id}
+                            className="px-4 py-2 text-right tabular-nums text-muted-foreground"
+                          >
+                            {formatCurrency(shareOf(line.shares, member.id), currency, locale)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                    {income.length > 0 && (
+                      <tr className="bg-muted/40">
+                        <td
+                          className="px-4 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground"
+                          colSpan={2 + periodMembers.length}
+                        >
+                          {t('splitGroups.pot.sharedIncome')}
+                        </td>
+                      </tr>
+                    )}
+                    {income.map((line) => (
+                      <tr key={`income-${line.category_id ?? 'none'}`}>
+                        <td className="px-4 py-2">
+                          {line.category_name ?? t('splitGroups.uncategorized')}
+                        </td>
+                        <td className="px-4 py-2 text-right tabular-nums text-emerald-600">
+                          {formatCurrency(-Number(line.total), currency, locale)}
+                        </td>
+                        {periodMembers.map((member) => (
+                          <td
+                            key={member.id}
+                            className="px-4 py-2 text-right tabular-nums text-emerald-600/80"
+                          >
+                            {formatCurrency(
+                              -shareOf(line.shares, member.id),
+                              currency,
+                              locale,
+                            )}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                  {total && (
+                    <tfoot>
+                      <tr className="border-t border-border font-semibold">
+                        <td className="px-4 py-2">{t('splitGroups.pot.netTotal')}</td>
+                        <td className="px-4 py-2 text-right tabular-nums">
+                          {formatCurrency(Number(total.net), currency, locale)}
+                        </td>
+                        {periodMembers.map((member) => (
+                          <td key={member.id} className="px-4 py-2 text-right tabular-nums">
+                            {formatCurrency(shareOf(total.shares, member.id), currency, locale)}
+                          </td>
+                        ))}
+                      </tr>
+                    </tfoot>
+                  )}
+                </table>
+              </div>
+            )
+          })
+        )}
+      </SectionCard>
 
-      {/* Category distribution — single horizontal stacked bar split
-          by category, with a legend showing absolute and % per slice. */}
-      {categoryBreakdownTotal > 0 && (
-        <SectionCard>
-          <SectionHeader
-            title={t('splitGroups.byCategory')}
-            description={t('splitGroups.byCategoryHint')}
-          />
-          <div className="px-4 py-3 space-y-3">
-            <div className="flex h-3 w-full overflow-hidden rounded-full bg-muted">
-              {categoryBreakdown.map((c) => {
-                const pct = (c.total / categoryBreakdownTotal) * 100
-                return (
-                  <div
-                    key={c.id}
-                    style={{ width: `${pct}%`, backgroundColor: c.color }}
-                    title={`${c.name} · ${formatCurrency(c.total, groupCurrency, locale)} (${pct.toFixed(1)}%)`}
-                  />
-                )
-              })}
+      {/* What each member paid against their share. */}
+      <SectionCard>
+        <SectionHeader
+          title={t('splitGroups.pot.positions')}
+          description={t('splitGroups.pot.positionsHint')}
+        />
+        {!showFigures ? (
+          <div className="p-4 space-y-2">
+            <Skeleton className="h-8 w-full" />
+            <Skeleton className="h-8 w-full" />
+          </div>
+        ) : currencies.length === 0 ? (
+          <div className="text-center py-6 text-muted-foreground text-sm">
+            {t('splitGroups.pot.noCosts')}
+          </div>
+        ) : (
+          currencies.map((currency) => (
+            <div key={currency} className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-xs text-muted-foreground border-b border-border">
+                    <th className="text-left font-medium px-4 py-2">
+                      {t('splitGroups.pot.member')}
+                    </th>
+                    <th className="text-right font-medium px-4 py-2">
+                      {t('splitGroups.pot.paid')}
+                    </th>
+                    <th className="text-right font-medium px-4 py-2">
+                      {t('splitGroups.pot.share')}
+                    </th>
+                    <th className="text-right font-medium px-4 py-2">
+                      {t('splitGroups.pot.sent')}
+                    </th>
+                    <th className="text-right font-medium px-4 py-2">
+                      {t('splitGroups.pot.received')}
+                    </th>
+                    <th className="text-right font-medium px-4 py-2 whitespace-nowrap">
+                      {t('splitGroups.pot.thisPeriod')}
+                    </th>
+                    <th className="text-right font-medium px-4 py-2">
+                      {t('splitGroups.pot.backlog')}
+                    </th>
+                    <th className="text-right font-medium px-4 py-2 whitespace-nowrap">
+                      {t('splitGroups.pot.inclBacklog')}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {(period?.positions ?? [])
+                    .filter((position) => position.currency === currency)
+                    .map((position) => (
+                      <tr key={`${position.member_id}-${currency}`}>
+                        <td className="px-4 py-2 font-medium whitespace-nowrap">
+                          {nameOf(position.member_id)}
+                        </td>
+                        <td className="px-4 py-2 text-right tabular-nums">
+                          {formatCurrency(Number(position.paid), currency, locale)}
+                        </td>
+                        <td className="px-4 py-2 text-right tabular-nums">
+                          {formatCurrency(Number(position.share), currency, locale)}
+                        </td>
+                        <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
+                          {formatCurrency(
+                            Number(position.contributions_made),
+                            currency,
+                            locale,
+                          )}
+                        </td>
+                        <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
+                          {formatCurrency(
+                            Number(position.contributions_received),
+                            currency,
+                            locale,
+                          )}
+                        </td>
+                        <td
+                          className={`px-4 py-2 text-right tabular-nums font-semibold ${
+                            Number(position.period_position) < 0
+                              ? 'text-emerald-600'
+                              : 'text-foreground'
+                          }`}
+                        >
+                          {formatCurrency(Number(position.period_position), currency, locale)}
+                        </td>
+                        <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
+                          {formatCurrency(Number(position.backlog), currency, locale)}
+                        </td>
+                        <td
+                          className={`px-4 py-2 text-right tabular-nums font-semibold ${
+                            Number(position.running_position) < 0
+                              ? 'text-emerald-600'
+                              : 'text-foreground'
+                          }`}
+                        >
+                          {formatCurrency(Number(position.running_position), currency, locale)}
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
             </div>
-            <ul className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 text-xs">
-              {categoryBreakdown.map((c) => {
-                const pct = (c.total / categoryBreakdownTotal) * 100
-                return (
-                  <li key={c.id} className="flex items-center justify-between gap-2">
-                    <span className="flex items-center gap-2 min-w-0">
-                      <span
-                        className="h-2.5 w-2.5 rounded-full shrink-0"
-                        style={{ backgroundColor: c.color }}
-                      />
-                      <span className="truncate">{c.name}</span>
-                    </span>
-                    <span className="tabular-nums whitespace-nowrap text-muted-foreground">
-                      {formatCurrency(c.total, groupCurrency, locale)} · {pct.toFixed(0)}%
-                    </span>
-                  </li>
-                )
-              })}
-            </ul>
+          ))
+        )}
+      </SectionCard>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4">
+        {/* The catch-up calculator. Nothing here is stored. A range with
+            no start carries no backlog by definition, so there is
+            nothing for it to answer and it stays away. */}
+        {range.start && (
+        <SectionCard>
+          <SectionHeader
+            title={t('splitGroups.pot.catchUp')}
+            description={t('splitGroups.pot.catchUpHint')}
+          />
+          <div className="px-4 py-4 space-y-3">
+            <div className="space-y-2">
+              <Label htmlFor="catch-up">{t('splitGroups.pot.catchUpMonthly')}</Label>
+              <Input
+                id="catch-up"
+                type="number"
+                step="0.01"
+                min="0"
+                value={catchUpInput}
+                onChange={(e) => setCatchUpInput(e.target.value)}
+              />
+            </div>
+            <p className="text-sm">
+              {!backlogLine
+                ? t('splitGroups.pot.catchUpNoBacklog')
+                : months === null
+                  ? t('splitGroups.pot.catchUpEnterAmount')
+                  : t('splitGroups.pot.catchUpResult', {
+                      count: months,
+                      name: nameOf(backlogLine.memberId),
+                      amount: formatCurrency(
+                        backlogLine.amount,
+                        backlogLine.currency,
+                        locale,
+                      ),
+                    })}
+            </p>
           </div>
         </SectionCard>
+        )}
+
+        {/* The period's contributions, straight from the response. */}
+        <SectionCard>
+          <SectionHeader
+            title={
+              isHousehold
+                ? t('splitGroups.pot.contributions')
+                : t('splitGroups.settlements')
+            }
+            action={
+              isOwner && canWrite ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="gap-1.5 h-8"
+                  onClick={() => openSettleUp()}
+                >
+                  {recordLabel}
+                </Button>
+              ) : undefined
+            }
+          />
+          {!showFigures ? (
+            <div className="p-4 space-y-2">
+              <Skeleton className="h-10 w-full" />
+            </div>
+          ) : period && period.contributions.length > 0 ? (
+            <ul className="divide-y divide-border">
+              {period.contributions.map((contribution) => (
+                <li
+                  key={contribution.id}
+                  className="flex items-center justify-between px-4 py-3"
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm flex items-center gap-1.5">
+                      <span className="font-medium">{nameOf(contribution.from_member_id)}</span>
+                      <ArrowRight size={12} className="text-muted-foreground" />
+                      <span className="font-medium">{nameOf(contribution.to_member_id)}</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      {new Date(contribution.date + 'T00:00:00').toLocaleDateString(dateLocale)}
+                      {contribution.notes ? ` · ${contribution.notes}` : ''}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="text-sm font-semibold tabular-nums">
+                      {formatCurrency(
+                        Number(contribution.amount),
+                        contribution.currency,
+                        locale,
+                      )}
+                    </span>
+                    {isOwner && canWrite && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => deleteSettlementMutation.mutate(contribution.id)}
+                        title={t('common.delete')}
+                        aria-label={t('common.delete')}
+                      >
+                        <Trash2 size={14} />
+                      </Button>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="text-center py-6 text-muted-foreground text-sm">
+              {isHousehold
+                ? t('splitGroups.pot.noContributions')
+                : t('splitGroups.pot.noSettlements')}
+            </div>
+          )}
+        </SectionCard>
+      </div>
+
+      {/* The period's shared transactions, paged on the server. */}
+      <SectionCard>
+        <SectionHeader
+          title={t('splitGroups.pot.transactions')}
+          description={
+            period && period.payer_assumed_transactions.length > 0
+              ? t('splitGroups.pot.payerAssumedHint', {
+                  total: period.payer_assumed_transactions.length,
+                })
+              : undefined
+          }
+          action={
+            <Button
+              variant="ghost"
+              size="sm"
+              className="gap-1 h-8 text-xs"
+              onClick={() => navigate(`/transactions?group_id=${groupId}`)}
+            >
+              {t('splitGroups.viewAllTransactions')}
+              <ArrowRight size={12} />
+            </Button>
+          }
+        />
+        {!showFigures || !period ? (
+          <div className="p-4 space-y-2">
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+          </div>
+        ) : period.transactions.items.length === 0 ? (
+          <div className="text-center py-8 text-muted-foreground text-sm flex flex-col items-center gap-2">
+            <Receipt size={20} className="opacity-50" />
+            {t('splitGroups.pot.noTransactions')}
+          </div>
+        ) : (
+          <>
+            <ul className="divide-y divide-border">
+              {period.transactions.items.map((tx) => (
+                <li
+                  key={tx.id}
+                  className="flex items-center gap-3 px-4 py-3 hover:bg-muted cursor-pointer transition-colors"
+                  onClick={() => navigate(`/transactions?group_id=${groupId}&highlight=${tx.id}`)}
+                >
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-foreground truncate">
+                      {tx.description}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {new Date(tx.date + 'T00:00:00').toLocaleDateString(dateLocale)}
+                      {tx.category_name ? ` · ${tx.category_name}` : ''}
+                      {tx.payer_member_id
+                        ? ` · ${t('splitGroups.pot.paidBy', { name: nameOf(tx.payer_member_id) })}`
+                        : ''}
+                    </p>
+                  </div>
+                  {tx.payer_assumed && (
+                    <span className="text-xs bg-muted text-muted-foreground px-2 py-0.5 rounded-full inline-flex items-center gap-1 shrink-0">
+                      <AlertTriangle size={11} />
+                      {t('splitGroups.pot.payerAssumed')}
+                    </span>
+                  )}
+                  <span
+                    className={`text-sm font-semibold tabular-nums ml-3 ${
+                      tx.type === 'debit' ? 'text-rose-500' : 'text-emerald-600'
+                    }`}
+                  >
+                    {formatCurrency(Number(tx.amount), tx.currency, locale)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <div className="flex items-center justify-between gap-2 px-4 py-3 border-t border-border">
+              <span className="text-xs text-muted-foreground">
+                {t('splitGroups.pot.pageOf', {
+                  page: period.transactions.page,
+                  pages: transactionPages,
+                })}
+              </span>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={page <= 1}
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                >
+                  {t('common.previous')}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={page >= transactionPages}
+                  onClick={() => setPage((p) => p + 1)}
+                >
+                  {t('common.next')}
+                </Button>
+              </div>
+            </div>
+          </>
+        )}
+      </SectionCard>
+        </>
       )}
 
-      {/* 2×2 grid: members + balances on top, transactions + settlements below */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4">
       {/* Members */}
       <SectionCard>
         <SectionHeader
@@ -705,19 +1227,14 @@ export default function GroupDetailPage() {
                 <div>
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-medium">{member.name}</span>
-                    {/* "(you)" only marks the actual viewer. is_self
-                        identifies the group owner/payer; for non-owner
-                        viewers we show that as "(owner)" instead so
-                        the badge isn't misleading. */}
-                    {viewerMember?.id === member.id ? (
+                    {/* "(you)" marks the viewer; the owner's member comes
+                        from the period response, which resolves it the
+                        same way for everyone who looks. */}
+                    {viewerMemberId === member.id ? (
                       <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full">
                         {t('splitGroups.you')}
                       </span>
-                    ) : member.is_self && isOwner ? (
-                      <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full">
-                        {t('splitGroups.you')}
-                      </span>
-                    ) : member.is_self ? (
+                    ) : ownerMemberId === member.id ? (
                       <span className="text-xs bg-muted text-muted-foreground px-2 py-0.5 rounded-full">
                         {t('splitGroups.ownerBadge')}
                       </span>
@@ -740,213 +1257,6 @@ export default function GroupDetailPage() {
           </ul>
         )}
       </SectionCard>
-
-      {/* Balances */}
-      <SectionCard>
-        <SectionHeader
-          title={t('splitGroups.balances')}
-          description={t('splitGroups.balancesHint')}
-        />
-        {balances && balances.lines.length > 0 ? (
-          <ul className="divide-y divide-border">
-            {balances.lines.map((line, idx) => {
-              const positive = line.amount > 0
-              // Reframe the line per viewer:
-              //   - Owner sees "X owes you" / "you owe X" (their direct relationship).
-              //   - A linked member sees their own line as "you owe / owes you {owner}",
-              //     and other lines as "{name} owes / is owed by {owner}".
-              const ownerName = ownerMember?.name ?? '—'
-              const otherName = memberName_(line.member_id)
-              const isViewerLine = viewerMember?.id === line.member_id
-              const label = isOwner
-                ? positive
-                  ? t('splitGroups.owesYou', { name: otherName })
-                  : t('splitGroups.youOwe', { name: otherName })
-                : isViewerLine
-                  ? positive
-                    ? t('splitGroups.youOwe', { name: ownerName })
-                    : t('splitGroups.ownerOwesYou', { name: ownerName })
-                  : positive
-                    ? t('splitGroups.thirdPartyOwes', { name: otherName, owner: ownerName })
-                    : t('splitGroups.thirdPartyOwed', { name: otherName, owner: ownerName })
-              return (
-                <li
-                  key={`${line.member_id}-${line.currency}-${idx}`}
-                  className="flex items-center justify-between px-4 py-3"
-                >
-                  <div className="text-sm">{label}</div>
-                  <div className="flex items-center gap-3">
-                    <span
-                      className={`text-sm font-semibold tabular-nums ${
-                        positive ? 'text-emerald-600' : 'text-rose-500'
-                      }`}
-                    >
-                      {formatCurrency(Math.abs(line.amount), line.currency, locale)}
-                    </span>
-                    {(() => {
-                      // Show "Acertar" if the viewer can act on this line:
-                      // - Owner can act on any line
-                      // - Linked member can only act on their own debt line
-                      //   (positive amount = they owe the owner)
-                      const canActLinked = !isOwner && isViewerLine && positive
-                      if (!isOwner && !canActLinked) return null
-                      if (!canWrite) return null
-                      return (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            if (!balances.self_member_id) return
-                            if (positive) {
-                              // Member owes the owner → from = member, to = owner
-                              openSettleUp(line.member_id, balances.self_member_id, Math.abs(line.amount), line.currency)
-                            } else {
-                              // Owner owes the member → from = owner, to = member
-                              openSettleUp(balances.self_member_id, line.member_id, Math.abs(line.amount), line.currency)
-                            }
-                          }}
-                        >
-                          {canActLinked ? t('splitGroups.payNow') : t('splitGroups.settleUp')}
-                        </Button>
-                      )
-                    })()}
-                  </div>
-                </li>
-              )
-            })}
-          </ul>
-        ) : (
-          <div className="text-center py-6 text-muted-foreground text-sm">
-            {t('splitGroups.allSettled')}
-          </div>
-        )}
-      </SectionCard>
-
-      {/* Recent transactions */}
-      <SectionCard>
-        <SectionHeader
-          title={t('splitGroups.recentTransactions')}
-          description={t('splitGroups.recentTransactionsHint')}
-          action={
-            groupTxs && groupTxs.length > 0 ? (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="gap-1 h-8 text-xs"
-                onClick={() => navigate(`/transactions?group_id=${groupId}`)}
-              >
-                {t('splitGroups.viewAllTransactions')}
-                <ArrowRight size={12} />
-              </Button>
-            ) : undefined
-          }
-        />
-        {!groupTxs ? (
-          <div className="p-4 space-y-2">
-            <Skeleton className="h-10 w-full" />
-            <Skeleton className="h-10 w-full" />
-          </div>
-        ) : groupTxs.length === 0 ? (
-          <div className="text-center py-8 text-muted-foreground text-sm flex flex-col items-center gap-2">
-            <Receipt size={20} className="opacity-50" />
-            {t('splitGroups.noTransactions')}
-          </div>
-        ) : (
-          <ul className="divide-y divide-border">
-            {groupTxs.slice(0, 8).map((tx) => (
-              <li
-                key={tx.id}
-                className="flex items-center gap-3 px-4 py-3 hover:bg-muted cursor-pointer transition-colors"
-                onClick={() => navigate(`/transactions?group_id=${groupId}&highlight=${tx.id}`)}
-              >
-                <CategoryIcon
-                  icon={tx.category?.icon}
-                  color={tx.category?.color}
-                  size="md"
-                />
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium text-foreground truncate">
-                    {tx.description}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    {new Date(tx.date + 'T00:00:00').toLocaleDateString(dateLocale)}
-                    {tx.category?.name ? ` · ${tx.category.name}` : ''}
-                    {tx.splits && tx.splits.length > 0
-                      ? ` · ${t('splitGroups.splitWays', { count: tx.splits.length })}`
-                      : ''}
-                  </p>
-                </div>
-                <span
-                  className={`text-sm font-semibold tabular-nums ml-3 ${
-                    tx.type === 'debit' ? 'text-rose-500' : 'text-emerald-600'
-                  }`}
-                >
-                  {formatCurrency(Number(tx.amount), tx.currency, locale)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </SectionCard>
-
-      {/* Settlements */}
-      <SectionCard>
-        <SectionHeader
-          title={t('splitGroups.settlements')}
-          action={
-            isOwner && canWrite ? (
-              <Button
-                size="sm"
-                variant="outline"
-                className="gap-1.5 h-8"
-                onClick={() => openSettleUp()}
-              >
-                {t('splitGroups.recordSettlement')}
-              </Button>
-            ) : undefined
-          }
-        />
-        {settlements && settlements.length > 0 ? (
-          <ul className="divide-y divide-border">
-            {settlements.map((s: GroupSettlement) => (
-              <li key={s.id} className="flex items-center justify-between px-4 py-3">
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm flex items-center gap-1.5">
-                    <span className="font-medium">{memberName_(s.from_member_id)}</span>
-                    <ArrowRight size={12} className="text-muted-foreground" />
-                    <span className="font-medium">{memberName_(s.to_member_id)}</span>
-                  </div>
-                  <p className="text-xs text-muted-foreground mt-0.5">
-                    {new Date(s.date + 'T00:00:00').toLocaleDateString(dateLocale)}
-                    {s.notes ? ` · ${s.notes}` : ''}
-                  </p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <span className="text-sm font-semibold tabular-nums">
-                    {formatCurrency(s.amount, s.currency, locale)}
-                  </span>
-                  {isOwner && canWrite && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => deleteSettlementMutation.mutate(s.id)}
-                      title={t('common.delete')}
-                      aria-label={t('common.delete')}
-                    >
-                      <Trash2 size={14} />
-                    </Button>
-                  )}
-                </div>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <div className="text-center py-6 text-muted-foreground text-sm">
-            {t('splitGroups.noSettlements')}
-          </div>
-        )}
-      </SectionCard>
-      </div>
 
       {/* Member dialog */}
       <Dialog open={memberDialogOpen} onOpenChange={setMemberDialogOpen}>
@@ -992,14 +1302,14 @@ export default function GroupDetailPage() {
         </DialogContent>
       </Dialog>
 
-      {/* Settle dialog */}
+      {/* Contribution / settlement dialog */}
       <Dialog open={settleOpen} onOpenChange={setSettleOpen}>
         <DialogContent className="sm:max-w-md max-h-[85vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>{t('splitGroups.recordSettlement')}</DialogTitle>
+            <DialogTitle>{recordLabel}</DialogTitle>
           </DialogHeader>
           {(() => {
-            const myMemberId = viewerMember?.id ?? (isOwner ? ownerMember?.id : null)
+            const myMemberId = viewerMemberId
             const viewerIsPayer = !!myMemberId && settleFrom === myMemberId
             return (
           <div className="space-y-4 min-w-0">
@@ -1043,7 +1353,7 @@ export default function GroupDetailPage() {
             </div>
             {/* Transaction action — placed right after the members so
                 the payer can decide upfront whether a real transaction
-                will back this settlement. When linking an existing
+                will back this record. When linking an existing
                 transaction, the amount/currency/date below mirror that
                 transaction and lock so the two records can't disagree. */}
             {viewerIsPayer && (
@@ -1104,7 +1414,7 @@ export default function GroupDetailPage() {
                                 type="button"
                                 onClick={() => {
                                   // Picking an existing transaction *as* the
-                                  // settlement: align amount, currency and
+                                  // contribution: align amount, currency and
                                   // date so the two records can't disagree.
                                   setSettlePickedTx(tx)
                                   setSettleAmount(Number(tx.amount).toFixed(2))

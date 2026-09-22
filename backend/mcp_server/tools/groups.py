@@ -11,10 +11,15 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services import balance_service, group_service, settlement_service
+from app.services import (
+    balance_service,
+    group_service,
+    position_service,
+    settlement_service,
+)
 from mcp_server.auth import CallContext
 from mcp_server.registry import tool
-from mcp_server.tools._helpers import num, parse_uuid, resolve_workspace_id
+from mcp_server.tools._helpers import num, parse_date, parse_uuid, resolve_workspace_id
 
 
 @tool(
@@ -131,6 +136,106 @@ async def get_group_balances(
         "self_member_id": str(result["self_member_id"]) if result.get("self_member_id") else None,
         "default_currency": result.get("default_currency"),
         "lines": lines,
+    }
+
+
+@tool(
+    name="get_group_positions",
+    description=(
+        "Each member's position in one group's common pot for a period: "
+        "`share` (what they should carry), `paid` (what they paid), "
+        "`contributions_made` / `contributions_received`, the "
+        "`period_position` (share - paid - made + received), the `backlog` "
+        "carried in from before `start`, and the `running_position` up to "
+        "`end`. Positive = the member should still move that much into the "
+        "pot; negative = the pot owes them. Shared income (credits) counts "
+        "negative. One row per member and currency; the same figures the "
+        "group page shows, whoever asks. `transfers_period` settles the "
+        "period alone and `transfers_running` includes the backlog, per "
+        "currency, never converted. The range is half-open: `start` is "
+        "inclusive and `end` exclusive (a calendar month is start=first "
+        "day, end=first day of the next month); omit both for all time. "
+        "Use for 'how much should X transfer this month?'."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "string", "format": "uuid"},
+            "start": {"type": "string", "format": "date", "description": "Inclusive."},
+            "end": {"type": "string", "format": "date", "description": "Exclusive."},
+        },
+        "required": ["group_id"],
+        "additionalProperties": False,
+    },
+    tags=["read", "groups"],
+)
+async def get_group_positions(
+    *,
+    session: AsyncSession,
+    ctx: CallContext,
+    group_id: str,
+    start: str | None = None,
+    end: str | None = None,
+) -> dict[str, Any]:
+    gid = parse_uuid(group_id)
+    if gid is None:
+        return dict(error="group not found or not visible to this user")
+    start_date, end_date = parse_date(start), parse_date(end)
+    if start_date and end_date and end_date < start_date:
+        return {"error": "end must not be before start"}
+
+    ws_id = await resolve_workspace_id(session, ctx)
+    result = await position_service.compute_positions(
+        session, gid, ws_id, ctx.user_id, start=start_date, end=end_date
+    )
+    if result is None:
+        return {"error": "group not found or not visible to this user"}
+
+    name_by_id = {m.id: m.name for m in result.members}
+
+    def _transfers(rows) -> list[dict[str, Any]]:
+        return [
+            {
+                "from_member_id": str(t.from_member_id),
+                "from_member_name": name_by_id.get(t.from_member_id),
+                "to_member_id": str(t.to_member_id),
+                "to_member_name": name_by_id.get(t.to_member_id),
+                "currency": t.currency,
+                "amount": num(t.amount),
+            }
+            for t in rows
+        ]
+
+    return {
+        "group_id": str(result.group_id),
+        "kind": result.kind,
+        "default_currency": result.default_currency,
+        "start": result.start.isoformat() if result.start else None,
+        "end": result.end.isoformat() if result.end else None,
+        "owner_member_id": str(result.owner_member_id) if result.owner_member_id else None,
+        "positions": [
+            {
+                "member_id": str(p.member_id),
+                "member_name": name_by_id.get(p.member_id),
+                "currency": p.currency,
+                "paid": num(p.paid),
+                "share": num(p.share),
+                "contributions_made": num(p.contributions_made),
+                "contributions_received": num(p.contributions_received),
+                "period_position": num(p.period_position),
+                "backlog": num(p.backlog),
+                "running_position": num(p.running_position),
+                "period_position_in_default_currency": num(
+                    p.period_position_in_default_currency
+                ),
+                "running_position_in_default_currency": num(
+                    p.running_position_in_default_currency
+                ),
+            }
+            for p in result.positions
+        ],
+        "transfers_period": _transfers(result.transfers_period),
+        "transfers_running": _transfers(result.transfers_running),
     }
 
 

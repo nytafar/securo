@@ -281,11 +281,12 @@ async def test_balance_line_dropped_when_settlement_zeroes_out_split(
 
 
 @pytest.mark.asyncio
-async def test_cross_member_settlements_are_ignored_in_owner_ledger(
+async def test_cross_member_settlement_moves_both_lines(
     session: AsyncSession, test_user, test_workspace
 ):
-    """Settlements between two non-self members don't affect the
-    owner-ledger view (balance_service is owner-centric in v1)."""
+    """A settlement between two members who are not the owner counts, so
+    the group's positions add up: the one who paid carries less, the one
+    who received carries more."""
     group, self_m, friends = await _setup(
         session, test_user, test_workspace.id, n_others=2
     )
@@ -306,8 +307,7 @@ async def test_cross_member_settlements_are_ignored_in_owner_ledger(
         ),
         test_user.id,
     )
-    # A "settles" with B — neither side is self. Should be a no-op for
-    # the owner's balance ledger.
+    # A "settles" with B — neither side is self.
     await settlement_service.create_settlement(
         session,
         group.id,
@@ -328,10 +328,9 @@ async def test_cross_member_settlements_are_ignored_in_owner_ledger(
     )
     assert balances is not None
     by_member = {ln["member_id"]: ln["amount"] for ln in balances["lines"]}
-    # A still owes their original $15 — not adjusted by the cross-member tx.
-    assert by_member[a.id] == Decimal("15.00")
-    # B has no obligation to the owner — no line.
-    assert b.id not in by_member
+    # A owed $15 and handed $100 to B.
+    assert by_member[a.id] == Decimal("-85.00")
+    assert by_member[b.id] == Decimal("100.00")
 
 
 @pytest.mark.asyncio

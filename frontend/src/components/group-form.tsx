@@ -7,6 +7,7 @@ import type { GroupKind } from '@/types'
 
 const KIND_OPTIONS: { value: GroupKind; tKey: string }[] = [
   { value: 'social', tKey: 'splitGroups.kind.social' },
+  { value: 'household', tKey: 'splitGroups.kind.household' },
   { value: 'cost_center', tKey: 'splitGroups.kind.cost_center' },
   { value: 'project', tKey: 'splitGroups.kind.project' },
   { value: 'client', tKey: 'splitGroups.kind.client' },
