@@ -389,6 +389,8 @@
     "allAccounts": "すべての口座",
     "viewing": "表示中",
     "clearFilter": "クリア",
+    "people": "人",
+    "consumptionHint": "本人の支出に、共有費用の負担分を加えた金額です。",
     "manage": "コレクションを管理",
     "add": "新規コレクション",
     "edit": "コレクションを編集",

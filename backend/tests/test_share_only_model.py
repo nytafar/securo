@@ -550,13 +550,19 @@ async def test_balance_line_default_currency_passthrough(
 
 
 @pytest.mark.asyncio
-async def test_owner_split_offset_pnl_helper(
+async def test_foreign_shares_are_what_gets_subtracted(
     session: AsyncSession, test_user, test_workspace
 ):
     """The income/expenses report uses Postgres `to_char`, so we can't
     exercise it under SQLite. Instead pin its underlying helper — the
-    same one the dashboard uses — directly."""
-    from app.services._query_filters import owner_split_offset_pnl
+    same one the dashboard uses — directly.
+
+    It used to read the logged-in user; it now takes the consumption
+    subject, which for an unfiltered page is the whole workspace."""
+    from app.services._query_filters import (
+        foreign_shares_pnl,
+        resolve_consumption_scope,
+    )
 
     await _force_user_currency(session, test_user, "USD")
     today = date.today()
@@ -578,8 +584,10 @@ async def test_owner_split_offset_pnl_helper(
     await session.commit()
 
     month_start, month_end = _month_window(today)
-    income_offset, expense_offset = await owner_split_offset_pnl(
-        session, test_user.id, month_start, month_end, primary_currency="USD"
+    _accounts, subject = await resolve_consumption_scope(session, test_workspace.id)
+    assert subject is not None
+    income_offset, expense_offset = await foreign_shares_pnl(
+        session, subject, month_start, month_end, primary_currency="USD"
     )
     # Three friends each owe $30 → offset is $90; the owner's $30 share
     # is what survives in the dashboard math.

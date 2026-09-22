@@ -16,12 +16,16 @@ from app.models.recurring_transaction import RecurringTransaction
 from app.schemas.dashboard import DashboardSummary, SpendingByCategory, MonthlyTrend, ProjectedTransaction, DailyBalance, BalanceHistory
 from app.services._query_filters import (
     counts_as_user_pnl,
+    foreign_shares_by_category,
+    foreign_shares_pnl,
+    foreign_shares_pnl_by_period,
     is_contribution_link,
-    owner_split_offset_by_category,
-    owner_split_offset_pnl,
     reporting_date_col,
-    viewer_shared_pnl,
-    viewer_shared_spending_by_category,
+    resolve_consumption_scope,
+    subject_credit_offsets,
+    subject_shares_by_category,
+    subject_shares_pnl,
+    subject_shares_pnl_by_period,
 )
 from app.services import invoice_forecast_service
 from app.services.admin_service import get_credit_card_accounting_mode
@@ -226,6 +230,7 @@ async def get_summary(
     balance_date: Optional[date] = None,
     account_ids: Optional[list[uuid.UUID]] = None,
     asset_group_ids: Optional[list[uuid.UUID]] = None,
+    filter_user_id: Optional[uuid.UUID] = None,
 ) -> DashboardSummary:
     if not month:
         month = date.today().replace(day=1)
@@ -240,6 +245,12 @@ async def get_summary(
     # but no accounts) still filters — coerce accounts to empty.
     if asset_group_ids is not None and account_ids is None:
         account_ids = []
+    # The user filter resolves to that person's accounts and *keeps* the
+    # share adjustment, with them as its subject. A collection has no
+    # subject at all.
+    account_ids, subject = await resolve_consumption_scope(
+        session, workspace_id, user_id=filter_user_id, account_ids=account_ids
+    )
     filtered = account_ids is not None
     acct_filter = [Transaction.account_id.in_(account_ids)] if filtered else []
 
@@ -370,29 +381,47 @@ async def get_summary(
     monthly_row = monthly_result.one()
     monthly_income = float(monthly_row[0] or 0)
     monthly_expenses = float(monthly_row[1] or 0)
+    # Kept unadjusted: the primary-currency figures below start from the
+    # same base and take the share adjustment once, on their own.
+    base_income = monthly_income
+    base_expenses = monthly_expenses
 
-    if not filtered:
-        # Subtract non-owner shares of the user's own split txs — they paid
-        # for the others, so those amounts aren't their actual cost.
-        own_offset_inc, own_offset_exp = await owner_split_offset_pnl(
+    if subject is not None:
+        # Subtract the shares of this money that belong to somebody else —
+        # the subject paid for them, so those amounts aren't their cost.
+        own_offset_inc, own_offset_exp = await foreign_shares_pnl(
             session,
-            user_id,
+            subject,
             month_start,
             month_end,
             use_effective_date=False,
-            workspace_id=workspace_id,
         )
         monthly_income -= own_offset_inc
         monthly_expenses -= own_offset_exp
 
-        # Add the viewer's share from group splits where they're a linked
-        # member but not the owner. Their concert ticket paid by a friend
-        # is a real expense in their P/L picture.
-        shared_income, shared_expenses = await viewer_shared_pnl(
-            session, user_id, month_start, month_end, use_effective_date=False
+        # Add what the subject carries of shared costs outside their own
+        # scope: my share of the groceries my partner paid, or of the
+        # concert ticket a friend in another workspace paid.
+        shared_income, shared_expenses = await subject_shares_pnl(
+            session, subject, month_start, month_end, use_effective_date=False
         )
         monthly_income += shared_income
         monthly_expenses += shared_expenses
+
+        # What the subject was given back of what they spent. A shared
+        # refund lowers the category it was booked to, so it has to lower
+        # this card by the same amount rather than raise income —
+        # otherwise the breakdown under it stops adding up to it.
+        credit_offset = sum(
+            (
+                await subject_credit_offsets(
+                    session, subject, month_start, month_end,
+                    use_effective_date=accounting_mode == "accrual",
+                )
+            ).values()
+        )
+        monthly_income -= credit_offset
+        monthly_expenses -= credit_offset
 
     # Keep actual and forecast totals separate. Pending rows, future-dated
     # installments and generate-ahead rows belong only to the projected view.
@@ -490,8 +519,12 @@ async def get_summary(
     # Convert income/expenses to primary currency using amount_primary when available
     # Use real-only totals (without projections) to avoid double-counting;
     # projections are added separately below via convert().
-    monthly_income_primary = real_monthly_income
-    monthly_expenses_primary = abs(real_monthly_expenses)
+    # The fallback is the *unadjusted* base, because the share adjustment
+    # is applied to these figures again a few lines down; starting from
+    # the adjusted native total would apply it twice whenever no row in
+    # the scope carries an `amount_primary`.
+    monthly_income_primary = base_income
+    monthly_expenses_primary = abs(base_expenses)
 
     # Use amount_primary sums for more accurate multi-currency income/expenses.
     # Same posted-only rule as the native-currency totals above.
@@ -519,78 +552,45 @@ async def get_summary(
         monthly_income_primary = float(primary_row[0] or 0)
         monthly_expenses_primary = abs(float(primary_row[1] or 0))
 
-    if not filtered:
-        # Apply share-only offset in primary currency (FX-converted).
-        own_offset_inc_pri, own_offset_exp_pri = await owner_split_offset_pnl(
+    if subject is not None:
+        # Apply the same offset in primary currency (FX-converted).
+        own_offset_inc_pri, own_offset_exp_pri = await foreign_shares_pnl(
             session,
-            user_id,
+            subject,
             month_start,
             month_end,
             use_effective_date=False,
             primary_currency=primary_currency,
-            workspace_id=workspace_id,
         )
         monthly_income_primary -= own_offset_inc_pri
         monthly_expenses_primary -= own_offset_exp_pri
 
-    # Add the viewer's shared shares to primary totals too. The shares
-    # are stored in the parent transaction's currency, so we convert
-    # each currency bucket separately rather than re-using shared_income
-    # / shared_expenses (which were summed without conversion).
-    # Gated under a collection filter — those parent transactions live in
-    # other users'/workspaces' accounts, outside the filtered account set.
-    if not filtered:
-        from app.models.group import GroupMember
-        from app.models.transaction_split import TransactionSplit
+    # Add the subject's outside shares to primary totals too, and take
+    # off the same credit term. The shares are stored in the parent
+    # transaction's currency, so the helper converts each currency
+    # bucket rather than re-using the nominal sums above.
+    # Gated under a collection filter — a collection is cash flow over
+    # its accounts, with no share adjustment.
+    if subject is not None:
+        shared_income_pri, shared_expenses_pri = await subject_shares_pnl(
+            session, subject, month_start, month_end,
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
+        )
+        monthly_income_primary += shared_income_pri
+        monthly_expenses_primary += abs(shared_expenses_pri)
 
-        viewer_member_ids = select(GroupMember.id).where(
-            GroupMember.linked_user_id == user_id,
-            GroupMember.is_self.is_(False),
-        )
-        shared_currency_rows = await session.execute(
-            select(
-                Transaction.currency,
-                func.sum(
-                    case(
-                        (Transaction.type == "credit", TransactionSplit.share_amount),
-                        else_=0,
-                    )
-                ),
-                func.sum(
-                    case(
-                        (Transaction.type == "debit", TransactionSplit.share_amount),
-                        else_=0,
-                    )
-                ),
-            )
-            .select_from(TransactionSplit)
-            .join(Transaction, TransactionSplit.transaction_id == Transaction.id)
-            .where(
-                TransactionSplit.group_member_id.in_(viewer_member_ids),
-                Transaction.user_id != user_id,
-                Transaction.source != "opening_balance",
-                report_date >= month_start,
-                report_date < month_end,
-                report_date <= today,
-                Transaction.status == "posted",
-                counts_as_user_pnl(),
-            )
-            .group_by(Transaction.currency)
-        )
-        for row in shared_currency_rows.all():
-            cur = row[0]
-            in_credit = float(row[1] or 0)
-            in_debit = float(row[2] or 0)
-            if in_credit:
-                credit_pri, _ = await convert(
-                    session, Decimal(str(in_credit)), cur, primary_currency
+        credit_offset_pri = sum(
+            (
+                await subject_credit_offsets(
+                    session, subject, month_start, month_end,
+                    use_effective_date=accounting_mode == "accrual",
+                    primary_currency=primary_currency,
                 )
-                monthly_income_primary += float(credit_pri)
-            if in_debit:
-                debit_pri, _ = await convert(
-                    session, Decimal(str(in_debit)), cur, primary_currency
-                )
-                monthly_expenses_primary += abs(float(debit_pri))
+            ).values()
+        )
+        monthly_income_primary -= credit_offset_pri
+        monthly_expenses_primary -= credit_offset_pri
 
     projected_income_primary = monthly_income_primary
     projected_expenses_primary = monthly_expenses_primary
@@ -727,12 +727,16 @@ async def get_spending_by_category(
     user_id: uuid.UUID,
     month: Optional[date] = None,
     account_ids: Optional[list[uuid.UUID]] = None,
+    filter_user_id: Optional[uuid.UUID] = None,
 ) -> list[SpendingByCategory]:
     if not month:
         month = date.today().replace(day=1)
 
     month_start, month_end = _month_range(month)
     today = date.today()
+    account_ids, subject = await resolve_consumption_scope(
+        session, workspace_id, user_id=filter_user_id, account_ids=account_ids
+    )
     filtered = account_ids is not None
     acct_filter = [Transaction.account_id.in_(account_ids)] if filtered else []
 
@@ -781,16 +785,15 @@ async def get_spending_by_category(
             "projected": 0.0,
         }
 
-    # Subtract non-owner shares per category — owner-side splits should
-    # contribute only the owner's share, not the full amount.
-    owner_offset = {} if filtered else await owner_split_offset_by_category(
+    # Subtract the shares that belong to somebody else — a split in the
+    # subject's scope should contribute only the subject's share.
+    owner_offset = {} if subject is None else await foreign_shares_by_category(
         session,
-        user_id,
+        subject,
         month_start,
         month_end,
         use_effective_date=accounting_mode == "accrual",
         primary_currency=primary_currency,
-        workspace_id=workspace_id,
     )
     for cat_uuid, offset_total in owner_offset.items():
         cat_id = str(cat_uuid) if cat_uuid else None
@@ -799,11 +802,11 @@ async def get_spending_by_category(
             if spending_map[cat_id]["total"] <= 0:
                 spending_map.pop(cat_id)
 
-    # Add shared shares — the viewer's portion of group-split debits
-    # they participate in but don't own. The category comes from the
-    # parent transaction.
-    shared_by_cat = {} if filtered else await viewer_shared_spending_by_category(
-        session, user_id, month_start, month_end,
+    # Add shared shares — the subject's portion of group-split debits
+    # outside their own scope. The category comes from the parent
+    # transaction.
+    shared_by_cat = {} if subject is None else await subject_shares_by_category(
+        session, subject, month_start, month_end,
         use_effective_date=accounting_mode == "accrual",
         primary_currency=primary_currency,
     )
@@ -839,6 +842,26 @@ async def get_spending_by_category(
                     "total": share_total,
                     "projected": 0.0,
                 }
+
+    # A shared credit gives part of a cost back. The subject's share of
+    # one lowers the category it was booked to, so a shared purchase and
+    # its shared refund leave that category at zero.
+    #
+    # Only categories that carry spending this period are touched. No
+    # column says whether a category is an expense or an income one, so
+    # "it has costs here" is what tells them apart: a shared credit in an
+    # income category has no spending to reduce and stays shared income.
+    credit_by_cat = {} if subject is None else await subject_credit_offsets(
+        session, subject, month_start, month_end,
+        use_effective_date=accounting_mode == "accrual",
+        primary_currency=primary_currency,
+    )
+    for cat_uuid, credit_total in credit_by_cat.items():
+        cat_id = str(cat_uuid) if cat_uuid else None
+        if cat_id in spending_map:
+            spending_map[cat_id]["total"] -= credit_total
+            if spending_map[cat_id]["total"] <= 0:
+                spending_map.pop(cat_id)
 
     # Add virtual recurring projections (debit only), converted to primary currency
     projections = await _get_recurring_projections(
@@ -944,7 +967,11 @@ async def get_monthly_trend(
     user_id: uuid.UUID,
     months: int = 6,
     account_ids: Optional[list[uuid.UUID]] = None,
+    filter_user_id: Optional[uuid.UUID] = None,
 ) -> list[MonthlyTrend]:
+    account_ids, subject = await resolve_consumption_scope(
+        session, workspace_id, user_id=filter_user_id, account_ids=account_ids
+    )
     filtered = account_ids is not None
     acct_filter = [Transaction.account_id.in_(account_ids)] if filtered else []
     today = date.today()
@@ -1017,37 +1044,49 @@ async def get_monthly_trend(
         else:
             bucket[1] += amount
 
+    # Take out what somebody else carries of this scope's money, and add
+    # what the subject carries of the money outside it. Both are read by
+    # the same month label the base query groups on, so a month whose
+    # only activity for this subject is a share of somebody else's cost
+    # still appears — which is the whole of her picture when the filter
+    # is on her and every bill sits on his account.
+    foreign_by_month: dict = {}
+    carried_by_month: dict = {}
+    if subject is not None:
+        window_start = today.replace(day=1)
+        for _ in range(max(months - 1, 0)):
+            window_start = (
+                window_start.replace(year=window_start.year - 1, month=12)
+                if window_start.month == 1
+                else window_start.replace(month=window_start.month - 1)
+            )
+        for month_key in trend_map:
+            year, mnum = month_key.split("-")
+            window_start = min(window_start, date(int(year), int(mnum), 1))
+        window_end = _month_range(today.replace(day=1))[1]
+        foreign_by_month = await foreign_shares_pnl_by_period(
+            session, subject, window_start, window_end, label_expr=month_label,
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
+        )
+        carried_by_month = await subject_shares_pnl_by_period(
+            session, subject, window_start, window_end, label_expr=month_label,
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
+        )
+        for month_key in carried_by_month:
+            trend_map.setdefault(month_key, [0.0, 0.0])
+
     trends_raw = sorted(
         ((month, values[0], values[1]) for month, values in trend_map.items()),
         key=lambda row: row[0],
         reverse=True,
     )[:months]
 
-    # Subtract owner non-owner-share offsets per month, and add the
-    # viewer's shares of others' splits.
     adjusted: list[MonthlyTrend] = []
     for month_str, income, expenses in trends_raw:
-        year, mnum = month_str.split("-")
-        m_start = date(int(year), int(mnum), 1)
-        m_end = (
-            date(int(year), int(mnum) + 1, 1)
-            if int(mnum) < 12
-            else date(int(year) + 1, 1, 1)
-        )
-        if filtered:
-            own_inc, own_exp, shared_inc, shared_exp = 0.0, 0.0, 0.0, 0.0
-        else:
-            own_inc, own_exp = await owner_split_offset_pnl(
-                session, user_id, m_start, m_end,
-                use_effective_date=accounting_mode == "accrual",
-                primary_currency=primary_currency,
-                workspace_id=workspace_id,
-            )
-            shared_inc, shared_exp = await viewer_shared_pnl(
-                session, user_id, m_start, m_end,
-                use_effective_date=accounting_mode == "accrual",
-                primary_currency=primary_currency,
-            )
+        own_inc, own_exp = foreign_by_month.get(month_str, (0.0, 0.0))
+        shared_inc, shared_exp = carried_by_month.get(month_str, (0.0, 0.0))
         adjusted.append(
             MonthlyTrend(
                 month=month_str,
@@ -1578,9 +1617,17 @@ async def get_balance_history(
     user_id: uuid.UUID,
     month: Optional[date] = None,
     account_ids: Optional[list[uuid.UUID]] = None,
+    filter_user_id: Optional[uuid.UUID] = None,
 ) -> BalanceHistory:
     if not month:
         month = date.today().replace(day=1)
+
+    # A balance is cash in an account, so the user filter narrows it to
+    # the accounts that person owns and nothing else is adjusted.
+    if filter_user_id is not None:
+        account_ids, _subject = await resolve_consumption_scope(
+            session, workspace_id, user_id=filter_user_id
+        )
 
     month_start, month_end = _month_range(month)
     prev_month_start = (month_start - timedelta(days=1)).replace(day=1)

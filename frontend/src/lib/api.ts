@@ -1184,8 +1184,10 @@ export const budgets = {
   delete: async (id: string): Promise<void> => {
     await api.delete(`/budgets/${id}`)
   },
-  comparison: async (month?: string): Promise<BudgetVsActual[]> => {
-    const { data } = await api.get('/budgets/comparison', { params: { month } })
+  // `userId` is the user filter: the comparison then measures that
+  // person's consumption instead of the whole workspace's.
+  comparison: async (month?: string, userId?: string): Promise<BudgetVsActual[]> => {
+    const { data } = await api.get('/budgets/comparison', { params: { month, user_id: userId } })
     return data
   },
 }
@@ -1225,12 +1227,15 @@ const acctIdsParam = (accountIds?: string[]) =>
     ? { params: { account_ids: accountIds }, paramsSerializer: { indexes: null as null } }
     : {}
 
+// The user filter. A page sends this *instead of* account ids: the
+// server resolves the accounts that person owns and keeps each share
+// with the right person, which a list of account ids cannot say.
 export const dashboard = {
-  summary: async (month?: string, balanceDate?: string, accountIds?: string[], assetGroupIds?: string[]): Promise<DashboardSummary> => {
+  summary: async (month?: string, balanceDate?: string, accountIds?: string[], assetGroupIds?: string[], userId?: string): Promise<DashboardSummary> => {
     const hasFilter = (accountIds && accountIds.length > 0) || (assetGroupIds && assetGroupIds.length > 0)
     const { data } = await api.get('/dashboard/summary', {
       params: {
-        month, balance_date: balanceDate,
+        month, balance_date: balanceDate, user_id: userId,
         ...(accountIds && accountIds.length > 0 ? { account_ids: accountIds } : {}),
         ...(assetGroupIds && assetGroupIds.length > 0 ? { asset_group_ids: assetGroupIds } : {}),
       },
@@ -1238,23 +1243,23 @@ export const dashboard = {
     })
     return data
   },
-  spendingByCategory: async (month?: string, accountIds?: string[]): Promise<SpendingByCategory[]> => {
+  spendingByCategory: async (month?: string, accountIds?: string[], userId?: string): Promise<SpendingByCategory[]> => {
     const extra = acctIdsParam(accountIds)
-    const { data } = await api.get('/dashboard/spending-by-category', { params: { month, ...(extra.params ?? {}) }, ...(extra.paramsSerializer ? { paramsSerializer: extra.paramsSerializer } : {}) })
+    const { data } = await api.get('/dashboard/spending-by-category', { params: { month, user_id: userId, ...(extra.params ?? {}) }, ...(extra.paramsSerializer ? { paramsSerializer: extra.paramsSerializer } : {}) })
     return data
   },
-  monthlyTrend: async (months = 6, accountIds?: string[]): Promise<MonthlyTrend[]> => {
+  monthlyTrend: async (months = 6, accountIds?: string[], userId?: string): Promise<MonthlyTrend[]> => {
     const extra = acctIdsParam(accountIds)
-    const { data } = await api.get('/dashboard/monthly-trend', { params: { months, ...(extra.params ?? {}) }, ...(extra.paramsSerializer ? { paramsSerializer: extra.paramsSerializer } : {}) })
+    const { data } = await api.get('/dashboard/monthly-trend', { params: { months, user_id: userId, ...(extra.params ?? {}) }, ...(extra.paramsSerializer ? { paramsSerializer: extra.paramsSerializer } : {}) })
     return data
   },
   projectedTransactions: async (params?: { month?: string; account_id?: string; from?: string; to?: string }): Promise<ProjectedTransaction[]> => {
     const { data } = await api.get('/dashboard/projected-transactions', { params })
     return data
   },
-  balanceHistory: async (month?: string, accountIds?: string[]): Promise<BalanceHistory> => {
+  balanceHistory: async (month?: string, accountIds?: string[], userId?: string): Promise<BalanceHistory> => {
     const extra = acctIdsParam(accountIds)
-    const { data } = await api.get('/dashboard/balance-history', { params: { month, ...(extra.params ?? {}) }, ...(extra.paramsSerializer ? { paramsSerializer: extra.paramsSerializer } : {}) })
+    const { data } = await api.get('/dashboard/balance-history', { params: { month, user_id: userId, ...(extra.params ?? {}) }, ...(extra.paramsSerializer ? { paramsSerializer: extra.paramsSerializer } : {}) })
     return data
   },
 }
@@ -1421,11 +1426,11 @@ export const collections = {
 
 // Reports
 export const reports = {
-  netWorth: async (months = 12, interval = 'monthly', accountIds?: string[], assetGroupIds?: string[], period?: 'ytd'): Promise<ReportResponse> => {
+  netWorth: async (months = 12, interval = 'monthly', accountIds?: string[], assetGroupIds?: string[], period?: 'ytd', userId?: string): Promise<ReportResponse> => {
     const hasFilter = (accountIds && accountIds.length > 0) || (assetGroupIds && assetGroupIds.length > 0)
     const { data } = await api.get('/reports/net-worth', {
       params: {
-        months, interval, period,
+        months, interval, period, user_id: userId,
         ...(accountIds && accountIds.length > 0 ? { account_ids: accountIds } : {}),
         ...(assetGroupIds && assetGroupIds.length > 0 ? { asset_group_ids: assetGroupIds } : {}),
       },
@@ -1435,14 +1440,14 @@ export const reports = {
   },
   // `days` requests an exact rolling window ending today, instead of the
   // month-aligned window `months` produces.
-  incomeExpenses: async (months = 12, interval = 'monthly', accountIds?: string[], period?: 'ytd', days?: number): Promise<ReportResponse> => {
+  incomeExpenses: async (months = 12, interval = 'monthly', accountIds?: string[], period?: 'ytd', days?: number, userId?: string): Promise<ReportResponse> => {
     const extra = acctIdsParam(accountIds)
-    const { data } = await api.get('/reports/income-expenses', { params: { months, interval, period, days, ...(extra.params ?? {}) }, ...(extra.paramsSerializer ? { paramsSerializer: extra.paramsSerializer } : {}) })
+    const { data } = await api.get('/reports/income-expenses', { params: { months, interval, period, days, user_id: userId, ...(extra.params ?? {}) }, ...(extra.paramsSerializer ? { paramsSerializer: extra.paramsSerializer } : {}) })
     return data
   },
-  cashFlow: async (months = 6, interval = 'daily', baseline = false, accountIds?: string[]): Promise<ReportResponse> => {
+  cashFlow: async (months = 6, interval = 'daily', baseline = false, accountIds?: string[], userId?: string): Promise<ReportResponse> => {
     const extra = acctIdsParam(accountIds)
-    const { data } = await api.get('/reports/cash-flow', { params: { months, interval, baseline, ...(extra.params ?? {}) }, ...(extra.paramsSerializer ? { paramsSerializer: extra.paramsSerializer } : {}) })
+    const { data } = await api.get('/reports/cash-flow', { params: { months, interval, baseline, user_id: userId, ...(extra.params ?? {}) }, ...(extra.paramsSerializer ? { paramsSerializer: extra.paramsSerializer } : {}) })
     return data
   },
 }

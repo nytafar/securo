@@ -17,8 +17,13 @@ from app.models.user import User
 from app.services._query_filters import (
     counts_as_pnl,
     counts_as_user_pnl,
-    owner_split_offset_by_category,
+    foreign_shares_by_category,
+    foreign_shares_pnl_by_period,
     reporting_date_col,
+    resolve_consumption_scope,
+    subject_credit_offsets,
+    subject_shares_by_category,
+    subject_shares_pnl_by_period,
 )
 from app.services.admin_service import get_credit_card_accounting_mode
 from app.services.account_service import get_account_name
@@ -291,11 +296,18 @@ async def get_net_worth_report(
     asset_group_ids: Optional[list[uuid.UUID]] = None,
     period: str | None = None,
     financial_year_start_month: int = 1,
+    filter_user_id: Optional[uuid.UUID] = None,
 ) -> ReportResponse:
     """Build a full ReportResponse for net worth over time."""
     # A wallet-only collection (wallets, no accounts) still filters.
     if asset_group_ids is not None and account_ids is None:
         account_ids = []
+    # Net worth is what is owned and owed, not consumption: the user
+    # filter only narrows it to the accounts that person owns.
+    if filter_user_id is not None:
+        account_ids, _subject = await resolve_consumption_scope(
+            session, workspace_id, user_id=filter_user_id
+        )
     today = date.today()
     start = _report_start_date(
         today, months, period, financial_year_start_month=financial_year_start_month
@@ -397,8 +409,12 @@ async def get_income_expenses_report(
     period: str | None = None,
     days: int | None = None,
     financial_year_start_month: int = 1,
+    filter_user_id: Optional[uuid.UUID] = None,
 ) -> ReportResponse:
     """Build a ReportResponse for income vs expenses over time."""
+    account_ids, subject = await resolve_consumption_scope(
+        session, workspace_id, user_id=filter_user_id, account_ids=account_ids
+    )
     filtered = account_ids is not None
     acct_filter = [Transaction.account_id.in_(account_ids)] if filtered else []
     today = date.today()
@@ -451,138 +467,63 @@ async def get_income_expenses_report(
         expenses = abs(float(row[2] or 0))
         data_map[row[0]] = (income, expenses)
 
-    # Subtract non-owner shares of the user's own splits per period — the
-    # user shouldn't be charged for the parts they're owed back.
-    from sqlalchemy import or_ as _or_, and_ as _and_
-    from app.models.group import Group as _Group_, GroupMember as _GroupMember_
-    from app.models.transaction_split import TransactionSplit as _TS_
+    # Only the subject's own part of what their accounts moved, and the
+    # parts of other people's costs they carry. One subject, two
+    # symmetric queries: what somebody else owns of this scope's money,
+    # and what this subject owns of the money outside it.
     from app.services.fx_rate_service import convert as fx_convert
 
-    own_member_ids_sq = (
-        select(_GroupMember_.id)
-        .outerjoin(_Group_, _Group_.id == _GroupMember_.group_id)
-        .where(
-            _or_(
-                _GroupMember_.linked_user_id == user_id,
-                _and_(_GroupMember_.is_self == True, _Group_.user_id == user_id),
+    if subject is not None:
+        foreign = await foreign_shares_pnl_by_period(
+            session, subject, start, today + timedelta(days=1),
+            label_expr=label_expr,
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
+        )
+        for period_key, (sub_inc, sub_exp) in foreign.items():
+            existing_income, existing_expenses = data_map.get(period_key, (0.0, 0.0))
+            data_map[period_key] = (
+                max(0.0, existing_income - sub_inc),
+                max(0.0, existing_expenses - abs(sub_exp)),
             )
-        )
-    )
-    owner_offset_result = await session.execute(
-        select(
-            label_expr,
-            Transaction.currency,
-            func.sum(
-                case(
-                    (Transaction.type == "credit", _TS_.share_amount),
-                    else_=0,
-                )
-            ),
-            func.sum(
-                case(
-                    (Transaction.type == "debit", _TS_.share_amount),
-                    else_=0,
-                )
-            ),
-        )
-        .select_from(_TS_)
-        .join(Transaction, _TS_.transaction_id == Transaction.id)
-        .where(
-            Transaction.user_id == user_id,
-            Transaction.workspace_id == workspace_id,
-            _TS_.group_member_id.notin_(own_member_ids_sq),
-            report_date >= start,
-            report_date <= today,
-            Transaction.source != "opening_balance",
-            Transaction.status == "posted",
-            counts_as_user_pnl(),
-        )
-        .group_by(label_expr, Transaction.currency)
-    )
-    for row in (owner_offset_result.all() if not filtered else []):
-        period, currency, raw_credit, raw_debit = row
-        sub_inc = 0.0
-        sub_exp = 0.0
-        if raw_credit:
-            inc_pri, _ = await fx_convert(
-                session, Decimal(str(raw_credit)), currency, primary_currency
-            )
-            sub_inc = float(inc_pri)
-        if raw_debit:
-            exp_pri, _ = await fx_convert(
-                session, Decimal(str(raw_debit)), currency, primary_currency
-            )
-            sub_exp = abs(float(exp_pri))
-        existing_income, existing_expenses = data_map.get(period, (0.0, 0.0))
-        data_map[period] = (
-            max(0.0, existing_income - sub_inc),
-            max(0.0, existing_expenses - sub_exp),
-        )
 
-    # Layer in the viewer's share from group splits — concert tickets
-    # paid by a friend show up as the viewer's expense in their P/L
-    # picture, just like in /transactions and the dashboard. Group by
-    # currency so we can FX-convert each bucket to primary correctly.
-    from app.models.group import GroupMember
-    from app.models.transaction_split import TransactionSplit
+        # Concert tickets paid by a friend, or this month's groceries paid
+        # by my partner: the subject's share is their expense even though
+        # the money never left their account.
+        carried = await subject_shares_pnl_by_period(
+            session, subject, start, today + timedelta(days=1),
+            label_expr=label_expr,
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
+        )
+        for period_key, (share_income, share_expenses) in carried.items():
+            existing_income, existing_expenses = data_map.get(period_key, (0.0, 0.0))
+            data_map[period_key] = (
+                existing_income + share_income,
+                existing_expenses + abs(share_expenses),
+            )
 
-    # Exclude is_self memberships — the owner's own self-member must
-    # not surface their in-Pessoal transactions in Trabalho's report.
-    viewer_member_ids = select(GroupMember.id).where(
-        GroupMember.linked_user_id == user_id,
-        GroupMember.is_self.is_(False),
-    )
-    shared_result = await session.execute(
-        select(
-            label_expr,
-            Transaction.currency,
-            func.sum(
-                case(
-                    (Transaction.type == "credit", TransactionSplit.share_amount),
-                    else_=0,
-                )
-            ),
-            func.sum(
-                case(
-                    (Transaction.type == "debit", TransactionSplit.share_amount),
-                    else_=0,
-                )
-            ),
-        )
-        .select_from(TransactionSplit)
-        .join(Transaction, TransactionSplit.transaction_id == Transaction.id)
-        .where(
-            TransactionSplit.group_member_id.in_(viewer_member_ids),
-            Transaction.user_id != user_id,
-            Transaction.workspace_id != workspace_id,
-            report_date >= start,
-            report_date <= today,
-            Transaction.source != "opening_balance",
-            Transaction.status == "posted",
-            counts_as_user_pnl(),
-        )
-        .group_by(label_expr, Transaction.currency)
-    )
-    from app.services.fx_rate_service import convert as fx_convert
-    for row in (shared_result.all() if not filtered else []):
-        period, currency, raw_credit, raw_debit = row
-        share_income_pri = 0.0
-        share_expenses_pri = 0.0
-        if raw_credit:
-            inc_pri, _ = await fx_convert(
-                session, Decimal(str(raw_credit)), currency, primary_currency
+        # What the subject was given back of what they spent, per period.
+        # It lowers expenses instead of raising income, which is what
+        # keeps this series equal to the sum of the composition's lines.
+        period_credit_offsets: dict[str, float] = {}
+        for (period_key, _cat_id), amount in (
+            await subject_credit_offsets(
+                session, subject, start, today + timedelta(days=1),
+                label_expr=label_expr,
+                use_effective_date=accounting_mode == "accrual",
+                primary_currency=primary_currency,
             )
-            share_income_pri = float(inc_pri)
-        if raw_debit:
-            exp_pri, _ = await fx_convert(
-                session, Decimal(str(raw_debit)), currency, primary_currency
+        ).items():
+            period_credit_offsets[period_key] = (
+                period_credit_offsets.get(period_key, 0.0) + amount
             )
-            share_expenses_pri = abs(float(exp_pri))
-        existing_income, existing_expenses = data_map.get(period, (0.0, 0.0))
-        data_map[period] = (
-            existing_income + share_income_pri,
-            existing_expenses + share_expenses_pri,
-        )
+        for period_key, offset in period_credit_offsets.items():
+            existing_income, existing_expenses = data_map.get(period_key, (0.0, 0.0))
+            data_map[period_key] = (
+                max(0.0, existing_income - offset),
+                max(0.0, existing_expenses - offset),
+            )
 
     forecast_map: dict[str, tuple[float, float]] = {}
 
@@ -792,21 +733,99 @@ async def get_income_expenses_report(
             "value": amount,
         }
 
-    # Subtract non-owner shares of own splits from composition (debit only —
-    # owner_split_offset_by_category is debit-only). Keeps the report's
-    # composition consistent with summary totals under share-only model.
-    full_range_offset = {} if filtered else await owner_split_offset_by_category(
-        session, user_id, start, today + timedelta(days=1),
-        use_effective_date=accounting_mode == "accrual",
-        primary_currency=primary_currency,
-    )
-    for cat_uuid, offset_total in full_range_offset.items():
-        cat_key = str(cat_uuid) if cat_uuid else "uncategorized"
-        comp_key = (cat_key, "expenses")
-        if comp_key in comp_map:
-            comp_map[comp_key]["value"] -= offset_total
-            if comp_map[comp_key]["value"] <= 0:
-                comp_map.pop(comp_key)
+    # The composition is the subject's consumption per category: their
+    # own costs, less the parts of them somebody else carries, plus the
+    # parts they carry of costs paid outside their scope, less their
+    # share of any shared credit booked to a category that has costs
+    # here — so a shared purchase and its shared refund cancel.
+    #
+    # The income side takes the first two of those terms as well. It used
+    # to carry full amounts, which made a shared credit read as all of
+    # one person's income no matter whose it was, and disagreed with the
+    # series on the same screen.
+    range_end = today + timedelta(days=1)
+    empty: dict = {}
+    if subject is None:
+        full_range_offset = carried_by_cat = credit_by_cat = empty
+        income_offset = income_carried = empty
+    else:
+        full_range_offset = await foreign_shares_by_category(
+            session, subject, start, range_end,
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
+        )
+        carried_by_cat = await subject_shares_by_category(
+            session, subject, start, range_end,
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
+        )
+        credit_by_cat = await subject_credit_offsets(
+            session, subject, start, range_end,
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
+        )
+        income_offset = await foreign_shares_by_category(
+            session, subject, start, range_end, tx_type="credit",
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
+        )
+        income_carried = await subject_shares_by_category(
+            session, subject, start, range_end, tx_type="credit",
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
+        )
+
+    # A cost or a credit outside the scope brings its own category with
+    # it, and that category may have no line here yet.
+    unknown_cats = {
+        cat_uuid
+        for source, group in (
+            (carried_by_cat, "expenses"),
+            (income_carried, "income"),
+        )
+        for cat_uuid in source
+        if cat_uuid is not None and (str(cat_uuid), group) not in comp_map
+    }
+    carried_meta: dict = {}
+    if unknown_cats:
+        meta_rows = await session.execute(
+            select(Category.id, Category.name, Category.color).where(
+                Category.id.in_(list(unknown_cats))
+            )
+        )
+        carried_meta = {row[0]: (row[1], row[2]) for row in meta_rows.all()}
+
+    def _add(group: str, cat_uuid, delta: float, *, create: bool) -> None:
+        comp_key = (str(cat_uuid) if cat_uuid else "uncategorized", group)
+        entry = comp_map.get(comp_key)
+        if entry is None:
+            if not create or delta <= 0:
+                return
+            cat_meta = carried_meta.get(cat_uuid)
+            comp_map[comp_key] = {
+                "label": cat_meta[0] if cat_meta else "Uncategorized",
+                "color": cat_meta[1] if cat_meta else "#6B7280",
+                "value": delta,
+            }
+            return
+        entry["value"] += delta
+        if entry["value"] <= 0:
+            comp_map.pop(comp_key)
+
+    for cat_uuid, amount in carried_by_cat.items():
+        _add("expenses", cat_uuid, amount, create=True)
+    for cat_uuid, amount in income_carried.items():
+        _add("income", cat_uuid, amount, create=True)
+    for cat_uuid, amount in full_range_offset.items():
+        _add("expenses", cat_uuid, -amount, create=False)
+    for cat_uuid, amount in income_offset.items():
+        _add("income", cat_uuid, -amount, create=False)
+    # The credit term moves the subject's share of a refund out of income
+    # and off the cost it refunded, in that order, so both sides of the
+    # composition match the series.
+    for cat_uuid, amount in credit_by_cat.items():
+        _add("income", cat_uuid, -amount, create=False)
+        _add("expenses", cat_uuid, -amount, create=False)
 
     # Investment-style outflows: transactions in `treat_as_transfer` categories
     # are excluded from P&L by counts_as_user_pnl (an investment application's
@@ -901,46 +920,56 @@ async def get_income_expenses_report(
             cat_trend_map[map_key]["periods"].get(period_label, 0.0) + amount
         )
 
-    # Subtract non-owner shares of own splits per (period, category) — keeps
-    # the per-category trend consistent with the share-only summary.
-    cat_offset_result = await session.execute(
-        select(
-            label_expr,
-            Transaction.category_id,
-            Transaction.currency,
-            func.sum(_TS_.share_amount),
+    # The same three terms as the composition, per (period, category), so
+    # a sparkline and the bar above it tell one story.
+    if subject is None:
+        trend_offset: dict = {}
+        trend_carried: dict = {}
+        trend_credits: dict = {}
+    else:
+        trend_offset = await foreign_shares_by_category(
+            session, subject, start, range_end, label_expr=label_expr,
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
         )
-        .select_from(_TS_)
-        .join(Transaction, _TS_.transaction_id == Transaction.id)
-        .where(
-            Transaction.user_id == user_id,
-            Transaction.workspace_id == workspace_id,
-            Transaction.type == "debit",
-            _TS_.group_member_id.notin_(own_member_ids_sq),
-            report_date >= start,
-            report_date <= today,
-            Transaction.source != "opening_balance",
-            Transaction.status == "posted",
-            counts_as_user_pnl(),
+        trend_carried = await subject_shares_by_category(
+            session, subject, start, range_end, label_expr=label_expr,
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
         )
-        .group_by(label_expr, Transaction.category_id, Transaction.currency)
-    )
-    for period_label, cat_id, currency, raw_total in (cat_offset_result.all() if not filtered else []):
-        if not raw_total:
+        trend_credits = await subject_credit_offsets(
+            session, subject, start, range_end, label_expr=label_expr,
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
+        )
+
+    # A cost the subject carries on somebody else's account has no row
+    # from the base query above, so the sparkline has to be opened for
+    # it — exactly as the composition opens a bar. Without this, the
+    # filter on the member who pays for nothing showed a total and a
+    # breakdown but no trends at all.
+    for (_period_label, cat_id) in trend_carried:
+        map_key = (str(cat_id) if cat_id else "uncategorized", "expenses")
+        if map_key in cat_trend_map:
             continue
-        cat_key = str(cat_id) if cat_id else "uncategorized"
-        offset_pri, _ = await fx_convert(
-            session, Decimal(str(raw_total)), currency, primary_currency
-        )
-        offset = float(offset_pri)
-        map_key = (cat_key, "expenses")
-        if map_key not in cat_trend_map:
-            continue
-        cat_trend_map[map_key]["total"] = max(
-            0.0, cat_trend_map[map_key]["total"] - offset
-        )
-        cur_period = cat_trend_map[map_key]["periods"].get(period_label, 0.0)
-        cat_trend_map[map_key]["periods"][period_label] = max(0.0, cur_period - offset)
+        cat_meta = carried_meta.get(cat_id)
+        cat_trend_map[map_key] = {
+            "label": cat_meta[0] if cat_meta else "Uncategorized",
+            "color": cat_meta[1] if cat_meta else "#6B7280",
+            "total": 0.0,
+            "periods": {},
+        }
+
+    for source, sign in ((trend_carried, 1.0), (trend_offset, -1.0), (trend_credits, -1.0)):
+        for (period_label, cat_id), total in source.items():
+            map_key = (str(cat_id) if cat_id else "uncategorized", "expenses")
+            entry = cat_trend_map.get(map_key)
+            if entry is None:
+                continue
+            delta = sign * total
+            entry["total"] = max(0.0, entry["total"] + delta)
+            current = entry["periods"].get(period_label, 0.0)
+            entry["periods"][period_label] = max(0.0, current + delta)
     # Drop categories that fully zeroed out
     for key in list(cat_trend_map.keys()):
         if cat_trend_map[key]["total"] <= 0:
@@ -1285,6 +1314,7 @@ async def get_cash_flow_report(
     currency: str = "USD",
     baseline: bool = False,
     account_ids: Optional[list[uuid.UUID]] = None,
+    filter_user_id: Optional[uuid.UUID] = None,
 ) -> ReportResponse:
     """Cash flow chart with a short past window plus a forward projection.
 
@@ -1306,6 +1336,12 @@ async def get_cash_flow_report(
     from app.services.dashboard_service import _balance_at, _get_recurring_projections
     from app.services.fx_rate_service import get_rate
 
+    # Cash flow is cash through accounts, so the user filter narrows it
+    # to the accounts that person owns and adjusts no share.
+    if filter_user_id is not None:
+        account_ids, _subject = await resolve_consumption_scope(
+            session, workspace_id, user_id=filter_user_id
+        )
     acct_filter = [Transaction.account_id.in_(account_ids)] if account_ids is not None else []
     today = date.today()
     end = _add_months(today, months)

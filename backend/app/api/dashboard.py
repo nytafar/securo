@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_async_session
 from app.core.workspace_context import WorkspaceContext, current_workspace
+from app.api._user_filter import assert_filterable_user
 from app.schemas.dashboard import DashboardSummary, SpendingByCategory, MonthlyTrend, ProjectedTransaction, BalanceHistory
 from app.services import dashboard_service
 
@@ -19,12 +20,14 @@ async def get_summary(
     balance_date: Optional[date] = Query(None),
     account_ids: Optional[list[uuid.UUID]] = Query(None),
     asset_group_ids: Optional[list[uuid.UUID]] = Query(None),
+    user_id: Optional[uuid.UUID] = Query(None),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
+    await assert_filterable_user(session, ctx.workspace.id, user_id)
     return await dashboard_service.get_summary(
         session, ctx.workspace.id, ctx.user_id, month, balance_date, account_ids,
-        asset_group_ids,
+        asset_group_ids, filter_user_id=user_id,
     )
 
 
@@ -32,11 +35,14 @@ async def get_summary(
 async def get_spending_by_category(
     month: Optional[date] = Query(None),
     account_ids: Optional[list[uuid.UUID]] = Query(None),
+    user_id: Optional[uuid.UUID] = Query(None),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
+    await assert_filterable_user(session, ctx.workspace.id, user_id)
     return await dashboard_service.get_spending_by_category(
-        session, ctx.workspace.id, ctx.user_id, month, account_ids
+        session, ctx.workspace.id, ctx.user_id, month, account_ids,
+        filter_user_id=user_id,
     )
 
 
@@ -44,11 +50,14 @@ async def get_spending_by_category(
 async def get_monthly_trend(
     months: int = Query(6, ge=1, le=12),
     account_ids: Optional[list[uuid.UUID]] = Query(None),
+    user_id: Optional[uuid.UUID] = Query(None),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
+    await assert_filterable_user(session, ctx.workspace.id, user_id)
     return await dashboard_service.get_monthly_trend(
-        session, ctx.workspace.id, ctx.user_id, months, account_ids
+        session, ctx.workspace.id, ctx.user_id, months, account_ids,
+        filter_user_id=user_id,
     )
 
 
@@ -56,11 +65,14 @@ async def get_monthly_trend(
 async def get_balance_history(
     month: Optional[date] = Query(None),
     account_ids: Optional[list[uuid.UUID]] = Query(None),
+    user_id: Optional[uuid.UUID] = Query(None),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
+    await assert_filterable_user(session, ctx.workspace.id, user_id)
     return await dashboard_service.get_balance_history(
-        session, ctx.workspace.id, ctx.user_id, month, account_ids
+        session, ctx.workspace.id, ctx.user_id, month, account_ids,
+        filter_user_id=user_id,
     )
 
 
