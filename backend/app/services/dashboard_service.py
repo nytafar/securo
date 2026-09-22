@@ -20,11 +20,9 @@ from app.services._query_filters import (
     foreign_shares_pnl,
     foreign_shares_pnl_by_period,
     is_contribution_link,
-    outside_subject_scope,
     reporting_date_col,
     resolve_consumption_scope,
-    subject_credit_shares_by_category,
-    subject_member_ids,
+    subject_credit_offsets,
     subject_shares_by_category,
     subject_shares_pnl,
     subject_shares_pnl_by_period,
@@ -410,6 +408,21 @@ async def get_summary(
         monthly_income += shared_income
         monthly_expenses += shared_expenses
 
+        # What the subject was given back of what they spent. A shared
+        # refund lowers the category it was booked to, so it has to lower
+        # this card by the same amount rather than raise income —
+        # otherwise the breakdown under it stops adding up to it.
+        credit_offset = sum(
+            (
+                await subject_credit_offsets(
+                    session, subject, month_start, month_end,
+                    use_effective_date=accounting_mode == "accrual",
+                )
+            ).values()
+        )
+        monthly_income -= credit_offset
+        monthly_expenses -= credit_offset
+
     # Keep actual and forecast totals separate. Pending rows, future-dated
     # installments and generate-ahead rows belong only to the projected view.
     real_monthly_income = monthly_income
@@ -552,60 +565,32 @@ async def get_summary(
         monthly_income_primary -= own_offset_inc_pri
         monthly_expenses_primary -= own_offset_exp_pri
 
-    # Add the subject's outside shares to primary totals too. The shares
-    # are stored in the parent transaction's currency, so we convert
-    # each currency bucket separately rather than re-using shared_income
-    # / shared_expenses (which were summed without conversion).
+    # Add the subject's outside shares to primary totals too, and take
+    # off the same credit term. The shares are stored in the parent
+    # transaction's currency, so the helper converts each currency
+    # bucket rather than re-using the nominal sums above.
     # Gated under a collection filter — a collection is cash flow over
     # its accounts, with no share adjustment.
     if subject is not None:
-        from app.models.transaction_split import TransactionSplit
-
-        viewer_member_ids = subject_member_ids(subject)
-        shared_currency_rows = await session.execute(
-            select(
-                Transaction.currency,
-                func.sum(
-                    case(
-                        (Transaction.type == "credit", TransactionSplit.share_amount),
-                        else_=0,
-                    )
-                ),
-                func.sum(
-                    case(
-                        (Transaction.type == "debit", TransactionSplit.share_amount),
-                        else_=0,
-                    )
-                ),
-            )
-            .select_from(TransactionSplit)
-            .join(Transaction, TransactionSplit.transaction_id == Transaction.id)
-            .where(
-                TransactionSplit.group_member_id.in_(viewer_member_ids),
-                outside_subject_scope(subject),
-                Transaction.source != "opening_balance",
-                report_date >= month_start,
-                report_date < month_end,
-                report_date <= today,
-                Transaction.status == "posted",
-                counts_as_user_pnl(),
-            )
-            .group_by(Transaction.currency)
+        shared_income_pri, shared_expenses_pri = await subject_shares_pnl(
+            session, subject, month_start, month_end,
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
         )
-        for row in shared_currency_rows.all():
-            cur = row[0]
-            in_credit = float(row[1] or 0)
-            in_debit = float(row[2] or 0)
-            if in_credit:
-                credit_pri, _ = await convert(
-                    session, Decimal(str(in_credit)), cur, primary_currency
+        monthly_income_primary += shared_income_pri
+        monthly_expenses_primary += abs(shared_expenses_pri)
+
+        credit_offset_pri = sum(
+            (
+                await subject_credit_offsets(
+                    session, subject, month_start, month_end,
+                    use_effective_date=accounting_mode == "accrual",
+                    primary_currency=primary_currency,
                 )
-                monthly_income_primary += float(credit_pri)
-            if in_debit:
-                debit_pri, _ = await convert(
-                    session, Decimal(str(in_debit)), cur, primary_currency
-                )
-                monthly_expenses_primary += abs(float(debit_pri))
+            ).values()
+        )
+        monthly_income_primary -= credit_offset_pri
+        monthly_expenses_primary -= credit_offset_pri
 
     projected_income_primary = monthly_income_primary
     projected_expenses_primary = monthly_expenses_primary
@@ -866,7 +851,7 @@ async def get_spending_by_category(
     # column says whether a category is an expense or an income one, so
     # "it has costs here" is what tells them apart: a shared credit in an
     # income category has no spending to reduce and stays shared income.
-    credit_by_cat = {} if subject is None else await subject_credit_shares_by_category(
+    credit_by_cat = {} if subject is None else await subject_credit_offsets(
         session, subject, month_start, month_end,
         use_effective_date=accounting_mode == "accrual",
         primary_currency=primary_currency,

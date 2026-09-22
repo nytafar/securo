@@ -21,7 +21,7 @@ from app.services._query_filters import (
     foreign_shares_pnl_by_period,
     reporting_date_col,
     resolve_consumption_scope,
-    subject_credit_shares_by_category,
+    subject_credit_offsets,
     subject_shares_by_category,
     subject_shares_pnl_by_period,
 )
@@ -503,6 +503,28 @@ async def get_income_expenses_report(
                 existing_expenses + abs(share_expenses),
             )
 
+        # What the subject was given back of what they spent, per period.
+        # It lowers expenses instead of raising income, which is what
+        # keeps this series equal to the sum of the composition's lines.
+        period_credit_offsets: dict[str, float] = {}
+        for (period_key, _cat_id), amount in (
+            await subject_credit_offsets(
+                session, subject, start, today + timedelta(days=1),
+                label_expr=label_expr,
+                use_effective_date=accounting_mode == "accrual",
+                primary_currency=primary_currency,
+            )
+        ).items():
+            period_credit_offsets[period_key] = (
+                period_credit_offsets.get(period_key, 0.0) + amount
+            )
+        for period_key, offset in period_credit_offsets.items():
+            existing_income, existing_expenses = data_map.get(period_key, (0.0, 0.0))
+            data_map[period_key] = (
+                max(0.0, existing_income - offset),
+                max(0.0, existing_expenses - offset),
+            )
+
     forecast_map: dict[str, tuple[float, float]] = {}
 
     # Add recurring projections for each month in the range (consistent with dashboard)
@@ -716,11 +738,16 @@ async def get_income_expenses_report(
     # parts they carry of costs paid outside their scope, less their
     # share of any shared credit booked to a category that has costs
     # here — so a shared purchase and its shared refund cancel.
+    #
+    # The income side takes the first two of those terms as well. It used
+    # to carry full amounts, which made a shared credit read as all of
+    # one person's income no matter whose it was, and disagreed with the
+    # series on the same screen.
     range_end = today + timedelta(days=1)
+    empty: dict = {}
     if subject is None:
-        full_range_offset: dict = {}
-        carried_by_cat: dict = {}
-        credit_by_cat: dict = {}
+        full_range_offset = carried_by_cat = credit_by_cat = empty
+        income_offset = income_carried = empty
     else:
         full_range_offset = await foreign_shares_by_category(
             session, subject, start, range_end,
@@ -732,53 +759,73 @@ async def get_income_expenses_report(
             use_effective_date=accounting_mode == "accrual",
             primary_currency=primary_currency,
         )
-        credit_by_cat = await subject_credit_shares_by_category(
+        credit_by_cat = await subject_credit_offsets(
             session, subject, start, range_end,
             use_effective_date=accounting_mode == "accrual",
             primary_currency=primary_currency,
         )
-    # A cost paid outside the scope brings its own category with it, and
-    # that category may have no line here yet.
-    unknown_cats = [
+        income_offset = await foreign_shares_by_category(
+            session, subject, start, range_end, tx_type="credit",
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
+        )
+        income_carried = await subject_shares_by_category(
+            session, subject, start, range_end, tx_type="credit",
+            use_effective_date=accounting_mode == "accrual",
+            primary_currency=primary_currency,
+        )
+
+    # A cost or a credit outside the scope brings its own category with
+    # it, and that category may have no line here yet.
+    unknown_cats = {
         cat_uuid
-        for cat_uuid in carried_by_cat
-        if cat_uuid is not None
-        and (str(cat_uuid), "expenses") not in comp_map
-    ]
+        for source, group in (
+            (carried_by_cat, "expenses"),
+            (income_carried, "income"),
+        )
+        for cat_uuid in source
+        if cat_uuid is not None and (str(cat_uuid), group) not in comp_map
+    }
     carried_meta: dict = {}
     if unknown_cats:
         meta_rows = await session.execute(
             select(Category.id, Category.name, Category.color).where(
-                Category.id.in_(unknown_cats)
+                Category.id.in_(list(unknown_cats))
             )
         )
         carried_meta = {row[0]: (row[1], row[2]) for row in meta_rows.all()}
-    for cat_uuid, share_total in carried_by_cat.items():
-        cat_key = str(cat_uuid) if cat_uuid else "uncategorized"
-        comp_key = (cat_key, "expenses")
-        if comp_key in comp_map:
-            comp_map[comp_key]["value"] += share_total
-        else:
+
+    def _add(group: str, cat_uuid, delta: float, *, create: bool) -> None:
+        comp_key = (str(cat_uuid) if cat_uuid else "uncategorized", group)
+        entry = comp_map.get(comp_key)
+        if entry is None:
+            if not create or delta <= 0:
+                return
             cat_meta = carried_meta.get(cat_uuid)
             comp_map[comp_key] = {
                 "label": cat_meta[0] if cat_meta else "Uncategorized",
                 "color": cat_meta[1] if cat_meta else "#6B7280",
-                "value": share_total,
+                "value": delta,
             }
-    for cat_uuid, offset_total in full_range_offset.items():
-        cat_key = str(cat_uuid) if cat_uuid else "uncategorized"
-        comp_key = (cat_key, "expenses")
-        if comp_key in comp_map:
-            comp_map[comp_key]["value"] -= offset_total
-            if comp_map[comp_key]["value"] <= 0:
-                comp_map.pop(comp_key)
-    for cat_uuid, credit_total in credit_by_cat.items():
-        cat_key = str(cat_uuid) if cat_uuid else "uncategorized"
-        comp_key = (cat_key, "expenses")
-        if comp_key in comp_map:
-            comp_map[comp_key]["value"] -= credit_total
-            if comp_map[comp_key]["value"] <= 0:
-                comp_map.pop(comp_key)
+            return
+        entry["value"] += delta
+        if entry["value"] <= 0:
+            comp_map.pop(comp_key)
+
+    for cat_uuid, amount in carried_by_cat.items():
+        _add("expenses", cat_uuid, amount, create=True)
+    for cat_uuid, amount in income_carried.items():
+        _add("income", cat_uuid, amount, create=True)
+    for cat_uuid, amount in full_range_offset.items():
+        _add("expenses", cat_uuid, -amount, create=False)
+    for cat_uuid, amount in income_offset.items():
+        _add("income", cat_uuid, -amount, create=False)
+    # The credit term moves the subject's share of a refund out of income
+    # and off the cost it refunded, in that order, so both sides of the
+    # composition match the series.
+    for cat_uuid, amount in credit_by_cat.items():
+        _add("income", cat_uuid, -amount, create=False)
+        _add("expenses", cat_uuid, -amount, create=False)
 
     # Investment-style outflows: transactions in `treat_as_transfer` categories
     # are excluded from P&L by counts_as_user_pnl (an investment application's
@@ -890,11 +937,28 @@ async def get_income_expenses_report(
             use_effective_date=accounting_mode == "accrual",
             primary_currency=primary_currency,
         )
-        trend_credits = await subject_credit_shares_by_category(
+        trend_credits = await subject_credit_offsets(
             session, subject, start, range_end, label_expr=label_expr,
             use_effective_date=accounting_mode == "accrual",
             primary_currency=primary_currency,
         )
+
+    # A cost the subject carries on somebody else's account has no row
+    # from the base query above, so the sparkline has to be opened for
+    # it — exactly as the composition opens a bar. Without this, the
+    # filter on the member who pays for nothing showed a total and a
+    # breakdown but no trends at all.
+    for (_period_label, cat_id) in trend_carried:
+        map_key = (str(cat_id) if cat_id else "uncategorized", "expenses")
+        if map_key in cat_trend_map:
+            continue
+        cat_meta = carried_meta.get(cat_id)
+        cat_trend_map[map_key] = {
+            "label": cat_meta[0] if cat_meta else "Uncategorized",
+            "color": cat_meta[1] if cat_meta else "#6B7280",
+            "total": 0.0,
+            "periods": {},
+        }
 
     for source, sign in ((trend_carried, 1.0), (trend_offset, -1.0), (trend_credits, -1.0)):
         for (period_label, cat_id), total in source.items():

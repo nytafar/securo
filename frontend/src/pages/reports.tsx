@@ -27,6 +27,7 @@ import { CashflowSankey } from '@/components/reports/CashflowSankey'
 import { usePrivacyMode } from '@/hooks/use-privacy-mode'
 import { useAuth } from '@/contexts/auth-context'
 import { useCollectionFilter } from '@/contexts/collection-filter-context'
+import { filterScope } from '@/lib/filter-scope'
 import type { ReportResponse, CategoryTrendItem } from '@/types'
 import { formatCurrency } from '@/lib/format'
 
@@ -156,9 +157,11 @@ export default function ReportsPage() {
   const walletIds = activeWalletIds ?? undefined
   const filterUserId = activeUserId ?? undefined
   // Wallet-only collection (active, zero accounts): the account-based reports
-  // (income/expenses, cash flow) have no data — only net worth (which includes
-  // the wallets' assets) is meaningful.
-  const noAccounts = activeAccountIds !== null && activeAccountIds.length === 0
+  // have no data — only net worth (which includes the wallets' assets) is
+  // meaningful. A person who owns no account here still carries shares of
+  // what the others paid, so income/expenses still has an answer for them;
+  // only cash flow has nothing to walk.
+  const { noCashAccounts, noConsumption } = filterScope(activeAccountIds, activeUserId)
 
   const currentTab = REPORT_TABS.find((tab) => tab.key === activeTab) ?? REPORT_TABS[0]
 
@@ -205,7 +208,10 @@ export default function ReportsPage() {
         : activeTab === 'income_expenses' || isMoneyMap
           ? reports.incomeExpenses(months, interval, acctIds, period, days, filterUserId)
           : reports.netWorth(months, interval, acctIds, walletIds, period, filterUserId),
-    enabled: currentTab.enabled && !(noAccounts && activeTab !== 'net_worth'),
+    enabled:
+      currentTab.enabled
+      && !(noConsumption && activeTab !== 'net_worth')
+      && !(noCashAccounts && isCashFlow),
   })
 
   const summary = data?.summary

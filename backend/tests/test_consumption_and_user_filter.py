@@ -889,3 +889,505 @@ async def test_the_user_filter_narrows_the_balance_to_her_own_accounts(
     )
     assert hers.total_balance_primary == pytest.approx(700.0, abs=0.01)
     assert both.total_balance_primary == pytest.approx(800.0, abs=0.01)
+
+
+# ───────────────── a workspace is a separate set of books ───────────────
+
+
+async def _second_workspace(session: AsyncSession, user):
+    """Another workspace of his — a personal one beside the household,
+    which is what everybody has after registering."""
+    from app.models.workspace import Workspace
+
+    workspace = Workspace(
+        id=uuid.uuid4(),
+        name="Personal",
+        kind="personal",
+        created_by_user_id=user.id,
+        default_currency="USD",
+        locale="en",
+    )
+    session.add(workspace)
+    await session.flush()
+    session.add(
+        WorkspaceMember(
+            id=uuid.uuid4(),
+            workspace_id=workspace.id,
+            user_id=user.id,
+            role="owner",
+        )
+    )
+    account = Account(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        workspace_id=workspace.id,
+        name="Personal checking",
+        type="checking",
+        balance=Decimal("0"),
+        currency="USD",
+    )
+    session.add(account)
+    await session.flush()
+    return workspace, account
+
+
+@pytest.mark.asyncio
+async def test_the_household_never_reaches_his_other_workspace(
+    session: AsyncSession, test_user, test_workspace, to_char
+):
+    """A workspace is its own set of books. His share of the household's
+    groceries belongs to the household's figures and to no other."""
+    home, category, _tx_row, when = await _her_shared_groceries(
+        session, test_user, test_workspace
+    )
+    # The same again, paid by him, plus a shared refund — the three
+    # shapes that could cross the line.
+    his_groceries = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        GROCERIES,
+        when=when,
+        category_id=category.id,
+        description="His groceries",
+    )
+    await _share_evenly(session, home, his_groceries, test_user.id)
+    refund = await _tx(
+        session,
+        test_user.id,
+        test_workspace.id,
+        home["mine"].id,
+        Decimal("200.00"),
+        type_="credit",
+        when=when,
+        category_id=category.id,
+        description="Refund",
+    )
+    await _share_evenly(session, home, refund, test_user.id)
+
+    personal, personal_account = await _second_workspace(session, test_user)
+    personal_category = Category(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        workspace_id=personal.id,
+        name="Books",
+        icon="book",
+        color="#3B82F6",
+    )
+    session.add(personal_category)
+    await session.flush()
+    await _tx(
+        session,
+        test_user.id,
+        personal.id,
+        personal_account.id,
+        Decimal("200.00"),
+        when=when,
+        category_id=personal_category.id,
+        description="A book",
+    )
+    await session.commit()
+    month = when.replace(day=1)
+
+    # His personal workspace shows its own 200 and nothing of the house.
+    summary = await dashboard_service.get_summary(
+        session, personal.id, test_user.id, month
+    )
+    assert summary.monthly_expenses_primary == pytest.approx(200.0, abs=0.01)
+    assert summary.monthly_income_primary == pytest.approx(0.0, abs=0.01)
+
+    rows = await dashboard_service.get_spending_by_category(
+        session, personal.id, test_user.id, month
+    )
+    assert {row.category_name for row in rows} == {"Books"}
+    assert rows[0].total == pytest.approx(200.0, abs=0.01)
+
+    trend = await dashboard_service.get_monthly_trend(
+        session, personal.id, test_user.id, months=1
+    )
+    key = f"{when.year:04d}-{when.month:02d}"
+    assert [row.expenses for row in trend if row.month == key] == [
+        pytest.approx(200.0, abs=0.01)
+    ]
+
+    report = await report_service.get_income_expenses_report(
+        session, personal.id, test_user.id, months=1, interval="monthly",
+        currency="USD",
+    )
+    totals = {b.key: b.value for b in report.summary.breakdowns}
+    assert totals["expenses"] == pytest.approx(200.0, abs=0.01)
+    assert {item.key for item in report.composition} == {str(personal_category.id)}
+
+    session.add(
+        Budget(
+            id=uuid.uuid4(),
+            user_id=test_user.id,
+            workspace_id=personal.id,
+            category_id=personal_category.id,
+            amount=Decimal("500.00"),
+            currency="USD",
+            month=month,
+            is_recurring=True,
+        )
+    )
+    await session.commit()
+    budget_rows = await budget_service.get_budget_vs_actual(
+        session, personal.id, test_user.id, month
+    )
+    assert {r.category_id for r in budget_rows} == {personal_category.id}
+    assert float(budget_rows[0].actual_amount) == pytest.approx(200.0, abs=0.01)
+
+    # And the household's own figures are untouched: 1 000 hers, 1 000 his,
+    # 200 back.
+    household = await dashboard_service.get_summary(
+        session, test_workspace.id, test_user.id, month
+    )
+    assert household.monthly_expenses_primary == pytest.approx(1800.0, abs=0.01)
+    assert await _groceries_on_the_dashboard(
+        session, test_workspace, test_user.id, category, month,
+        filter_user_id=test_user.id,
+    ) == pytest.approx(900.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_his_other_workspace_does_not_leak_into_the_household_either(
+    session: AsyncSession, test_user, test_workspace
+):
+    home, category, _tx_row, when = await _her_shared_groceries(
+        session, test_user, test_workspace
+    )
+    personal, personal_account = await _second_workspace(session, test_user)
+    personal_group = await group_service.create_group(
+        session, personal.id, test_user.id,
+        GroupCreate(name="Personal pot", default_currency="USD"),
+    )
+    mine = await group_service.create_member(
+        session, personal_group.id, personal.id,
+        GroupMemberCreate(name="Me", is_self=True),
+    )
+    assert mine is not None
+    personal_tx = await _tx(
+        session,
+        test_user.id,
+        personal.id,
+        personal_account.id,
+        Decimal("400.00"),
+        when=when,
+        category_id=category.id,
+        description="Personal, shared with himself",
+    )
+    await split_service.replace_splits(
+        session,
+        personal_tx,
+        TransactionSplitsInput(
+            share_type="percent",
+            splits=[
+                TransactionSplitInput(
+                    group_member_id=mine.id, share_pct=Decimal("100")
+                )
+            ],
+        ),
+        test_user.id,
+    )
+    await session.commit()
+    month = when.replace(day=1)
+
+    for filters in ({}, {"filter_user_id": test_user.id}):
+        summary = await dashboard_service.get_summary(
+            session, test_workspace.id, test_user.id, month, **filters
+        )
+        expected = 1000.0 if not filters else 500.0
+        assert summary.monthly_expenses_primary == pytest.approx(expected, abs=0.01)
+
+
+# ─────────────── the breakdown adds up to the card above it ─────────────
+
+
+async def _pie_total(session, test_workspace, viewer_id, month, **kwargs) -> float:
+    rows = await dashboard_service.get_spending_by_category(
+        session, test_workspace.id, viewer_id, month, **kwargs
+    )
+    return sum(row.total for row in rows)
+
+
+async def _composition_totals(session, test_workspace, viewer_id, **kwargs) -> dict:
+    report = await report_service.get_income_expenses_report(
+        session, test_workspace.id, viewer_id, months=1, interval="monthly",
+        currency="USD", **kwargs
+    )
+    out = {"income": 0.0, "expenses": 0.0}
+    for item in report.composition:
+        if item.group in out:
+            out[item.group] += item.value
+    series = {b.key: b.value for b in report.summary.breakdowns}
+    return {"composition": out, "series": series}
+
+
+async def _refunded_groceries(session, test_user, test_workspace):
+    """1 000 of groceries and 400 back, both shared 50/50, both on her
+    account and in the same month and category."""
+    home, category, _tx_row, when = await _her_shared_groceries(
+        session, test_user, test_workspace
+    )
+    refund = await _tx(
+        session,
+        home["partner_user"].id,
+        test_workspace.id,
+        home["hers"].id,
+        Decimal("400.00"),
+        type_="credit",
+        when=when,
+        category_id=category.id,
+        description="Partly refunded",
+    )
+    await _share_evenly(session, home, refund, test_user.id)
+    await session.commit()
+    return home, category, when
+
+
+@pytest.mark.asyncio
+async def test_the_dashboard_card_equals_the_sum_of_its_breakdown(
+    session: AsyncSession, test_user, test_workspace
+):
+    home, _category, when = await _refunded_groceries(
+        session, test_user, test_workspace
+    )
+    month = when.replace(day=1)
+
+    for filters, expected in (
+        ({}, 600.0),
+        ({"filter_user_id": test_user.id}, 300.0),
+        ({"filter_user_id": home["partner_user"].id}, 300.0),
+    ):
+        summary = await dashboard_service.get_summary(
+            session, test_workspace.id, test_user.id, month, **filters
+        )
+        pie = await _pie_total(
+            session, test_workspace, test_user.id, month, **filters
+        )
+        assert summary.monthly_expenses_primary == pytest.approx(expected, abs=0.01)
+        assert pie == pytest.approx(expected, abs=0.01)
+        # The refund lowered the cost instead of becoming somebody's income.
+        assert summary.monthly_income_primary == pytest.approx(0.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_the_report_series_equals_the_sum_of_its_composition(
+    session: AsyncSession, test_user, test_workspace, to_char
+):
+    home, _category, _when = await _refunded_groceries(
+        session, test_user, test_workspace
+    )
+
+    for filters, expected in (
+        ({}, 600.0),
+        ({"filter_user_id": test_user.id}, 300.0),
+        ({"filter_user_id": home["partner_user"].id}, 300.0),
+    ):
+        totals = await _composition_totals(
+            session, test_workspace, test_user.id, **filters
+        )
+        assert totals["series"]["expenses"] == pytest.approx(expected, abs=0.01)
+        assert totals["composition"]["expenses"] == pytest.approx(expected, abs=0.01)
+        assert totals["series"]["income"] == pytest.approx(0.0, abs=0.01)
+        assert totals["composition"]["income"] == pytest.approx(0.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_an_unshared_refund_is_left_exactly_as_upstream_has_it(
+    session: AsyncSession, test_user, test_workspace, to_char
+):
+    """The credit term is about *shares*. A refund nobody shared still
+    counts as income and still leaves its category at full cost, which
+    is what upstream does and what this batch must not change."""
+    _usd(test_user)
+    when = date.today().replace(day=11)
+    if when > date.today():
+        when = date.today()
+    category = await _groceries_category(session, test_user, test_workspace)
+    account = Account(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name="mine",
+        type="checking",
+        balance=Decimal("0"),
+        currency="USD",
+    )
+    session.add(account)
+    await session.flush()
+    await _tx(
+        session, test_user.id, test_workspace.id, account.id, GROCERIES,
+        when=when, category_id=category.id, description="Groceries",
+    )
+    await _tx(
+        session, test_user.id, test_workspace.id, account.id, Decimal("400.00"),
+        type_="credit", when=when, category_id=category.id, description="Refund",
+    )
+    await session.commit()
+    month = when.replace(day=1)
+
+    summary = await dashboard_service.get_summary(
+        session, test_workspace.id, test_user.id, month
+    )
+    assert summary.monthly_expenses_primary == pytest.approx(1000.0, abs=0.01)
+    assert summary.monthly_income_primary == pytest.approx(400.0, abs=0.01)
+    assert await _groceries_on_the_dashboard(
+        session, test_workspace, test_user.id, category, month
+    ) == pytest.approx(1000.0, abs=0.01)
+
+    totals = await _composition_totals(session, test_workspace, test_user.id)
+    assert totals["series"]["income"] == pytest.approx(400.0, abs=0.01)
+    assert totals["composition"]["income"] == pytest.approx(400.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_shared_income_in_a_category_with_no_costs_stays_income(
+    session: AsyncSession, test_user, test_workspace, to_char
+):
+    """Rent is not a refund: with nothing spent in its category, a shared
+    credit is shared income and the credit term leaves it alone."""
+    home = await _household(session, test_user, test_workspace)
+    when = date.today().replace(day=9)
+    if when > date.today():
+        when = date.today()
+    rent_category = Category(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name="Rent received",
+        icon="home",
+        color="#22C55E",
+    )
+    session.add(rent_category)
+    await session.flush()
+    rent = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id,
+        Decimal("5000.00"), type_="credit", when=when,
+        category_id=rent_category.id, description="Rent",
+    )
+    await _share_evenly(session, home, rent, test_user.id)
+    await session.commit()
+    month = when.replace(day=1)
+
+    on_him = await dashboard_service.get_summary(
+        session, test_workspace.id, test_user.id, month,
+        filter_user_id=test_user.id,
+    )
+    assert on_him.monthly_income_primary == pytest.approx(2500.0, abs=0.01)
+    assert on_him.monthly_expenses_primary == pytest.approx(0.0, abs=0.01)
+
+    totals = await _composition_totals(
+        session, test_workspace, test_user.id, filter_user_id=test_user.id
+    )
+    assert totals["series"]["income"] == pytest.approx(2500.0, abs=0.01)
+    assert totals["composition"]["income"] == pytest.approx(2500.0, abs=0.01)
+
+
+# ───────────────── her sparklines, and her closed accounts ──────────────
+
+
+@pytest.mark.asyncio
+async def test_the_category_trends_follow_a_cost_she_never_paid(
+    session: AsyncSession, test_user, test_workspace, to_char
+):
+    """He pays, she carries half. Her report showed a total and a
+    breakdown but no sparkline at all, because the trend was only ever
+    opened by a row on her own accounts."""
+    home = await _household(session, test_user, test_workspace)
+    category = await _groceries_category(session, test_user, test_workspace)
+    when = date.today().replace(day=14)
+    if when > date.today():
+        when = date.today()
+    tx = await _tx(
+        session, test_user.id, test_workspace.id, home["mine"].id, GROCERIES,
+        when=when, category_id=category.id, description="Groceries",
+    )
+    await _share_evenly(session, home, tx, test_user.id)
+    await session.commit()
+
+    report = await report_service.get_income_expenses_report(
+        session, test_workspace.id, test_user.id, months=1, interval="monthly",
+        currency="USD", filter_user_id=home["partner_user"].id,
+    )
+    trends = {item.key: item for item in report.category_trend}
+    assert str(category.id) in trends, "her groceries have no sparkline"
+    assert trends[str(category.id)].total == pytest.approx(500.0, abs=0.01)
+    assert trends[str(category.id)].label == "Groceries"
+    assert sum(point.value for point in trends[str(category.id)].series) == (
+        pytest.approx(500.0, abs=0.01)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_closed_account_is_outside_every_figure(
+    session: AsyncSession, test_user, test_workspace
+):
+    """Every base total drops closed accounts, so a share of a cost on
+    one must not come off a figure that never carried it — which read as
+    minus 500 of expenses for her."""
+    home = await _household(session, test_user, test_workspace)
+    category = await _groceries_category(session, test_user, test_workspace)
+    when = date.today().replace(day=7)
+    if when > date.today():
+        when = date.today()
+    closed = Account(
+        id=uuid.uuid4(),
+        user_id=home["partner_user"].id,
+        workspace_id=test_workspace.id,
+        name="Her old card",
+        type="checking",
+        balance=Decimal("0"),
+        currency="USD",
+        is_closed=True,
+    )
+    session.add(closed)
+    await session.flush()
+    tx = await _tx(
+        session, home["partner_user"].id, test_workspace.id, closed.id,
+        GROCERIES, when=when, category_id=category.id, description="On the old card",
+    )
+    await _share_evenly(session, home, tx, test_user.id)
+    await session.commit()
+    month = when.replace(day=1)
+
+    for filters in (
+        {},
+        {"filter_user_id": test_user.id},
+        {"filter_user_id": home["partner_user"].id},
+    ):
+        summary = await dashboard_service.get_summary(
+            session, test_workspace.id, test_user.id, month, **filters
+        )
+        assert summary.monthly_expenses_primary == pytest.approx(0.0, abs=0.01)
+        assert summary.monthly_income_primary == pytest.approx(0.0, abs=0.01)
+        assert await _groceries_on_the_dashboard(
+            session, test_workspace, test_user.id, category, month, **filters
+        ) == pytest.approx(0.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_the_filter_resolves_to_her_open_accounts_only(
+    session: AsyncSession, test_user, test_workspace
+):
+    from app.services._query_filters import user_owned_account_ids
+
+    home = await _household(session, test_user, test_workspace)
+    closed = Account(
+        id=uuid.uuid4(),
+        user_id=home["partner_user"].id,
+        workspace_id=test_workspace.id,
+        name="Her old card",
+        type="checking",
+        balance=Decimal("0"),
+        currency="USD",
+        is_closed=True,
+    )
+    session.add(closed)
+    await session.commit()
+
+    owned = await user_owned_account_ids(
+        session, test_workspace.id, home["partner_user"].id
+    )
+    assert owned == [home["hers"].id]

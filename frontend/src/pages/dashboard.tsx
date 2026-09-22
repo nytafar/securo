@@ -54,6 +54,7 @@ import { usePrivacyMode } from '@/hooks/use-privacy-mode'
 import { useIsMobile } from '@/hooks/use-mobile'
 import { useAuth } from '@/contexts/auth-context'
 import { useCollectionFilter } from '@/contexts/collection-filter-context'
+import { filterScope } from '@/lib/filter-scope'
 import { resolveDateFnsLocale } from '@/lib/date-fns-locale'
 import type { Rule, Transaction } from '@/types'
 import { formatCurrency } from '@/lib/format'
@@ -190,10 +191,9 @@ export default function DashboardPage() {
   // The cash views — the transaction list, the calendar, the drill-down —
   // take the accounts either filter resolves to, and adjust no share.
   const listAcctIds = activeAccountIds ?? undefined
-  // A wallet-only collection (active, but with zero accounts) has no account
-  // data — skip the account-only cards so they render empty instead of
-  // silently falling back to "all accounts".
-  const noAccounts = activeAccountIds !== null && activeAccountIds.length === 0
+  // A wallet-only collection has no cash and no consumption; a person
+  // who owns no account here has no cash but still carries shares.
+  const { noCashAccounts, noConsumption } = filterScope(activeAccountIds, activeUserId)
 
   const { data: summary, isLoading: summaryLoading } = useQuery({
     queryKey: ['dashboard', 'summary', selectedMonth, activeAccountIds, activeWalletIds, activeUserId],
@@ -203,7 +203,7 @@ export default function DashboardPage() {
   const { data: spending, isLoading: spendingLoading } = useQuery({
     queryKey: ['dashboard', 'spending', selectedMonth, activeAccountIds, activeUserId],
     queryFn: () => dashboard.spendingByCategory(monthParam, acctIds, filterUserId),
-    enabled: !noAccounts,
+    enabled: !noConsumption,
   })
 
   const prevMonth = shiftMonth(selectedMonth, -1)
@@ -211,7 +211,7 @@ export default function DashboardPage() {
   const { data: balanceHistory, isLoading: balanceHistoryLoading } = useQuery({
     queryKey: ['dashboard', 'balance-history', selectedMonth, activeAccountIds, activeUserId],
     queryFn: () => dashboard.balanceHistory(monthParam, acctIds, filterUserId),
-    enabled: !noAccounts,
+    enabled: !noCashAccounts,
   })
 
   const { data: currentMonthTxs, isLoading: currentTxLoading } = useQuery({
@@ -223,7 +223,7 @@ export default function DashboardPage() {
       exclude_transfers: true,
       account_ids: listAcctIds,
     }),
-    enabled: !noAccounts,
+    enabled: !noCashAccounts,
   })
 
   // Same month grid the transactions page renders, scoped to the active
@@ -231,7 +231,7 @@ export default function DashboardPage() {
   const calendarAccountIds = listAcctIds && listAcctIds.length > 0 ? listAcctIds : undefined
   const { data: calendarData, isLoading: calendarLoading } = useQuery({
     queryKey: ['transactions', 'calendar', selectedMonth, activeAccountIds],
-    enabled: txViewMode === 'calendar' && !noAccounts,
+    enabled: txViewMode === 'calendar' && !noCashAccounts,
     queryFn: () => transactions.calendar({
       month: monthStart,
       account_ids: calendarAccountIds,

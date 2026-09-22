@@ -146,6 +146,21 @@ describe('the viewing filter', () => {
     expect(screen.getByTestId('accounts')).toHaveTextContent('all')
   })
 
+  it('resolves a person who owns no account here to an empty set', async () => {
+    // Not "no filter": she owns nothing in this workspace and still
+    // carries her share of what he paid, which is what the consumption
+    // pages go on to ask the server for.
+    api.accounts.list.mockResolvedValue([{ id: 'acct-his', user_id: HIM, name: 'His' }])
+    const { user } = renderSelector()
+
+    await user.click(await screen.findByRole('button', { name: /all accounts/i }))
+    await user.click(await screen.findByRole('menuitem', { name: /Anna/ }))
+
+    await waitFor(() => expect(screen.getByTestId('user')).toHaveTextContent(HER))
+    expect(screen.getByTestId('accounts')).toHaveTextContent('')
+    expect(screen.getByTestId('accounts')).not.toHaveTextContent('all')
+  })
+
   it('stays out of the way for one person with no collections', async () => {
     api.collections.list.mockResolvedValue([])
     api.workspaces.listMembers.mockResolvedValue([

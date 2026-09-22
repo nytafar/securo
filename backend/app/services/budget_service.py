@@ -17,7 +17,7 @@ from app.services._query_filters import (
     foreign_shares_by_category,
     reporting_date_col,
     resolve_consumption_scope,
-    subject_credit_shares_by_category,
+    subject_credit_offsets,
     subject_shares_by_category,
 )
 from app.services.admin_service import get_credit_card_accounting_mode
@@ -271,7 +271,7 @@ async def _apply_consumption(
         cat_id = str(cat_uuid)
         spending[cat_id] = spending.get(cat_id, Decimal("0")) + Decimal(str(total))
 
-    credits_ = await subject_credit_shares_by_category(
+    credits_ = await subject_credit_offsets(
         session, subject, start, end,
         use_effective_date=accounting_mode == "accrual",
         primary_currency=primary_currency,

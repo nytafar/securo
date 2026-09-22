@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Optional
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account
@@ -371,11 +371,18 @@ async def user_owned_account_ids(
     What the user filter resolves to. Ownership is the same signal the
     pot uses to name a payer, so "her accounts" means the same thing on
     the group page and on the dashboard.
+
+    A closed account is left out, because every figure the filter feeds
+    already drops closed accounts. Resolving to one would have put a
+    cost in the scope whose own base query could never see it, and the
+    share of it that belongs to somebody else would have come off a
+    total that never had it.
     """
     result = await session.execute(
         select(Account.id).where(
             Account.workspace_id == workspace_id,
             Account.user_id == user_id,
+            Account.is_closed == False,  # noqa: E712
         )
     )
     return [row[0] for row in result.all()]
@@ -414,29 +421,40 @@ async def resolve_consumption_scope(
     )
 
 
-def subject_member_ids(subject: ConsumptionSubject):
+def subject_member_ids(subject: ConsumptionSubject, *, invitations_only: bool = False):
     """The group members that are this subject's own.
 
     Read from persisted columns only — a member's stored link, or the
     stored self flag inside a group one of the subject's users owns. The
     `is_self` the group service rewrites per request never reaches a
     query, so two people looking at the same figure see the same number.
+
+    `invitations_only` narrows it to memberships somebody else created
+    for one of the subject's users: linked, and not the self-membership
+    that stands for them in a group of their own. That is the only kind
+    of membership that may carry a figure **across workspaces** — a
+    self-membership belongs to a group in its own workspace and is
+    already counted there, so letting it out would put the household's
+    groceries on the personal workspace's dashboard.
     """
     from app.models.group import Group, GroupMember
 
-    return (
-        select(GroupMember.id)
-        .outerjoin(Group, Group.id == GroupMember.group_id)
-        .where(
-            or_(
-                GroupMember.linked_user_id.in_(subject.user_ids),
-                and_(
-                    GroupMember.is_self == True,  # noqa: E712
-                    Group.user_id.in_(subject.user_ids),
-                ),
+    conditions = [GroupMember.linked_user_id.in_(subject.user_ids)]
+    if not invitations_only:
+        conditions.append(
+            and_(
+                GroupMember.is_self == True,  # noqa: E712
+                Group.user_id.in_(subject.user_ids),
             )
         )
+    stmt = (
+        select(GroupMember.id)
+        .outerjoin(Group, Group.id == GroupMember.group_id)
+        .where(or_(*conditions))
     )
+    if invitations_only:
+        stmt = stmt.where(GroupMember.is_self.is_(False))
+    return stmt
 
 
 def in_subject_scope(subject: ConsumptionSubject) -> list:
@@ -449,20 +467,88 @@ def in_subject_scope(subject: ConsumptionSubject) -> list:
 
 
 def outside_subject_scope(subject: ConsumptionSubject):
-    """The negation of `in_subject_scope`, as one clause.
+    """Transactions in this workspace that the subject's own aggregation
+    did not count at full amount.
 
-    A share counts for the subject on exactly the transactions their own
-    aggregation did *not* count at full amount, so the two sides cannot
-    overlap and nothing is double counted — which is what went wrong
-    when "not mine" was spelled as `Transaction.user_id != me` and two
-    people shared a workspace.
+    Deliberately **not** "any other workspace": a workspace is a separate
+    set of books, and a figure in one may not be moved by a share in
+    another. Money that crosses that line does so only through the
+    invitation clause in `subject_share_match`, which is the rule
+    upstream had and this one keeps.
     """
     if subject.account_ids is None:
-        return Transaction.workspace_id != subject.workspace_id
-    return or_(
+        # The scope is the whole workspace: nothing in it is outside.
+        return false()
+    return and_(
+        Transaction.workspace_id == subject.workspace_id,
+        or_(
+            Transaction.account_id.is_(None),
+            Transaction.account_id.notin_(subject.account_ids),
+        ),
+    )
+
+
+def subject_share_match(subject: ConsumptionSubject, *, mine: bool, scope: str):
+    """One clause: this share belongs to whom, on a transaction where.
+
+    `scope="in"` is the subject's own scope — their accounts, or the
+    whole workspace when nothing is filtered. `mine=False` there picks
+    the shares of that money that belong to somebody else, which come
+    off the subject's total.
+
+    `scope="out"` is what the subject carries of money counted nowhere
+    in their own aggregation, and it has exactly two sources:
+
+    * **this workspace, another account** — my share of the groceries my
+      partner paid. Only reachable under the user filter, because with
+      no filter the scope is the whole workspace.
+    * **another workspace, by invitation** — my share of the concert
+      ticket a friend paid, in their books. Bounded by both of the
+      guards upstream had: the membership must be one somebody else
+      created for me (`is_self` false), and the transaction must not be
+      one of the subject's own. Without them, every figure in a
+      household would also appear in each member's personal workspace.
+
+    `scope="any"` is both, for the credit term, which asks what the
+    subject was given back wherever the cost sat.
+    """
+    from app.models.transaction_split import TransactionSplit
+
+    if scope == "any":
+        return or_(
+            subject_share_match(subject, mine=mine, scope="in"),
+            subject_share_match(subject, mine=mine, scope="out"),
+        )
+
+    if scope == "in":
+        member_ids = subject_member_ids(subject)
+        belongs = (
+            TransactionSplit.group_member_id.in_(member_ids)
+            if mine
+            else TransactionSplit.group_member_id.notin_(member_ids)
+        )
+        return and_(*in_subject_scope(subject), belongs)
+
+    # scope == "out"
+    if not mine:
+        # Whose the rest of somebody else's money is is not a question
+        # any figure here asks.
+        return false()
+    across = and_(
         Transaction.workspace_id != subject.workspace_id,
-        Transaction.account_id.is_(None),
-        Transaction.account_id.notin_(subject.account_ids),
+        Transaction.user_id.notin_(subject.user_ids),
+        TransactionSplit.group_member_id.in_(
+            subject_member_ids(subject, invitations_only=True)
+        ),
+    )
+    if subject.account_ids is None:
+        return across
+    return or_(
+        across,
+        and_(
+            outside_subject_scope(subject),
+            TransactionSplit.group_member_id.in_(subject_member_ids(subject)),
+        ),
     )
 
 
@@ -470,25 +556,6 @@ def _reporting_date_expr(use_effective_date: bool):
     return func.coalesce(
         Transaction.effective_bill_date,
         Transaction.effective_date if use_effective_date else Transaction.date,
-    )
-
-
-def _scope_filters(subject: ConsumptionSubject, scope: str) -> list:
-    if scope == "in":
-        return in_subject_scope(subject)
-    if scope == "out":
-        return [outside_subject_scope(subject)]
-    return []
-
-
-def _member_filter(subject: ConsumptionSubject, mine: bool):
-    member_ids = subject_member_ids(subject)
-    from app.models.transaction_split import TransactionSplit
-
-    return (
-        TransactionSplit.group_member_id.in_(member_ids)
-        if mine
-        else TransactionSplit.group_member_id.notin_(member_ids)
     )
 
 
@@ -537,9 +604,13 @@ async def _share_pnl(
         )
         .select_from(TransactionSplit)
         .join(Transaction, TransactionSplit.transaction_id == Transaction.id)
+        .join(Account, Transaction.account_id == Account.id)
         .where(
-            _member_filter(subject, mine),
-            *_scope_filters(subject, scope),
+            subject_share_match(subject, mine=mine, scope=scope),
+            # The base totals a share adjusts are all taken over open
+            # accounts, so a share of a closed account's cost would come
+            # off a figure that never had it.
+            Account.is_closed == False,  # noqa: E712
             Transaction.source != "opening_balance",
             date_col >= start,
             date_col < end,
@@ -606,9 +677,10 @@ async def _share_by_category(
         )
         .select_from(TransactionSplit)
         .join(Transaction, TransactionSplit.transaction_id == Transaction.id)
+        .join(Account, Transaction.account_id == Account.id)
         .where(
-            _member_filter(subject, mine),
-            *_scope_filters(subject, scope),
+            subject_share_match(subject, mine=mine, scope=scope),
+            Account.is_closed == False,  # noqa: E712
             Transaction.type == tx_type,
             Transaction.source != "opening_balance",
             date_col >= start,
@@ -702,9 +774,12 @@ async def foreign_shares_by_category(
     use_effective_date: bool = False,
     primary_currency: Optional[str] = None,
     label_expr=None,
+    tx_type: str = "debit",
 ) -> dict:
-    """Per category, the debit shares inside the subject's scope that
-    belong to somebody else — subtract from the full debits."""
+    """Per category, the shares inside the subject's scope that belong
+    to somebody else — subtract from the full amounts. `tx_type` picks
+    the debit side (what a category cost) or the credit side (what came
+    back into it)."""
     return await _share_by_category(
         session,
         subject,
@@ -712,7 +787,7 @@ async def foreign_shares_by_category(
         end,
         mine=False,
         scope="in",
-        tx_type="debit",
+        tx_type=tx_type,
         use_effective_date=use_effective_date,
         primary_currency=primary_currency,
         label_expr=label_expr,
@@ -778,9 +853,10 @@ async def subject_shares_by_category(
     use_effective_date: bool = False,
     primary_currency: Optional[str] = None,
     label_expr=None,
+    tx_type: str = "debit",
 ) -> dict:
-    """Per category, the debit shares the subject carries on
-    transactions outside their own scope — add to the full debits."""
+    """Per category, the shares the subject carries on transactions
+    outside their own scope — add to the full amounts."""
     return await _share_by_category(
         session,
         subject,
@@ -788,14 +864,14 @@ async def subject_shares_by_category(
         end,
         mine=True,
         scope="out",
-        tx_type="debit",
+        tx_type=tx_type,
         use_effective_date=use_effective_date,
         primary_currency=primary_currency,
         label_expr=label_expr,
     )
 
 
-async def subject_credit_shares_by_category(
+async def subject_cost_by_category(
     session: AsyncSession,
     subject: ConsumptionSubject,
     start: date,
@@ -805,18 +881,95 @@ async def subject_credit_shares_by_category(
     primary_currency: Optional[str] = None,
     label_expr=None,
 ) -> dict:
-    """Per category, the subject's shares of shared *credits*.
+    """What each category cost the subject: the debits in their scope,
+    less the shares of those somebody else carries, plus the shares they
+    carry of debits outside it.
 
-    A share is signed: a debit costs, a credit gives back. In a spending
-    view a shared refund therefore lowers the category it was booked to,
-    so a shared purchase and its shared refund leave that category at
-    zero — which a debit-only reading could never do.
-
-    Scope is deliberately both sides: a refund of a cost the subject
-    carries is theirs whether it landed on their own account or on the
-    account of the member who paid.
+    The canonical answer to "does this category have costs here", which
+    is what tells an expense category from an income one — nothing on a
+    category says so. Each page's own breakdown is built from its own
+    base query, so this is not what a page *displays*; it is the one
+    figure the credit term is measured against, so that the same
+    judgement is made on the pie and on the card above it.
     """
-    return await _share_by_category(
+    date_col = _reporting_date_expr(use_effective_date)
+    labels = [label_expr] if label_expr is not None else []
+    result = await session.execute(
+        select(
+            *labels,
+            Transaction.category_id,
+            func.sum(func.coalesce(Transaction.amount_primary, Transaction.amount)),
+        )
+        .select_from(Transaction)
+        .join(Account, Transaction.account_id == Account.id)
+        .where(
+            *in_subject_scope(subject),
+            Account.is_closed == False,  # noqa: E712
+            Transaction.type == "debit",
+            Transaction.source != "opening_balance",
+            date_col >= start,
+            date_col < end,
+            date_col <= date.today(),
+            Transaction.status == "posted",
+            counts_as_user_pnl(),
+        )
+        .group_by(*labels, Transaction.category_id)
+    )
+    costs: dict = {}
+    for row in result.all():
+        key = (row[0], row[-2]) if label_expr is not None else row[-2]
+        costs[key] = costs.get(key, 0.0) + abs(float(row[-1] or 0))
+
+    foreign = await foreign_shares_by_category(
+        session, subject, start, end,
+        use_effective_date=use_effective_date,
+        primary_currency=primary_currency,
+        label_expr=label_expr,
+    )
+    for key, amount in foreign.items():
+        costs[key] = costs.get(key, 0.0) - amount
+    carried = await subject_shares_by_category(
+        session, subject, start, end,
+        use_effective_date=use_effective_date,
+        primary_currency=primary_currency,
+        label_expr=label_expr,
+    )
+    for key, amount in carried.items():
+        costs[key] = costs.get(key, 0.0) + amount
+    return costs
+
+
+async def subject_credit_offsets(
+    session: AsyncSession,
+    subject: ConsumptionSubject,
+    start: date,
+    end: date,
+    *,
+    use_effective_date: bool = False,
+    primary_currency: Optional[str] = None,
+    label_expr=None,
+) -> dict:
+    """Per category, what the subject was given back of what they spent.
+
+    A share is signed: a debit costs, a credit gives back. The subject's
+    share of a shared credit therefore lowers the category it was booked
+    to, so a shared purchase and its shared refund leave that category at
+    zero — and lowers the expense total by the same amount, instead of
+    raising income, so the breakdown still adds up to the card above it.
+
+    Two rules make that safe. It applies **only to a category that cost
+    the subject something in the same period and scope**, because nothing
+    on a category says whether it is an expense one or an income one and
+    a credit in an income category is shared income, not a refund. And it
+    is **clamped to that cost**, so a category can reach zero and stop:
+    an unclamped subtraction would show a negative category, or a total
+    that no longer matched the lines under it.
+
+    Scope is both sides of the subject's own: a refund of a cost they
+    carry is theirs whether it landed on their account or on the account
+    of the member who paid.
+    """
+    credits_ = await _share_by_category(
         session,
         subject,
         start,
@@ -828,3 +981,18 @@ async def subject_credit_shares_by_category(
         primary_currency=primary_currency,
         label_expr=label_expr,
     )
+    if not credits_:
+        return {}
+    costs = await subject_cost_by_category(
+        session, subject, start, end,
+        use_effective_date=use_effective_date,
+        primary_currency=primary_currency,
+        label_expr=label_expr,
+    )
+    offsets: dict = {}
+    for key, amount in credits_.items():
+        cost = costs.get(key, 0.0)
+        if cost <= 0:
+            continue
+        offsets[key] = min(amount, cost)
+    return offsets
