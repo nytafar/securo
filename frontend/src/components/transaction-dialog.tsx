@@ -484,6 +484,9 @@ function TransactionForm({
         share_amount: s.share_amount,
         share_pct: s.share_pct,
       })),
+      // The payer is a property of the transaction and stands on every
+      // share row, so the first one carries it.
+      payer_group_member_id: existing[0].payer_group_member_id ?? null,
     }
   })
   // Captured once at mount so we know whether to send an explicit clear

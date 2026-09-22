@@ -90,4 +90,9 @@ class GroupMember(Base):
     )
 
     group: Mapped["Group"] = relationship(back_populates="members")
-    splits: Mapped[list["TransactionSplit"]] = relationship(back_populates="member")
+    # The shares this member carries. `TransactionSplit` also points here
+    # with its explicit payer, so the join has to name its foreign key.
+    splits: Mapped[list["TransactionSplit"]] = relationship(
+        back_populates="member",
+        foreign_keys="TransactionSplit.group_member_id",
+    )

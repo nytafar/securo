@@ -325,6 +325,10 @@ export interface TransactionSplit {
   id: string
   transaction_id: string
   group_member_id: string
+  /** The member who actually paid, when it is not the owner of the
+   *  account the transaction sits on. Null = derived from that owner.
+   *  The same on every share row of one transaction. */
+  payer_group_member_id: string | null
   share_amount: number
   share_type: string
   share_pct: number | null
@@ -342,6 +346,10 @@ export interface TransactionSplitInput {
 export interface TransactionSplitsInput {
   share_type: ShareType
   splits: TransactionSplitInput[]
+  /** Who paid. Omitted or null means the payer is derived from the
+   *  account's owner — which is also how an override is cleared, since
+   *  this payload replaces the sharing wholesale. */
+  payer_group_member_id?: string | null
 }
 
 // Payload the transaction dialog sends on save. `splits` is the normalized

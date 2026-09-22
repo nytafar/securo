@@ -1894,6 +1894,9 @@
     "percentSum": "योग: {{total}}%",
     "amountSum": "योग: {{total}} / {{target}} {{currency}}",
     "equalHint": "हर चयनित सदस्य को बराबर हिस्सा मिलता है।",
+    "payer": "भुगतानकर्ता",
+    "payerFromAccount": "खाते के मालिक से",
+    "payerHint": "इसे तब सेट करें जब भुगतान खाते के मालिक ने नहीं किया हो — नकद, Securo के बाहर का खाता, या बिना Securo उपयोगकर्ता वाला सदस्य।",
     "kind": {
       "social": "सामाजिक",
       "household": "घर",

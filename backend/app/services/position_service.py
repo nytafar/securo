@@ -195,18 +195,33 @@ async def _identity_of(
 
 
 def _resolve_payer(
-    identity: _GroupIdentity, account_owner_id: Optional[uuid.UUID]
+    identity: _GroupIdentity,
+    account_owner_id: Optional[uuid.UUID],
+    explicit_member_id: Optional[uuid.UUID] = None,
 ) -> tuple[Optional[uuid.UUID], bool]:
     """Return (payer member, payer assumed) for a transaction on an
     account owned by `account_owner_id`.
 
-    The payer is the member linked to the account's owner, or the owner's
-    member when that user owns the group. When the account's owner is no
-    member, or several members link that user, the payer falls back to
-    the owner's member and is flagged as assumed. A group with no owner's
-    member keeps today's behaviour: shares count, the owner's side stays
-    implicit and no member is ever the payer.
+    An explicit payer, set on the transaction's group sharing, wins over
+    everything below and is never assumed: it is what someone typed in
+    for cash, for an account outside the app, or for a member with no
+    Securo user. Clearing it falls back to the derivation.
+
+    Otherwise the payer is the member linked to the account's owner, or
+    the owner's member when that user owns the group. When the account's
+    owner is no member, or several members link that user, the payer
+    falls back to the owner's member and is flagged as assumed. A group
+    with no owner's member keeps today's behaviour: shares count, the
+    owner's side stays implicit and no member is ever the payer.
     """
+    if explicit_member_id is not None:
+        if any(m.id == explicit_member_id for m in identity.members):
+            return explicit_member_id, False
+        # A stored payer who is no longer a member of this group. The
+        # derivation is all that is left, and it is a guess about a
+        # question somebody had already answered, so say it is assumed.
+        derived, _ = _resolve_payer(identity, account_owner_id)
+        return derived, True
     if identity.owner_member_id is None:
         # Today's behaviour, kept: nobody is credited as payer, not even
         # a linked member on whose account the transaction sits.
@@ -230,6 +245,7 @@ async def _load_shared_transactions(
     query = (
         select(
             TransactionSplit.group_member_id,
+            TransactionSplit.payer_group_member_id,
             TransactionSplit.share_amount,
             Transaction.id,
             Transaction.date,
@@ -258,7 +274,11 @@ async def _load_shared_transactions(
     for row in (await session.execute(query)).all():
         tx = by_id.get(row.id)
         if tx is None:
-            payer_member_id, payer_assumed = _resolve_payer(identity, row.account_owner_id)
+            # The explicit payer is written on every share row of a
+            # transaction, so the first row seen carries it.
+            payer_member_id, payer_assumed = _resolve_payer(
+                identity, row.account_owner_id, row.payer_group_member_id
+            )
             tx = _SharedTransaction(
                 id=row.id,
                 report_date=row.report_date,

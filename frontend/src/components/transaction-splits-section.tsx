@@ -68,6 +68,9 @@ export function TransactionSplitsSection({
   const [groupId, setGroupId] = useState<string>('')
   const [shareType, setShareType] = useState<ShareType>(value?.share_type ?? 'equal')
   const [rows, setRows] = useState<RowState[]>([])
+  // '' = derive the payer from the account's owner, which is the
+  // default and how an override is cleared.
+  const [payerMemberId, setPayerMemberId] = useState<string>(value?.payer_group_member_id ?? '')
   // Snapshot of the initial value so row hydration survives the
   // first push-state-up cycle (which zeros the parent before the
   // group has finished loading).
@@ -186,6 +189,10 @@ export function TransactionSplitsSection({
     const groupChanged = lastGroupIdRef.current !== group.id
     lastGroupIdRef.current = group.id
 
+    // A payer names a member of one group. Switching groups therefore
+    // drops the override rather than carrying a stranger's id across.
+    if (groupChanged && hydratedRef.current) setPayerMemberId('')
+
     setRows((prevRows) => {
       // If first hydration or switched groups, rebuild completely
       if (!hydratedRef.current || groupChanged) {
@@ -236,9 +243,13 @@ export function TransactionSplitsSection({
       }
       return { group_member_id: r.member_id }
     })
-    onChange({ share_type: shareType, splits })
+    onChange({
+      share_type: shareType,
+      splits,
+      payer_group_member_id: payerMemberId || null,
+    })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, shareType, rows])
+  }, [enabled, shareType, rows, payerMemberId])
 
   // Validation summary
   const total = useMemo(() => {
@@ -468,6 +479,30 @@ export function TransactionSplitsSection({
                       })
                     })()
                   )}
+                </div>
+              )}
+
+              {group && group.members.length > 0 && (
+                <div className="space-y-1 border-t border-border pt-2 mt-2">
+                  <Label className="text-xs" htmlFor="split-payer">
+                    {t('splitGroups.payer')}
+                  </Label>
+                  <select
+                    id="split-payer"
+                    className="w-full border border-border rounded-md px-2 py-1.5 text-sm bg-card"
+                    value={payerMemberId}
+                    onChange={(e) => setPayerMemberId(e.target.value)}
+                  >
+                    <option value="">{t('splitGroups.payerFromAccount')}</option>
+                    {group.members.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.name}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-muted-foreground">
+                    {t('splitGroups.payerHint')}
+                  </p>
                 </div>
               )}
 

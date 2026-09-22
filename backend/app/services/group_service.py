@@ -213,6 +213,26 @@ async def delete_group(
     group = await get_group(session, group_id, workspace_id)
     if not group:
         return False
+
+    # The same refusal as `delete_member`, one level up: deleting the
+    # group would take its members with it, and a transaction that names
+    # one of them as payer would be left crediting nobody. The RESTRICT
+    # FK says this too, but only where foreign keys are enforced.
+    from app.models.transaction_split import TransactionSplit
+
+    paid_for = await session.execute(
+        select(func.count(func.distinct(TransactionSplit.transaction_id)))
+        .select_from(TransactionSplit)
+        .join(GroupMember, TransactionSplit.payer_group_member_id == GroupMember.id)
+        .where(GroupMember.group_id == group_id)
+    )
+    still_payer = paid_for.scalar_one() or 0
+    if still_payer:
+        raise ValueError(
+            f"A member of this group is the payer of {still_payer} transaction(s). "
+            "Change the payer there first."
+        )
+
     try:
         await session.delete(group)
         await session.commit()
@@ -357,6 +377,26 @@ async def delete_member(
     member = result.scalar_one_or_none()
     if not member:
         return False
+
+    # A member named as the explicit payer of a transaction is refused
+    # before anything is deleted, never silently reassigned: moving the
+    # payment to somebody else would change what every other member owes
+    # without anyone asking for it. The database's RESTRICT says the same
+    # thing, but only where foreign keys are enforced, and it cannot say
+    # how many transactions are in the way.
+    from app.models.transaction_split import TransactionSplit
+
+    paid_for = await session.execute(
+        select(func.count(func.distinct(TransactionSplit.transaction_id))).where(
+            TransactionSplit.payer_group_member_id == member_id
+        )
+    )
+    still_payer = paid_for.scalar_one() or 0
+    if still_payer:
+        raise ValueError(
+            f"Member is the payer of {still_payer} transaction(s). "
+            "Change the payer there first."
+        )
 
     try:
         await session.delete(member)

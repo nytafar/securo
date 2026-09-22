@@ -1894,6 +1894,9 @@
     "percentSum": "Sum: {{total}}%",
     "amountSum": "Sum: {{total}} / {{target}} {{currency}}",
     "equalHint": "Each selected member gets an equal share.",
+    "payer": "Paid by",
+    "payerFromAccount": "From the account's owner",
+    "payerHint": "Set this when the account's owner is not who paid — cash, an account outside Securo, or a member with no Securo user.",
     "kind": {
       "social": "Social",
       "household": "Household",

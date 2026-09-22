@@ -1994,6 +1994,9 @@
     "percentSum": "Suma: {{total}}%",
     "amountSum": "Suma: {{total}} / {{target}} {{currency}}",
     "equalHint": "Każdy wybrany członek otrzymuje równy udział.",
+    "payer": "Zapłacone przez",
+    "payerFromAccount": "Przez właściciela konta",
+    "payerHint": "Ustaw, gdy płacił ktoś inny niż właściciel konta — gotówka, konto spoza Securo lub członek bez użytkownika Securo.",
     "kind": {
       "social": "Towarzyska",
       "household": "Gospodarstwo domowe",

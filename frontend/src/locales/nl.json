@@ -1894,6 +1894,9 @@
     "percentSum": "Som: {{total}}%",
     "amountSum": "Som: {{total}} / {{target}} {{currency}}",
     "equalHint": "Elk geselecteerd lid krijgt een gelijk deel.",
+    "payer": "Betaald door",
+    "payerFromAccount": "Door de rekeninghouder",
+    "payerHint": "Stel dit in wanneer de rekeninghouder niet degene is die betaald heeft — contant geld, een rekening buiten Securo of een lid zonder Securo-gebruiker.",
     "kind": {
       "social": "Sociaal",
       "household": "Huishouden",

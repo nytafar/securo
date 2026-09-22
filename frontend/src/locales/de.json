@@ -1895,6 +1895,9 @@
     "percentSum": "Summe: {{total}}%",
     "amountSum": "Summe: {{total}} / {{target}} {{currency}}",
     "equalHint": "Jedes ausgewählte Mitglied erhält einen gleichen Anteil.",
+    "payer": "Bezahlt von",
+    "payerFromAccount": "Vom Kontoinhaber",
+    "payerHint": "Setze dies, wenn nicht der Kontoinhaber bezahlt hat — Bargeld, ein Konto außerhalb von Securo oder ein Mitglied ohne Securo-Benutzer.",
     "kind": {
       "social": "Freizeit",
       "household": "Haushalt",

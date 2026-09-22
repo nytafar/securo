@@ -1894,6 +1894,9 @@
     "percentSum": "合計: {{total}}%",
     "amountSum": "合計: {{total}} / {{target}} {{currency}}",
     "equalHint": "選択した各メンバーに均等に配分されます。",
+    "payer": "支払者",
+    "payerFromAccount": "口座の所有者から",
+    "payerHint": "口座の所有者が支払った人でない場合に設定します—現金、Securo 外の口座、または Securo ユーザーのいないメンバーなど。",
     "kind": {
       "social": "プライベート",
       "household": "家計",

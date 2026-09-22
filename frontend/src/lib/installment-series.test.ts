@@ -266,4 +266,60 @@ describe('hasNonStatusChange', () => {
     }
     expect(hasNonStatusChange(splitPayload, splitOriginal)).toBe(true)
   })
+
+  it('detects a payer-only change on an otherwise untouched split group', () => {
+    const splitOriginal = {
+      ...original,
+      splits: [
+        {
+          id: 's1',
+          transaction_id: 'tx-1',
+          group_member_id: 'member-1',
+          payer_group_member_id: null,
+          share_amount: '50.00',
+          share_pct: 33.3333,
+          share_type: 'equal',
+          notes: null,
+          created_at: '2026-08-06T00:00:00Z',
+        },
+      ],
+    } as unknown as Transaction
+    const splitPayload = {
+      ...statusOnlyPayload,
+      splits: {
+        share_type: 'equal' as const,
+        splits: [{ group_member_id: 'member-1', share_amount: 50, share_pct: 33.3333 }],
+        payer_group_member_id: 'member-2',
+      },
+    }
+    expect(hasNonStatusChange(splitPayload, splitOriginal)).toBe(true)
+  })
+
+  it('treats an untouched payer as unchanged', () => {
+    const splitOriginal = {
+      ...original,
+      splits: [
+        {
+          id: 's1',
+          transaction_id: 'tx-1',
+          group_member_id: 'member-1',
+          payer_group_member_id: 'member-2',
+          share_amount: '50.00',
+          share_pct: 33.3333,
+          share_type: 'equal',
+          notes: null,
+          created_at: '2026-08-06T00:00:00Z',
+        },
+      ],
+    } as unknown as Transaction
+    const splitPayload = {
+      ...statusOnlyPayload,
+      splits: {
+        share_type: 'equal' as const,
+        splits: [{ group_member_id: 'member-1', share_amount: 50, share_pct: 33.3333 }],
+        payer_group_member_id: 'member-2',
+      },
+    }
+    expect(hasNonStatusChange(splitPayload, splitOriginal)).toBe(false)
+  })
 })

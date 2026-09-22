@@ -594,6 +594,40 @@ describe('the group page as a common pot', () => {
     ).toBeInTheDocument()
   })
 
+  it('names the payer that was typed in, and stops assuming', async () => {
+    // Her cash, on his account: the payer was set by hand, so the row
+    // says who paid and the warning is gone.
+    const namedPayer = {
+      ...thisMonth,
+      payer_assumed_transactions: [],
+      transactions: {
+        ...thisMonth.transactions,
+        items: [
+          {
+            ...thisMonth.transactions.items[0],
+            payer_member_id: ANNA,
+            payer_assumed: false,
+          },
+        ],
+      },
+    }
+    api.groups.period.mockResolvedValue(namedPayer)
+
+    renderPage()
+
+    const line = await screen.findByText(
+      new RegExp(t('splitGroups.pot.paidBy', { name: 'Anna' })),
+      { selector: 'p' },
+    )
+    expect(line).toBeInTheDocument()
+    expect(
+      screen.queryByText(t('splitGroups.pot.payerAssumed')),
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText(t('splitGroups.pot.payerAssumedHint', { total: 1 })),
+    ).not.toBeInTheDocument()
+  })
+
   it('follows the period everywhere when it changes', async () => {
     const { user } = await renderLoaded()
 

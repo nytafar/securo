@@ -1198,7 +1198,12 @@ async def propose_mark_contribution(
         "into the pot cannot also be money the pot spent. Sharing a "
         "transaction 100 % on the member who paid it is how a personal "
         "purchase is taken out of the pot: it moves no position and "
-        "rules leave it alone afterwards."
+        "rules leave it alone afterwards. "
+        "`payer_group_member_id` names who actually paid when the owner "
+        "of the account the transaction sits on is not it — cash, an "
+        "account outside the app, or a member with no Securo user. Omit "
+        "it to derive the payer from the account's owner, which also "
+        "clears an override that was set before."
     ),
     parameters={
         "type": "object",
@@ -1228,6 +1233,14 @@ async def propose_mark_contribution(
                     "additionalProperties": False,
                 },
             },
+            "payer_group_member_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": (
+                    "The member who paid. Omit to derive it from the "
+                    "owner of the account the transaction sits on."
+                ),
+            },
             "apply": _APPLY_FIELD,
         },
         "required": ["group_id", "transaction_id"],
@@ -1244,6 +1257,7 @@ async def propose_share_transaction(
     transaction_id: str,
     share_type: str = "equal",
     splits: list[dict[str, Any]] | None = None,
+    payer_group_member_id: str | None = None,
     apply: bool = False,
 ) -> dict[str, Any]:
     from app.services import split_service
@@ -1286,10 +1300,20 @@ async def propose_share_transaction(
             )
         }
 
+    payer_id = parse_uuid(payer_group_member_id) if payer_group_member_id else None
+    if payer_group_member_id and payer_id is None:
+        return {"error": "payer_group_member_id must be a uuid"}
+    if payer_id is not None and payer_id not in {m.id for m in members}:
+        return {"error": "The payer must be a member of the same group as the shares"}
+
     entries = splits or [{"group_member_id": str(m.id)} for m in members]
     try:
         payload = TransactionSplitsInput.model_validate(
-            {"share_type": share_type, "splits": entries}
+            {
+                "share_type": share_type,
+                "splits": entries,
+                "payer_group_member_id": str(payer_id) if payer_id else None,
+            }
         )
         # Materializing here is what makes the preview honest: the same
         # rounding the write would do, and the same refusal when the
@@ -1317,6 +1341,10 @@ async def propose_share_transaction(
             "amount": num(tx.amount),
             "currency": tx.currency,
             "share_type": share_type,
+            # Null means the payer is derived from the account's owner,
+            # and sharing again without it clears an override.
+            "payer_group_member_id": str(payer_id) if payer_id else None,
+            "payer_member_name": names.get(payer_id) if payer_id else None,
             "shares": [
                 {
                     "group_member_id": str(member_id),

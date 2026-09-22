@@ -1895,6 +1895,9 @@
     "percentSum": "Somma: {{total}}%",
     "amountSum": "Somma: {{total}} / {{target}} {{currency}}",
     "equalHint": "Ogni membro selezionato riceve una quota uguale.",
+    "payer": "Pagato da",
+    "payerFromAccount": "Dal titolare del conto",
+    "payerHint": "Impostalo quando chi ha pagato non è il titolare del conto: contanti, un conto fuori da Securo o un membro senza utente Securo.",
     "kind": {
       "social": "Sociale",
       "household": "Famiglia",

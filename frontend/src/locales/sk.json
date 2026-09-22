@@ -2026,6 +2026,9 @@
     "percentSum": "Súčet: {{total}} %",
     "amountSum": "Súčet: {{total}} / {{target}} {{currency}}",
     "equalHint": "Každý vybraný člen dostane rovnaký podiel.",
+    "payer": "Zaplatil",
+    "payerFromAccount": "Majiteľ účtu",
+    "payerHint": "Nastavte, keď neplatil majiteľ účtu — hotovosť, účet mimo Securo alebo člen bez používateľa Securo.",
     "kind": {
       "social": "Spoločenská",
       "household": "Domácnosť",
