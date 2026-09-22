@@ -109,6 +109,21 @@ async def _validate_members(
     return group_ids.pop()
 
 
+async def _validate_payer(
+    session: AsyncSession, payer_member_id: uuid.UUID, group_id: uuid.UUID
+) -> None:
+    """The explicit payer must be a member of the group the shares
+    belong to. A member with no Securo user is a valid payer — that is
+    the case the override exists for."""
+    found = await session.execute(
+        select(GroupMember.id).where(
+            GroupMember.id == payer_member_id, GroupMember.group_id == group_id
+        )
+    )
+    if found.scalar_one_or_none() is None:
+        raise ValueError("The payer must be a member of the same group as the shares")
+
+
 async def replace_splits(
     session: AsyncSession,
     transaction: Transaction,
@@ -130,6 +145,15 @@ async def replace_splits(
     # before the clear so a refused write leaves the existing splits
     # alone. Clearing splits is always allowed — it is how a transaction
     # is freed to become a contribution.
+    # A payer with nothing to pay for. Clearing the sharing clears the
+    # payer with it, so this payload is a mistake rather than an
+    # override, and it is refused before the clear like the check below.
+    if payload.payer_group_member_id is not None and not payload.splits:
+        raise ValueError(
+            "A payer without shares has nothing to pay for: "
+            "name who carries the cost, or clear the payer too"
+        )
+
     if payload.splits:
         from app.services.settlement_service import is_contribution_link
 
@@ -151,13 +175,23 @@ async def replace_splits(
     if len(set(member_ids)) != len(member_ids):
         raise ValueError("Each member can appear at most once per transaction")
 
-    await _validate_members(session, member_ids, user_id, transaction.workspace_id)
+    group_id = await _validate_members(session, member_ids, user_id, transaction.workspace_id)
+
+    payer_member_id = payload.payer_group_member_id
+    if payer_member_id is not None:
+        await _validate_payer(session, payer_member_id, group_id)
 
     for member_id, share_amount, share_pct in _materialize(transaction.amount, payload):
         session.add(
             TransactionSplit(
                 transaction_id=transaction.id,
                 group_member_id=member_id,
+                # The payer is a property of the transaction, not of one
+                # share. It is repeated on every row so the reader that
+                # already loads the shares needs no second query, and
+                # this is the one place that writes it, so the rows
+                # cannot disagree.
+                payer_group_member_id=payer_member_id,
                 share_amount=share_amount,
                 share_type=payload.share_type,
                 share_pct=share_pct,

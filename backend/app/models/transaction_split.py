@@ -30,6 +30,24 @@ class TransactionSplit(Base):
     group_member_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("group_members.id", ondelete="RESTRICT")
     )
+    # The explicit payer of the whole transaction, when the derived one
+    # (the owner of the account the transaction sits on) is wrong: cash,
+    # an account outside the app, or a member with no Securo user. Null
+    # means "derive it", which is the default.
+    #
+    # It is a property of the transaction, not of one share, and is
+    # written identically on every share row of a transaction by
+    # `split_service.replace_splits`, the single writer. It lives here
+    # rather than on `transactions` because a payer only means something
+    # relative to a group, and the group is only known through the
+    # shares: a member on this side is guaranteed to be a member of the
+    # group the shares belong to, and the override cannot outlive them.
+    payer_group_member_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("group_members.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     # Always materialized in the parent transaction's currency. The
     # service layer assigns the rounding residual to the last share so
     # the sum is exact.
@@ -46,4 +64,8 @@ class TransactionSplit(Base):
     )
 
     transaction: Mapped["Transaction"] = relationship(back_populates="splits")
-    member: Mapped["GroupMember"] = relationship(back_populates="splits")
+    # Two foreign keys point at group_members now, so both sides of the
+    # share relationship have to say which one they mean.
+    member: Mapped["GroupMember"] = relationship(
+        back_populates="splits", foreign_keys=[group_member_id]
+    )

@@ -1895,6 +1895,9 @@
     "percentSum": "Somme : {{total}} %",
     "amountSum": "Somme : {{total}} / {{target}} {{currency}}",
     "equalHint": "Chaque membre sélectionné reçoit une part égale.",
+    "payer": "Payé par",
+    "payerFromAccount": "Par le titulaire du compte",
+    "payerHint": "À définir lorsque le titulaire du compte n'est pas celui qui a payé : espèces, un compte hors de Securo ou un membre sans utilisateur Securo.",
     "kind": {
       "social": "Social",
       "household": "Foyer",

@@ -1895,6 +1895,9 @@
     "percentSum": "Soma: {{total}}%",
     "amountSum": "Soma: {{total}} / {{target}} {{currency}}",
     "equalHint": "Cada membro selecionado recebe uma parcela igual.",
+    "payer": "Pago por",
+    "payerFromAccount": "Pelo titular da conta",
+    "payerHint": "Defina quando quem pagou não é o titular da conta — dinheiro, uma conta fora do Securo ou um membro sem utilizador Securo.",
     "kind": {
       "social": "Social",
       "household": "Casa",

@@ -120,6 +120,10 @@ export function hasNonStatusChange(
     if (!v || v.splits.length === 0) return null
     return {
       share_type: v.share_type,
+      // Null and undefined both mean "derive the payer from the
+      // account's owner", so they compare equal; naming a payer on an
+      // otherwise untouched sharing is a real edit.
+      payer_group_member_id: v.payer_group_member_id ?? null,
       splits: v.splits.map((s) => ({
         group_member_id: s.group_member_id,
         share_amount: toNumber(s.share_amount),
@@ -130,6 +134,7 @@ export function hasNonStatusChange(
   const originalSplits: TransactionSplitsInput | null = original.splits?.length
     ? {
         share_type: (original.splits[0].share_type as TransactionSplitsInput['share_type']) ?? 'equal',
+        payer_group_member_id: original.splits[0].payer_group_member_id ?? null,
         splits: original.splits.map((s) => ({
           group_member_id: s.group_member_id,
           share_amount: s.share_amount,
