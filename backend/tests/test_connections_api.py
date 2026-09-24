@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.bank_connection import BankConnection
 from app.models.user import User
-from app.providers.base import ProviderUserActionRequired, SessionExpiredError
+from app.core.config import get_settings
+from app.providers.base import ProviderUserActionRequired, PsuContext, SessionExpiredError
 
 
 @pytest.mark.asyncio
@@ -350,3 +351,100 @@ async def test_update_settings_success(
     )
     assert resp.status_code == 200
     assert resp.json()["settings"]["payee_source"] == "merchant"
+
+
+@pytest.mark.asyncio
+async def test_manual_sync_forwards_the_present_user(
+    client: AsyncClient, auth_headers, test_connection, monkeypatch
+):
+    """A click on Sync is attended: the client address the trusted proxy saw
+    and the browser's user agent go to the provider."""
+    monkeypatch.setattr(get_settings(), "trusted_proxy_hops", 1)
+    with patch(
+        "app.services.connection_service.sync_connection", new_callable=AsyncMock
+    ) as mock_sync:
+        mock_sync.return_value = (test_connection, 0)
+        resp = await client.post(
+            f"/api/connections/{test_connection.id}/sync",
+            headers={
+                **auth_headers,
+                "X-Forwarded-For": "198.51.100.1, 203.0.113.9",
+                "User-Agent": "Mozilla/5.0 (Test)",
+            },
+        )
+
+    assert resp.status_code == 200
+    mock_sync.assert_awaited_once()
+    psu = mock_sync.call_args.kwargs["psu"]
+    assert isinstance(psu, PsuContext)
+    assert psu.ip_address == "203.0.113.9"
+    assert psu.user_agent == "Mozilla/5.0 (Test)"
+
+
+@pytest.mark.asyncio
+async def test_manual_sync_without_a_trusted_address_stays_unattended(
+    client: AsyncClient, auth_headers, test_connection, monkeypatch
+):
+    """Behind a proxy the operator hasn't declared, there is no address to
+    vouch for, so nothing is forwarded."""
+    monkeypatch.setattr(get_settings(), "trusted_proxy_hops", 2)
+    with patch(
+        "app.services.connection_service.sync_connection", new_callable=AsyncMock
+    ) as mock_sync:
+        mock_sync.return_value = (test_connection, 0)
+        resp = await client.post(
+            f"/api/connections/{test_connection.id}/sync",
+            headers={**auth_headers, "X-Forwarded-For": "203.0.113.9"},
+        )
+
+    assert resp.status_code == 200
+    mock_sync.assert_awaited_once()
+    assert mock_sync.call_args.kwargs["psu"] is None
+
+
+@pytest.mark.asyncio
+async def test_manual_sync_drops_headers_that_cannot_be_forwarded(
+    client: AsyncClient, auth_headers, test_connection, monkeypatch
+):
+    """A user agent outside printable ASCII would make the outgoing request
+    fail, so it is left out rather than breaking the sync."""
+    monkeypatch.setattr(get_settings(), "trusted_proxy_hops", 1)
+    with patch(
+        "app.services.connection_service.sync_connection", new_callable=AsyncMock
+    ) as mock_sync:
+        mock_sync.return_value = (test_connection, 0)
+        resp = await client.post(
+            f"/api/connections/{test_connection.id}/sync",
+            headers=[
+                *((k.encode(), v.encode()) for k, v in auth_headers.items()),
+                (b"X-Forwarded-For", b"203.0.113.9"),
+                (b"User-Agent", "App æøå".encode()),
+                (b"Accept-Language", b"nb-NO,nb;q=0.9"),
+            ],
+        )
+
+    assert resp.status_code == 200
+    psu = mock_sync.call_args.kwargs["psu"]
+    assert psu.ip_address == "203.0.113.9"
+    assert psu.user_agent is None
+    assert psu.accept_language == "nb-NO,nb;q=0.9"
+
+
+@pytest.mark.asyncio
+async def test_oauth_callback_forwards_the_present_user(
+    client: AsyncClient, auth_headers, test_connection, monkeypatch
+):
+    monkeypatch.setattr(get_settings(), "trusted_proxy_hops", 1)
+    with patch(
+        "app.services.connection_service.handle_oauth_callback", new_callable=AsyncMock
+    ) as mock_callback:
+        mock_callback.return_value = test_connection
+        resp = await client.post(
+            "/api/connections/oauth/callback",
+            json={"code": "auth-code", "provider": "enable_banking"},
+            headers={**auth_headers, "X-Forwarded-For": "203.0.113.9"},
+        )
+
+    assert resp.status_code == 200
+    mock_callback.assert_awaited_once()
+    assert mock_callback.call_args.kwargs["psu"].ip_address == "203.0.113.9"

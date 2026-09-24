@@ -31,6 +31,7 @@ from app.providers.base import (
     InstitutionData,
     InstitutionListData,
     ProviderRateLimited,
+    PsuContext,
     ProviderUserActionRequired,
     SessionExpiredError,
     TransactionData,
@@ -194,6 +195,22 @@ def _is_wrong_period_error(resp: httpx.Response) -> bool:
     return isinstance(body, dict) and body.get("error") == "WRONG_TRANSACTIONS_PERIOD"
 
 
+def _is_psu_header_error(resp: httpx.Response) -> bool:
+    """True when Enable Banking refused the PSU headers we sent.
+
+    A bank may require a set of PSU headers, and Enable Banking wants all of
+    them or none (PSU_HEADER_NOT_PROVIDED), or it may reject a value
+    (PSU_HEADER_INVALID).
+    """
+    if resp.status_code not in (400, 422):
+        return False
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and str(body.get("error") or "").startswith("PSU_HEADER_")
+
+
 class EnableBankingProvider(BankProvider):
     """Enable Banking PSD2 connector."""
 
@@ -201,6 +218,9 @@ class EnableBankingProvider(BankProvider):
     _cached_token: Optional[str] = None
     _cached_token_exp: float = 0.0
     _cached_private_key: Optional[str] = None
+
+    # Set only for reads the user triggered (see set_psu_context).
+    _psu: Optional[PsuContext] = None
 
     @property
     def name(self) -> str:
@@ -266,6 +286,31 @@ class EnableBankingProvider(BankProvider):
 
     # ----- HTTP layer -----
 
+    def set_psu_context(self, psu: PsuContext) -> None:
+        self._psu = psu
+
+    def _psu_headers(self, path: str) -> dict[str, str]:
+        """PSU headers for an account data call made while the user is present.
+
+        Enable Banking tells background reads from attended ones by these
+        headers alone, and many banks cap background reads at four a day. They
+        belong on the /accounts/{uid}/… data endpoints only. A bank can require
+        a particular set, so send every one we have.
+        """
+        psu = self._psu
+        if psu is None or not path.startswith("/accounts/"):
+            return {}
+        values = {
+            "Psu-Ip-Address": psu.ip_address,
+            "Psu-User-Agent": psu.user_agent,
+            "Psu-Referer": psu.referer,
+            "Psu-Accept": psu.accept,
+            "Psu-Accept-Charset": psu.accept_charset,
+            "Psu-Accept-Encoding": psu.accept_encoding,
+            "Psu-Accept-Language": psu.accept_language,
+        }
+        return {name: value for name, value in values.items() if value}
+
     def _client(self) -> httpx.AsyncClient:
         settings = get_settings()
         return httpx.AsyncClient(
@@ -288,7 +333,21 @@ class EnableBankingProvider(BankProvider):
         json_body: Optional[dict] = None,
     ) -> dict:
         async with self._client() as client:
-            resp = await client.request(method, path, params=params, json=json_body)
+            psu_headers = self._psu_headers(path)
+            resp = await client.request(
+                method, path, params=params, json=json_body, headers=psu_headers
+            )
+            if psu_headers and _is_psu_header_error(resp):
+                # This bank wants PSU headers we can't supply, or rejected a
+                # value (a private address, say). Read unattended instead, as
+                # a scheduled sync would, and don't retry them this run.
+                logger.warning(
+                    "Enable Banking refused PSU headers for %s; reading unattended: %s",
+                    path,
+                    resp.text[:200],
+                )
+                self._psu = None
+                resp = await client.request(method, path, params=params, json=json_body)
         if resp.status_code in (401, 410):
             raise SessionExpiredError(
                 f"Enable Banking returned {resp.status_code} for {path}"

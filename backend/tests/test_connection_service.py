@@ -23,6 +23,7 @@ from app.providers.base import (
     ConnectTokenData,
     HoldingData,
     ProviderUserActionRequired,
+    PsuContext,
     TransactionData,
 )
 from app.services.text_similarity import token_overlap
@@ -823,6 +824,49 @@ async def test_sync_connection_new_transactions(session: AsyncSession, test_user
     )
     assert transaction is not None
     assert transaction.original_description == "GROCERY"
+
+
+@pytest.mark.asyncio
+async def test_sync_connection_tells_provider_the_user_is_present(
+    session: AsyncSession, test_user, test_workspace,
+):
+    conn = await _make_connection(session, test_user.id, "Attended Bank")
+    psu = PsuContext(ip_address="203.0.113.9", user_agent="Mozilla/5.0 (Test)")
+    mock_provider = AsyncMock()
+    mock_provider.set_psu_context = MagicMock()
+    mock_provider.action_required_warnings = []
+    mock_provider.refresh_credentials = AsyncMock(return_value={"token": "fake"})
+    mock_provider.get_accounts = AsyncMock(return_value=[])
+
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider), \
+         patch("app.services.connection_service.detect_transfer_pairs", new_callable=AsyncMock):
+        await sync_connection(session, conn.id, test_workspace.id, test_user.id, psu=psu)
+
+    mock_provider.set_psu_context.assert_called_once_with(psu)
+    # Set before the first read, so every bank call carries it.
+    assert mock_provider.mock_calls[0][0] == "set_psu_context"
+
+
+@pytest.mark.asyncio
+async def test_oauth_callback_initial_import_is_attended(
+    session: AsyncSession, test_user, test_workspace,
+):
+    psu = PsuContext(ip_address="203.0.113.9")
+    mock_provider = AsyncMock()
+    mock_provider.set_psu_context = MagicMock()
+    mock_provider.handle_oauth_callback = AsyncMock(return_value=ConnectionData(
+        external_id="ext-attended", institution_name="Attended Bank",
+        credentials={"token": "x"}, accounts=[],
+    ))
+
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider), \
+         patch("app.services.connection_service.detect_transfer_pairs", new_callable=AsyncMock):
+        await handle_oauth_callback(
+            session, test_workspace.id, test_user.id, "code", "enable_banking", psu=psu,
+        )
+
+    mock_provider.set_psu_context.assert_called_once_with(psu)
+    assert mock_provider.mock_calls[0][0] == "set_psu_context"
 
 
 @pytest.mark.asyncio

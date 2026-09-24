@@ -196,6 +196,26 @@ class InstitutionListData:
     institutions: list[InstitutionData]
 
 
+@dataclass(frozen=True)
+class PsuContext:
+    """The user who is present when a read is made on their behalf.
+
+    PSD2 lets a bank cap the reads it serves without the user (commonly four a
+    day); reads the user triggers are not capped when the provider can tell
+    the bank who is present. Only ever built for user-initiated requests:
+    attaching it to a scheduled sync would pass a background read off as an
+    attended one.
+    """
+
+    ip_address: str
+    user_agent: Optional[str] = None
+    referer: Optional[str] = None
+    accept: Optional[str] = None
+    accept_charset: Optional[str] = None
+    accept_encoding: Optional[str] = None
+    accept_language: Optional[str] = None
+
+
 class SessionExpiredError(Exception):
     """Raised when a provider session/consent has expired and reauth is required."""
 
@@ -332,6 +352,13 @@ class BankProvider(ABC):
     async def handle_oauth_callback(self, code: str) -> ConnectionData:
         """Exchange OAuth code for access token and fetch initial data."""
         ...
+
+    def set_psu_context(self, psu: PsuContext) -> None:
+        """Tell the provider the user is present for the reads that follow.
+
+        Ignored by default. PSD2 providers override it to forward the user's
+        IP address and user agent, so the bank treats those reads as attended.
+        """
 
     @abstractmethod
     async def get_accounts(self, credentials: dict) -> list[AccountData]:
