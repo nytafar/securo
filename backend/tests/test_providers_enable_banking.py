@@ -18,6 +18,7 @@ from jose import jwt
 
 from app.providers.base import (
     ProviderUserActionRequired,
+    PsuContext,
     SessionExpiredError,
     mask_last4,
 )
@@ -589,3 +590,107 @@ def test_mask_last4_returns_none_when_unusable():
 
 def test_mask_last4_handles_exactly_four():
     assert mask_last4("1234") == "1234"
+
+
+# ----- PSU headers (attended reads) -----
+
+
+def _accounts_handler(seen: list[httpx.Request]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        path = request.url.path
+        if path.startswith("/sessions/"):
+            return httpx.Response(200, json={"accounts": ["acc-1"]})
+        if path.endswith("/details"):
+            return httpx.Response(200, json={"uid": "acc-1", "name": "Checking"})
+        return httpx.Response(200, json={"balances": []})
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_psu_context_marks_account_reads_as_attended(eb_keys):
+    provider = EnableBankingProvider()
+    provider.set_psu_context(
+        PsuContext(ip_address="203.0.113.9", user_agent="Mozilla/5.0 (Test)")
+    )
+    seen: list[httpx.Request] = []
+
+    with _patch_client(provider, _accounts_handler(seen)):
+        await provider.get_accounts(_CREDENTIALS)
+
+    by_path = {r.url.path: r for r in seen}
+    for path in ("/accounts/acc-1/details", "/accounts/acc-1/balances"):
+        assert by_path[path].headers["Psu-Ip-Address"] == "203.0.113.9"
+        assert by_path[path].headers["Psu-User-Agent"] == "Mozilla/5.0 (Test)"
+    # The session lookup is Enable Banking's own endpoint, not a bank read.
+    assert "Psu-Ip-Address" not in by_path["/sessions/sess-x"].headers
+
+
+@pytest.mark.asyncio
+async def test_without_psu_context_reads_go_out_unattended(eb_keys):
+    provider = EnableBankingProvider()
+    seen: list[httpx.Request] = []
+
+    with _patch_client(provider, _accounts_handler(seen)):
+        await provider.get_accounts(_CREDENTIALS)
+
+    assert seen
+    assert not any(
+        name.lower().startswith("psu-") for r in seen for name in r.headers
+    )
+
+
+@pytest.mark.asyncio
+async def test_refused_psu_headers_fall_back_to_an_unattended_read(eb_keys):
+    """Enable Banking wants all of a bank's required PSU headers or none. When
+    it refuses ours, read as a scheduled sync would rather than fail."""
+    provider = EnableBankingProvider()
+    provider.set_psu_context(PsuContext(ip_address="192.168.1.20"))
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        path = request.url.path
+        if path.startswith("/sessions/"):
+            return httpx.Response(200, json={"accounts": ["acc-1"]})
+        if "Psu-Ip-Address" in request.headers:
+            return httpx.Response(
+                422, json={"code": 422, "error": "PSU_HEADER_NOT_PROVIDED"}
+            )
+        if path.endswith("/details"):
+            return httpx.Response(200, json={"uid": "acc-1", "name": "Checking"})
+        return httpx.Response(200, json={"balances": []})
+
+    with _patch_client(provider, handler):
+        accounts = await provider.get_accounts(_CREDENTIALS)
+
+    assert [a.name for a in accounts] == ["Checking"]
+    paths = [(r.url.path, "Psu-Ip-Address" in r.headers) for r in seen]
+    # One refused attempt, then unattended for the rest of the run.
+    assert paths == [
+        ("/sessions/sess-x", False),
+        ("/accounts/acc-1/details", True),
+        ("/accounts/acc-1/details", False),
+        ("/accounts/acc-1/balances", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_psu_context_reaches_transaction_reads(eb_keys):
+    provider = EnableBankingProvider()
+    provider.set_psu_context(
+        PsuContext(ip_address="203.0.113.9", accept_language="nb-NO")
+    )
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"transactions": []})
+
+    with _patch_client(provider, handler):
+        await provider.get_transactions(_CREDENTIALS, "acc-1")
+
+    assert seen[0].headers["Psu-Ip-Address"] == "203.0.113.9"
+    assert seen[0].headers["Psu-Accept-Language"] == "nb-NO"
+    assert "Psu-User-Agent" not in seen[0].headers

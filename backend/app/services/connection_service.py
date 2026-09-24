@@ -33,6 +33,7 @@ from app.providers.base import (
     ProviderNotConfiguredError,
     ProviderRateLimited,
     ProviderUserActionRequired,
+    PsuContext,
     SessionExpiredError,
 )
 from app.services import oauth_state
@@ -1031,6 +1032,7 @@ async def handle_oauth_callback(
     state: Optional[str] = None,
     sync_assets: Optional[bool] = None,
     reconnect_connection_id: Optional[uuid.UUID] = None,
+    psu: Optional[PsuContext] = None,
 ) -> BankConnection:
     state_payload: dict = {}
     if state:
@@ -1061,6 +1063,9 @@ async def handle_oauth_callback(
         raise ValueError("OAuth callback missing provider")
 
     provider = get_provider(provider_name)
+    # The user is at the screen for the initial import, so it is attended.
+    if psu is not None:
+        provider.set_psu_context(psu)
     connection_data = await provider.handle_oauth_callback(code)
 
     if existing_reconnect:
@@ -1875,6 +1880,7 @@ async def sync_connection(
     workspace_id: uuid.UUID,
     requesting_user_id: uuid.UUID,
     trigger_provider_refresh: bool = False,
+    psu: Optional[PsuContext] = None,
 ) -> tuple[BankConnection, int]:
     connection = await get_connection(
         session, connection_id, workspace_id, for_update=True
@@ -1915,6 +1921,9 @@ async def sync_connection(
             "worker service is likely not loading the environment (.env) that "
             "enables this provider."
         ) from exc
+    # A user-initiated sync reads as attended; a scheduled one passes no psu.
+    if psu is not None:
+        provider.set_psu_context(psu)
 
     try:
         # Refresh credentials if needed

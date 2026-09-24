@@ -1,9 +1,13 @@
+import ipaddress
 import uuid
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.database import get_async_session
+from app.core.rate_limit import resolve_client_ip
 from app.core.workspace_context import (
     WorkspaceContext,
     current_workspace,
@@ -13,6 +17,7 @@ from app.providers import all_known_providers
 from app.providers.base import (
     ProviderNotConfiguredError,
     ProviderUserActionRequired,
+    PsuContext,
     SessionExpiredError,
 )
 from app.schemas.bank_connection import (
@@ -31,6 +36,45 @@ from app.services import connection_service
 from app.services.transfer_detection_service import detect_transfer_pairs, unlink_transfer_pair
 
 router = APIRouter(prefix="/api/connections", tags=["connections"])
+
+
+# Browser headers a bank may ask for, bounded so a provider never has to
+# send on something odd.
+_PSU_HEADER_MAX_LENGTH = 512
+
+
+def _psu_header(request: Request, name: str) -> Optional[str]:
+    """A request header fit to forward: printable ASCII only, else nothing."""
+    value = (request.headers.get(name) or "").strip()
+    if not value or len(value) > _PSU_HEADER_MAX_LENGTH:
+        return None
+    if not (value.isascii() and value.isprintable()):
+        return None
+    return value
+
+
+def _psu_context(request: Request) -> Optional[PsuContext]:
+    """Who is present for a user-initiated read, for providers that tell the bank.
+
+    The address comes from the trusted-proxy rule the login rate limiter uses
+    (TRUSTED_PROXY_HOPS), so it is the address the operator's proxy saw, not
+    one the client wrote into X-Forwarded-For. Without a usable address the
+    read goes out unattended, as a scheduled sync does.
+    """
+    ip = resolve_client_ip(request, get_settings().trusted_proxy_hops)
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    return PsuContext(
+        ip_address=ip,
+        user_agent=_psu_header(request, "user-agent"),
+        referer=_psu_header(request, "referer"),
+        accept=_psu_header(request, "accept"),
+        accept_charset=_psu_header(request, "accept-charset"),
+        accept_encoding=_psu_header(request, "accept-encoding"),
+        accept_language=_psu_header(request, "accept-language"),
+    )
 
 
 @router.get("/providers")
@@ -99,6 +143,7 @@ async def list_provider_institutions(
 @router.post("/oauth/callback", response_model=BankConnectionRead)
 async def oauth_callback(
     data: OAuthCallbackRequest,
+    request: Request,
     ctx: WorkspaceContext = Depends(current_writable_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
@@ -112,6 +157,7 @@ async def oauth_callback(
             state=data.state,
             sync_assets=data.sync_assets,
             reconnect_connection_id=data.reconnect_connection_id,
+            psu=_psu_context(request),
         )
         return connection
     except ProviderUserActionRequired as e:
@@ -163,6 +209,7 @@ async def get_reauth_url(
 @router.post("/{connection_id}/sync")
 async def sync_connection(
     connection_id: uuid.UUID,
+    request: Request,
     ctx: WorkspaceContext = Depends(current_writable_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
@@ -176,6 +223,7 @@ async def sync_connection(
             ctx.workspace.id,
             ctx.user_id,
             trigger_provider_refresh=True,
+            psu=_psu_context(request),
         )
         result = BankConnectionRead.model_validate(connection)
         return {**result.model_dump(mode="json"), "merged_count": merged_count}
