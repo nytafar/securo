@@ -69,6 +69,9 @@ export default function AccountsPage() {
   const { canWrite } = useWorkspace()
   const userCurrency = user?.preferences?.currency_display ?? 'USD'
   const queryClient = useQueryClient()
+  // Reference time for "is this bank's rate limit still in force"; the page
+  // re-mounts often enough that a clock per render isn't needed.
+  const [openedAt] = useState(() => Date.now())
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingAccount, setEditingAccount] = useState<Account | null>(null)
   const [deletingId, setDeletingId] = useState<string | null>(null)
@@ -146,6 +149,12 @@ export default function AccountsPage() {
       const detail = axios.isAxiosError(err)
         ? err.response?.data?.detail
         : null
+      // The bank refused the read: nothing failed on our side, and nothing
+      // was refreshed either.
+      if (detail?.code === 'provider_rate_limited') {
+        toast.warning(t('accounts.syncRateLimited'))
+        return
+      }
       const message = typeof detail === 'string' ? detail : detail?.message
       toast.error(message || t('accounts.syncError'))
     },
@@ -316,6 +325,9 @@ export default function AccountsPage() {
                 const connAccounts = bankAccounts.filter((a) => a.connection_id === conn.id)
                 const needsReconnect = conn.status !== 'active'
                 const syncPending = syncMutation.isPending && syncMutation.variables === conn.id
+                const rateLimitedUntil = conn.settings?.rate_limited_until
+                  ? new Date(conn.settings.rate_limited_until)
+                  : null
                 return (
                   <div key={conn.id} className="bg-card rounded-xl border border-border shadow-sm">
                     {/* Connection header */}
@@ -343,6 +355,11 @@ export default function AccountsPage() {
                           {conn.last_sync_at && (
                             <p className="text-[11px] text-muted-foreground mt-0.5">
                               {t('accounts.lastSync')}: {new Date(conn.last_sync_at).toLocaleString(dateLocale)}
+                            </p>
+                          )}
+                          {rateLimitedUntil && rateLimitedUntil.getTime() > openedAt && (
+                            <p className="text-[11px] text-amber-700 dark:text-amber-300 mt-0.5">
+                              {t('accounts.rateLimitedUntil', { time: rateLimitedUntil.toLocaleString(dateLocale) })}
                             </p>
                           )}
                         </div>

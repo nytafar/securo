@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Literal, Optional
 
@@ -220,7 +220,14 @@ class ProviderRateLimited(Exception):
     access (commonly ~4/day per resource), so a burst of syncs returns HTTP
     429. The connection is healthy; callers should skip this run and retry
     later rather than flag it as errored.
+
+    `retry_after` carries the provider's own hint (an HTTP Retry-After) when
+    it sent one, so the caller can hold off at least that long.
     """
+
+    def __init__(self, message: str, *, retry_after: Optional[timedelta] = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class ProviderNotConfiguredError(Exception):

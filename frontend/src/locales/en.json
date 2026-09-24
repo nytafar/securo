@@ -1146,6 +1146,8 @@
     "deleted": "Account deleted",
     "syncDone": "Sync completed",
     "syncError": "Sync failed",
+    "syncRateLimited": "Your bank's daily limit for data requests has been reached, so nothing was updated. Try again later.",
+    "rateLimitedUntil": "Bank's daily limit reached. Automatic sync resumes after {{time}}",
     "connected": "Bank connected successfully",
     "connectError": "Failed to connect bank",
     "disconnected": "Connection removed",

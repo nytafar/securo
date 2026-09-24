@@ -15,7 +15,7 @@ from app.core.app_clock import (
 from app.worker import celery_app
 from app.core.config import get_settings
 from app.models.bank_connection import BankConnection
-from app.providers.base import ProviderNotConfiguredError
+from app.providers.base import ProviderNotConfiguredError, ProviderRateLimited
 from app.services import connection_service
 
 logger = logging.getLogger(__name__)
@@ -43,12 +43,18 @@ def _make_session_maker():
     return engine, async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
-async def _sync_all() -> int:
-    """Find stale connections and sync each one."""
+async def _sync_all() -> dict[str, int]:
+    """Find stale connections and sync each one.
+
+    A connection its provider recently rate-limited is left alone until the
+    backoff recorded on it has passed, so the bank's quota can recover.
+    """
     engine, session_maker = _make_session_maker()
     try:
         cutoff = datetime.now(timezone.utc) - STALE_THRESHOLD
         synced = 0
+        rate_limited = 0
+        deferred = 0
 
         async with session_maker() as session:
             operation_timezone = await get_timezone(session, fresh=True)
@@ -74,6 +80,15 @@ async def _sync_all() -> int:
 
         with use_resolved_timezone(operation_timezone):
             for conn_id, user_id, last_sync, settings in connections:
+                retry_at = connection_service.rate_limited_until(settings)
+                if retry_at is not None and retry_at > datetime.now(timezone.utc):
+                    logger.info(
+                        "Skipping connection %s: rate-limited until %s",
+                        conn_id,
+                        retry_at.isoformat(),
+                    )
+                    deferred += 1
+                    continue
                 try:
                     logger.info("Syncing connection %s (last_sync=%s)", conn_id, last_sync)
                     await _sync_one(
@@ -85,6 +100,9 @@ async def _sync_all() -> int:
                         ),
                     )
                     synced += 1
+                except ProviderRateLimited:
+                    # sync_connection has logged it and recorded the backoff.
+                    rate_limited += 1
                 except ProviderNotConfiguredError as exc:
                     # Actionable one-liner instead of a buried traceback: this
                     # means THIS process is missing the provider's configuration.
@@ -92,7 +110,7 @@ async def _sync_all() -> int:
                 except Exception:
                     logger.exception("Background sync failed for connection %s", conn_id)
 
-        return synced
+        return {"synced": synced, "rate_limited": rate_limited, "deferred": deferred}
     finally:
         await engine.dispose()
 
@@ -125,9 +143,15 @@ async def _sync_one(
 @celery_app.task(name="app.tasks.sync_tasks.sync_all_connections")
 def sync_all_connections() -> dict:
     """Celery task: sync all stale bank connections."""
-    synced = asyncio.run(_sync_all())
-    logger.info("Background sync complete: %d connections synced", synced)
-    return {"synced": synced}
+    result = asyncio.run(_sync_all())
+    logger.info(
+        "Background sync complete: %d connections synced, %d rate-limited, "
+        "%d deferred by an earlier rate limit",
+        result["synced"],
+        result["rate_limited"],
+        result["deferred"],
+    )
+    return result
 
 
 @celery_app.task(name="app.tasks.sync_tasks.sync_single_connection")
@@ -136,6 +160,8 @@ def sync_single_connection(connection_id: str, user_id: str) -> dict:
     try:
         asyncio.run(_sync_one_celery(connection_id, user_id))
         return {"status": "ok", "connection_id": connection_id}
+    except ProviderRateLimited:
+        return {"status": "rate_limited", "connection_id": connection_id}
     except Exception as e:
         logger.exception("Sync task failed for connection %s", connection_id)
         return {"status": "error", "connection_id": connection_id, "error": str(e)}

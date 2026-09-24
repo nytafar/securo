@@ -145,6 +145,9 @@ export interface ConnectionSettings {
   payee_source?: 'auto' | 'merchant' | 'payment_data' | 'description' | 'none'
   import_pending?: boolean
   sync_assets?: boolean
+  // Set by the backend when the bank rate-limited a sync: scheduled syncs
+  // leave the connection alone until then (ISO 8601).
+  rate_limited_until?: string
 }
 
 export interface Account {

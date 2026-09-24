@@ -93,6 +93,18 @@ def _account_identifier(raw: dict) -> Optional[str]:
     return None
 
 
+# PSD2 quotas are daily, so no hint from the bank needs to hold us off longer.
+MAX_RETRY_AFTER = timedelta(days=1)
+
+
+def _retry_after(resp: httpx.Response) -> Optional[timedelta]:
+    """Read a Retry-After given in seconds; the HTTP-date form is ignored."""
+    value = resp.headers.get("retry-after", "").strip()
+    if not (value.isascii() and value.isdigit()):
+        return None
+    return min(timedelta(seconds=int(value)), MAX_RETRY_AFTER)
+
+
 def _pick_balance(balances: list[dict]) -> Optional[dict]:
     """Pick the most useful balance from EB's list (prefer closing booked)."""
     if not balances:
@@ -298,7 +310,8 @@ class EnableBankingProvider(BankProvider):
             # connection. Surface a distinct type so sync can skip-and-retry
             # instead of erroring the connection.
             raise ProviderRateLimited(
-                f"Enable Banking {method} {path} → 429: {resp.text[:200]}"
+                f"Enable Banking {method} {path} → 429: {resp.text[:200]}",
+                retry_after=_retry_after(resp),
             )
         if resp.status_code >= 400:
             raise httpx.HTTPStatusError(
