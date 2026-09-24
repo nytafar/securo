@@ -1147,6 +1147,8 @@
     "deleted": "Account verwijderd",
     "syncDone": "Synchronisatie voltooid",
     "syncError": "Synchronisatie mislukt",
+    "syncRateLimited": "De daglimiet voor gegevensverzoeken van je bank is bereikt, dus er is niets bijgewerkt. Probeer het later opnieuw.",
+    "rateLimitedUntil": "Daglimiet van de bank bereikt. Automatisch synchroniseren gaat verder na {{time}}",
     "connected": "Bank succesvol verbonden",
     "connectError": "Kan geen verbinding maken met de bank",
     "disconnected": "Verbinding verwijderd",

@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from jose import jwt
 
 from app.providers.base import (
+    ProviderRateLimited,
     ProviderUserActionRequired,
     SessionExpiredError,
     mask_last4,
@@ -27,6 +28,7 @@ from app.providers.enable_banking import (
     EnableBankingProvider,
     _account_identifier,
     _map_cash_account_type,
+    _retry_after,
     _txn_fingerprint,
 )
 
@@ -518,6 +520,59 @@ async def test_get_transactions_other_422_is_not_retried(eb_keys):
         await provider.get_transactions(_CREDENTIALS, "acc-1")
 
     assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_accounts_rate_limited_details_aborts_with_body(eb_keys):
+    """A 429 on the first data call is not skipped like a per-account failure:
+    it stops the run and carries the bank's error and Retry-After upward."""
+    provider = EnableBankingProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/sessions/"):
+            return httpx.Response(200, json={"accounts": ["acc-1", "acc-2"]})
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "3600"},
+            json={
+                "code": 429,
+                "message": "Too many requests to ASPSP",
+                "error": "ASPSP_RATE_LIMIT_EXCEEDED",
+            },
+        )
+
+    with _patch_client(provider, handler), pytest.raises(ProviderRateLimited) as exc_info:
+        await provider.get_accounts(_CREDENTIALS)
+
+    assert "ASPSP_RATE_LIMIT_EXCEEDED" in str(exc_info.value)
+    assert exc_info.value.retry_after == timedelta(hours=1)
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_without_retry_after_leaves_it_unset(eb_keys):
+    provider = EnableBankingProvider()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": "ASPSP_RATE_LIMIT_EXCEEDED"})
+
+    with _patch_client(provider, handler), pytest.raises(ProviderRateLimited) as exc_info:
+        await provider.get_transactions(_CREDENTIALS, "acc-1")
+
+    assert exc_info.value.retry_after is None
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("Wed, 21 Oct 2026 07:28:00 GMT", None),
+        ("soon", None),
+        (b"\xb2", None),  # superscript two: isdigit() but not int()
+        ("999999999999", timedelta(days=1)),
+    ],
+)
+def test_retry_after_ignores_what_it_cannot_use(header, expected):
+    resp = httpx.Response(429, headers={"Retry-After": header})
+    assert _retry_after(resp) == expected
 
 
 @pytest.mark.asyncio

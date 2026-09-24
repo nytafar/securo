@@ -1,5 +1,5 @@
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,11 +22,13 @@ from app.providers.base import (
     ConnectionData,
     ConnectTokenData,
     HoldingData,
+    ProviderRateLimited,
     ProviderUserActionRequired,
     TransactionData,
 )
 from app.services.text_similarity import token_overlap
 from app.services.connection_service import (
+    RATE_LIMIT_BACKOFF,
     _find_existing_connected_account,
     _merge_sync_metadata,
     _match_pluggy_category,
@@ -823,6 +825,109 @@ async def test_sync_connection_new_transactions(session: AsyncSession, test_user
     )
     assert transaction is not None
     assert transaction.original_description == "GROCERY"
+
+
+@pytest.mark.asyncio
+async def test_sync_connection_rate_limited_records_backoff(
+    session: AsyncSession, test_user, test_workspace,
+):
+    """A 429 keeps the connection healthy, leaves last_sync_at alone and
+    records when scheduled syncs may try again, then tells the caller."""
+    conn = await _make_connection(
+        session, test_user.id, "Throttled Bank", settings={"payee_source": "auto"}
+    )
+    last_sync_before = conn.last_sync_at
+    mock_provider = AsyncMock()
+    mock_provider.refresh_credentials = AsyncMock(return_value={"token": "fake"})
+    mock_provider.get_accounts = AsyncMock(side_effect=ProviderRateLimited(
+        'Enable Banking GET /accounts/uid-1/details → 429: '
+        '{"code":429,"error":"ASPSP_RATE_LIMIT_EXCEEDED"}'
+    ))
+
+    started = datetime.now(timezone.utc)
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider):
+        with pytest.raises(ProviderRateLimited):
+            await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+
+    stored = await session.get(BankConnection, conn.id)
+    assert stored is not None
+    await session.refresh(stored)
+    assert stored.settings is not None
+    assert stored.status == "active"
+    assert stored.last_sync_at == last_sync_before
+    assert stored.settings["payee_source"] == "auto"
+    until = datetime.fromisoformat(stored.settings["rate_limited_until"])
+    assert started + RATE_LIMIT_BACKOFF <= until <= datetime.now(timezone.utc) + RATE_LIMIT_BACKOFF
+
+
+@pytest.mark.asyncio
+async def test_sync_connection_rate_limited_honours_longer_retry_after(
+    session: AsyncSession, test_user, test_workspace,
+):
+    conn = await _make_connection(session, test_user.id, "Throttled Bank")
+    mock_provider = AsyncMock()
+    mock_provider.refresh_credentials = AsyncMock(return_value={"token": "fake"})
+    mock_provider.get_accounts = AsyncMock(
+        side_effect=ProviderRateLimited("429", retry_after=timedelta(hours=20))
+    )
+
+    started = datetime.now(timezone.utc)
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider):
+        with pytest.raises(ProviderRateLimited):
+            await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+
+    stored = await session.get(BankConnection, conn.id)
+    assert stored is not None
+    await session.refresh(stored)
+    assert stored.settings is not None
+    until = datetime.fromisoformat(stored.settings["rate_limited_until"])
+    assert until >= started + timedelta(hours=20)
+
+
+@pytest.mark.asyncio
+async def test_sync_connection_rate_limited_keeps_expired_status(
+    session: AsyncSession, test_user, test_workspace,
+):
+    """A rate limit must not hide an expired consent behind "active"."""
+    conn = await _make_connection(session, test_user.id, "Expired Bank")
+    conn.status = "expired"
+    await session.commit()
+    mock_provider = AsyncMock()
+    mock_provider.refresh_credentials = AsyncMock(return_value={"token": "fake"})
+    mock_provider.get_accounts = AsyncMock(side_effect=ProviderRateLimited("429"))
+
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider):
+        with pytest.raises(ProviderRateLimited):
+            await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+
+    stored = await session.get(BankConnection, conn.id)
+    assert stored is not None
+    await session.refresh(stored)
+    assert stored.status == "expired"
+
+
+@pytest.mark.asyncio
+async def test_sync_connection_success_clears_rate_limit_backoff(
+    session: AsyncSession, test_user, test_workspace,
+):
+    """A sync that gets through (a manual one, typically) lifts the backoff."""
+    conn = await _make_connection(
+        session, test_user.id, "Recovered Bank",
+        settings={
+            "payee_source": "auto",
+            "rate_limited_until": (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat(),
+        },
+    )
+    mock_provider = AsyncMock()
+    mock_provider.action_required_warnings = []
+    mock_provider.refresh_credentials = AsyncMock(return_value={"token": "fake"})
+    mock_provider.get_accounts = AsyncMock(return_value=[])
+
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider), \
+         patch("app.services.connection_service.detect_transfer_pairs", new_callable=AsyncMock):
+        result_conn, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+
+    assert result_conn.settings == {"payee_source": "auto"}
 
 
 @pytest.mark.asyncio

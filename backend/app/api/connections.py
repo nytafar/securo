@@ -12,6 +12,7 @@ from app.core.workspace_context import (
 from app.providers import all_known_providers
 from app.providers.base import (
     ProviderNotConfiguredError,
+    ProviderRateLimited,
     ProviderUserActionRequired,
     SessionExpiredError,
 )
@@ -192,6 +193,13 @@ async def sync_connection(
         )
     except SessionExpiredError as e:
         raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(e))
+    except ProviderRateLimited as e:
+        # The bank refused this read, so nothing was refreshed. Say so rather
+        # than answering 200 and letting the UI report a completed sync.
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"message": str(e), "code": "provider_rate_limited"},
+        )
     except ProviderNotConfiguredError as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
     except Exception as e:

@@ -8,7 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.bank_connection import BankConnection
 from app.models.user import User
-from app.providers.base import ProviderUserActionRequired, SessionExpiredError
+from app.providers.base import (
+    ProviderRateLimited,
+    ProviderUserActionRequired,
+    SessionExpiredError,
+)
 
 
 @pytest.mark.asyncio
@@ -275,6 +279,23 @@ async def test_sync_connection_session_expired_returns_gone(
 
     assert resp.status_code == 410
     assert resp.json()["detail"] == "SimpleFIN access URL is missing"
+
+
+@pytest.mark.asyncio
+async def test_sync_connection_rate_limited_returns_too_many_requests(
+    client: AsyncClient, auth_headers
+):
+    """A rate-limited sync refreshed nothing, so it must not answer 200."""
+    with patch("app.services.connection_service.sync_connection") as mock_sync:
+        mock_sync.side_effect = ProviderRateLimited(
+            "Enable Banking GET /accounts/uid/details → 429: ASPSP_RATE_LIMIT_EXCEEDED"
+        )
+        resp = await client.post(
+            f"/api/connections/{uuid.uuid4()}/sync", headers=auth_headers,
+        )
+
+    assert resp.status_code == 429
+    assert resp.json()["detail"]["code"] == "provider_rate_limited"
 
 
 @pytest.mark.asyncio

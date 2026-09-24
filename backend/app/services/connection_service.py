@@ -63,6 +63,26 @@ settings = get_settings()
 
 _PROVIDER_SELL_DATE_METADATA_KEY = "_securo_provider_sell_date"
 
+# How long scheduled syncs leave a connection alone after its provider
+# rate-limited it. PSD2 lets a bank cap unattended access at about four reads
+# a day, and Enable Banking's advice for ASPSP_RATE_LIMIT_EXCEEDED is to resume
+# after six hours; retrying sooner only spends the quota that has to recover.
+# A longer Retry-After from the provider wins.
+RATE_LIMIT_BACKOFF = timedelta(hours=6)
+RATE_LIMITED_UNTIL_KEY = "rate_limited_until"
+
+
+def rate_limited_until(connection_settings: Optional[dict]) -> Optional[datetime]:
+    """When scheduled syncs may try a rate-limited connection again, if recorded."""
+    value = (connection_settings or {}).get(RATE_LIMITED_UNTIL_KEY)
+    if not isinstance(value, str):
+        return None
+    try:
+        until = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return until if until.tzinfo is not None else None
+
 
 def _clean_logo_url(value: object) -> Optional[str]:
     """Normalize a provider-supplied logo to a non-empty string or None.
@@ -2401,6 +2421,13 @@ async def sync_connection(
             await session.delete(orphan)
 
         connection.last_sync_at = datetime.now(timezone.utc)
+        current_settings = connection.settings or {}
+        if RATE_LIMITED_UNTIL_KEY in current_settings:
+            connection.settings = {
+                key: value
+                for key, value in current_settings.items()
+                if key != RATE_LIMITED_UNTIL_KEY
+            }
         action_required_warnings = getattr(provider, "action_required_warnings", None)
         if isinstance(action_required_warnings, list) and action_required_warnings:
             logger.warning(
@@ -2436,21 +2463,32 @@ async def sync_connection(
             if conn:
                 conn.status = "error"
         raise
-    except ProviderRateLimited:
+    except ProviderRateLimited as exc:
         # The bank/aggregator is throttling data requests (PSD2 caps unattended
         # access, commonly ~4/day). The connection is healthy, so don't error
-        # it or 500 the request — skip this run, keep it active, and leave
-        # last_sync_at untouched so the next sync retries the same window.
+        # it — keep it active and leave last_sync_at untouched so the next
+        # sync retries the same window. Record when scheduled syncs may try
+        # again, then re-raise so callers report the run as rate-limited
+        # instead of synced.
         await session.rollback()
+        backoff = max(RATE_LIMIT_BACKOFF, exc.retry_after or RATE_LIMIT_BACKOFF)
+        until = datetime.now(timezone.utc) + backoff
         async with session.begin():
             conn = await session.get(BankConnection, connection_id)
-            if conn and conn.status != "expired":
-                conn.status = "active"
-        # The row can vanish if the connection was deleted mid-sync. Fall back
-        # to the one we already hold rather than raising: re-raising here would
-        # escape as a 500, which is exactly what this handler exists to avoid.
-        refreshed = await session.get(BankConnection, connection_id)
-        return refreshed or connection, 0
+            if conn:
+                if conn.status != "expired":
+                    conn.status = "active"
+                conn.settings = {
+                    **(conn.settings or {}),
+                    RATE_LIMITED_UNTIL_KEY: until.isoformat(),
+                }
+        logger.warning(
+            "Connection %s was rate-limited; scheduled syncs resume after %s: %s",
+            connection_id,
+            until.isoformat(),
+            exc,
+        )
+        raise
     except Exception:
         # Mark connection as errored so UI shows reconnect banner
         await session.rollback()

@@ -1147,6 +1147,8 @@
     "deleted": "Compte supprimé",
     "syncDone": "Synchronisation terminée",
     "syncError": "Échec de la synchronisation",
+    "syncRateLimited": "La limite quotidienne de requêtes de votre banque est atteinte, rien n'a donc été mis à jour. Réessayez plus tard.",
+    "rateLimitedUntil": "Limite quotidienne de la banque atteinte. La synchronisation automatique reprendra après {{time}}",
     "connected": "Banque connectée avec succès",
     "connectError": "Échec de la connexion à la banque",
     "disconnected": "Connexion supprimée",

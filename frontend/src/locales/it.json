@@ -1147,6 +1147,8 @@
     "deleted": "Conto eliminato",
     "syncDone": "Sincronizzazione completata",
     "syncError": "Sincronizzazione fallita",
+    "syncRateLimited": "È stato raggiunto il limite giornaliero di richieste della tua banca, quindi non è stato aggiornato nulla. Riprova più tardi.",
+    "rateLimitedUntil": "Limite giornaliero della banca raggiunto. La sincronizzazione automatica riprende dopo {{time}}",
     "connected": "Banca collegata con successo",
     "connectError": "Impossibile collegare la banca",
     "disconnected": "Connessione rimossa",
